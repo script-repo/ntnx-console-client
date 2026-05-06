@@ -11,7 +11,7 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 - **Single tab, many consoles.** Browser-style overlapping tabs let you keep multiple consoles open and switch instantly.
 - **VM list with filtering.** Search by name / UUID / IP, filter by power state and category, and star favorites (persisted in localStorage).
 - **CVM support.** Discovers Controller VMs through the v4 `clustermgmt` API on Prism Central, then redirects the console request to the cluster's Prism Element using the legacy VNC proxy when v4 console-token is unavailable.
-- **Per-PE credentials.** Prism Central credentials don't authenticate to Prism Element by default. NRCC prompts once per PE, validates with a real probe, and stores credentials in browser localStorage.
+- **Per-PE credentials, server-side only.** Prism Central credentials don't authenticate to Prism Element by default. NRCC prompts once per PE, validates with a real probe, and caches the credentials **in the NRCC server process's memory only** — keyed to an `HttpOnly` session cookie. They are never written to browser `localStorage`, never persisted to disk, and disappear when the NRCC server restarts (or after 8 hours of inactivity).
 - **Pure HTTP/WebSocket.** No agent on the cluster, no plug-in, no special browser extensions. Self-signed TLS toggle for lab environments.
 - **Prism-Central look-and-feel.** Modern UI with status pills, accent-blue interactions, and a navy header.
 
@@ -55,8 +55,10 @@ Vanilla JS + noVNC, no build step:
 └─────────────┬──────────────┘
               ▼
    ┌──────────────────────┐
-   │ POST /api/console-   │ — includes vmUuid, optional peHost / cvmIp / cvmName / peUsername / pePassword
-   │   token              │
+   │ POST /api/console-   │ — includes vmUuid, optional peHost / cvmIp / cvmName.
+   │   token              │   PE creds are NOT in the body; the server reads
+   │                      │   them from its in-memory session map (populated
+   │                      │   earlier by POST /api/pe-test).
    └──────┬───────────────┘
           ▼
    ┌──────────────────────────────────────────────────────────────┐
@@ -105,13 +107,14 @@ copy .env.example .env       # Windows
 
 `.env` keys (all optional — values entered in the UI take precedence):
 
-| Key                       | Default            | Description                                    |
-| ------------------------- | ------------------ | ---------------------------------------------- |
-| `PORT`                    | `3000`             | Local HTTP port.                               |
-| `NUTANIX_PC_HOST`         | _empty_            | Default Prism Central IP / hostname.           |
-| `NUTANIX_USERNAME`        | _empty_            | Default PC username.                           |
-| `NUTANIX_PASSWORD`        | _empty_            | Default PC password.                           |
-| `NUTANIX_TLS_SKIP_VERIFY` | `true`             | Accept self-signed Prism certs (lab default).  |
+| Key                       | Default            | Description                                                                                            |
+| ------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------ |
+| `PORT`                    | `3000`             | Local HTTP port.                                                                                       |
+| `NUTANIX_PC_HOST`         | _empty_            | Default Prism Central IP / hostname.                                                                   |
+| `NUTANIX_USERNAME`        | _empty_            | Default PC username.                                                                                   |
+| `NUTANIX_PASSWORD`        | _empty_            | Default PC password.                                                                                   |
+| `NUTANIX_TLS_SKIP_VERIFY` | `true`             | Accept self-signed Prism certs (lab default).                                                          |
+| `NUTANIX_API_TIMEOUT_MS`  | `30000`            | Per-request timeout (ms) for outbound calls to Prism. Increase if VM listing times out against a slow PC. |
 
 ### Run
 
@@ -131,7 +134,7 @@ Then open <http://localhost:3000>.
 4. Use the search box and filters (power state / category) to find a VM. Click the star to favorite it (persisted in browser localStorage).
 5. Select a VM and click **Open Console**.
    - For regular VMs the console opens immediately via PC's v4 token flow.
-   - For CVMs, NRCC prompts once for **PE credentials** (per cluster). The credentials are validated with a probe and stored locally.
+   - For CVMs, NRCC prompts once for **PE credentials** (per cluster). The credentials are validated with a probe and cached in the NRCC server's memory for the session — never in the browser, never on disk. To wipe them, click **Forget PE credentials** on the toolbar (or restart the NRCC server).
 6. Multiple consoles stay open in browser-style **tabs**. Click a tab to switch; click the **×** to close.
 
 ### Keyboard shortcuts
@@ -163,7 +166,7 @@ If your PE has the v4 vmm API exposed, NRCC will use the standard `generate-cons
 
 ### Prism Central credentials don't authenticate to Prism Element
 
-PC and PE have separate user databases. PC's `admin` is not automatically a PE user. NRCC will prompt for PE credentials the first time you open a CVM on a given PE, validate them with a real probe (`PrismGateway/services/rest/v2.0/cluster`), and cache them in `localStorage["ntnxConsolePeCreds"]`. Use the **Cancel** button in the modal to abort.
+PC and PE have separate user databases. PC's `admin` is not automatically a PE user. NRCC will prompt for PE credentials the first time you open a CVM on a given PE, validate them with a real probe (`PrismGateway/services/rest/v2.0/cluster`), and cache them in the NRCC server's in-memory session map (keyed to an `HttpOnly` cookie). Use the **Cancel** button in the modal to abort.
 
 ### Network reachability
 
@@ -173,15 +176,16 @@ Your browser talks only to NRCC on `localhost:3000`, but **the NRCC server must 
 
 Self-signed Prism certificates are normal in lab environments. The **Allow self-signed TLS** checkbox sets `rejectUnauthorized: false` for outbound HTTPS and WSS calls. **Do not enable this in production** or anywhere a man-in-the-middle is plausible. If you have a properly signed Prism cert, leave it unchecked.
 
-### CVM credentials are stored in the browser
+### Credential handling
 
-PE credentials are stored as plaintext under `localStorage["ntnxConsolePeCreds"]`. They never leave your browser except in the body of `/api/console-token` POSTs to your local NRCC instance. Treat the workstation accordingly. To clear them, use your browser's site data tools or run:
-
-```js
-localStorage.removeItem("ntnxConsolePeCreds")
-```
-
-in the browser console.
+- **Prism Central credentials** are entered in the toolbar form fields. The browser holds them only in the live `<input>` elements (cleared on reload) and posts them to the NRCC server with each `/api/vms` and `/api/console-token` call. They are not written to `localStorage` and not cached server-side. If you reload the page you must re-enter them.
+- **Prism Element credentials** are sent exactly once — to `POST /api/pe-test` — when you first open a CVM on that PE. On a successful probe NRCC caches them in **server-side memory only**, keyed to an opaque `HttpOnly`, `SameSite=Strict` session cookie (`nrcc_sid`). After that, every `POST /api/console-token` looks them up by `peHost`; the browser never sees them again, and they are never returned in any API response.
+- The cache lives only in the NRCC process. It is wiped on:
+  - **Server restart** (`Ctrl-C` / `npm start` again),
+  - **8 hours of session inactivity** (rolling),
+  - clicking **Forget PE credentials** in the toolbar (`DELETE /api/pe-creds`).
+- To audit what NRCC has cached for your session, `GET /api/pe-creds` returns just the list of PE host names (no usernames, no passwords).
+- The `localStorage` keys NRCC still uses are non-credential: `ntnxConsoleProfile` (PC host + username, only when "Remember host and username" is checked) and `ntnxConsoleFavoriteVms` (favorite VM UUIDs).
 
 ### No production hardening
 
@@ -215,6 +219,9 @@ NRCC tries multiple Prism API versions (`v4.0`, `v4.1`, `v4.2`, `v3`, `v2.0`, `v
 | Console WebSocket (PE) | `WSS /vnc/vm/{uuid}/proxy`                                                            |
 | PE auth probe          | `GET /PrismGateway/services/rest/v2.0/cluster`                                        |
 | PE legacy login        | `POST /PrismGateway/j_spring_security_check` (form) — for session cookie if needed    |
+| Validate + cache PE creds (NRCC) | `POST /api/pe-test` — server stores creds under the session cookie          |
+| List cached PE hosts (NRCC)      | `GET /api/pe-creds` — returns `{ peHosts: [...] }`, no creds                |
+| Forget cached PE creds (NRCC)    | `DELETE /api/pe-creds` (all) or `DELETE /api/pe-creds/:peHost` (one)        |
 
 All requests carry per-call `NTNX-Request-Id` / `X-Request-Id` headers (UUIDv4) — required by Nutanix v4 APIs.
 
@@ -226,6 +233,7 @@ All requests carry per-call `NTNX-Request-Id` / `X-Request-Id` headers (UUIDv4) 
 | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Failed to list VMs. self-signed certificate`                          | Tick **Allow self-signed TLS**.                                                                                                                                                                       |
 | `Failed to list VMs. connect ECONNREFUSED <host>:9440`                 | NRCC server can't reach PC on port 9440. Run NRCC on a host that can.                                                                                                                                 |
+| `Failed to list VMs. timeout of NNNNms exceeded`                       | A Prism Central VM-list probe took longer than `NUTANIX_API_TIMEOUT_MS` (default 30 s). Bump the env var or check PC load. The new server log line `All N VM-list probes failed against …` shows the actual per-URL failure reasons. |
 | `Loaded N VMs (0 CVM)` despite ticking **Include hidden/system VMs**   | PC's clustermgmt API returned 0 CVMs for those clusters (e.g., the cluster is the PC cluster itself, which returns `CLU-10006: cvm list not supported on PC cluster`). Expected for the PC self-cluster. |
 | `Could not locate the CVM on its Prism Element`                        | PE returned no VM matching the CVM IP/name. Open the **Probe trace** in the error to see which endpoint returned what. Most often: PE creds are wrong, or PE is unreachable from NRCC.                  |
 | `PE rejected those credentials (401)`                                  | PE credentials are wrong. The modal will offer to re-enter them.                                                                                                                                      |
@@ -238,9 +246,10 @@ For deeper diagnostics, check the NRCC server log (`npm start` console). Probes 
 
 ## Security notes
 
-- Never run NRCC on a host that is also reachable by untrusted users — there is no built-in auth.
+- Never run NRCC on a host that is also reachable by untrusted users — there is no built-in auth on the NRCC port itself, so anyone who can hit `localhost:3000` inherits the cached PE session.
 - Never expose port 3000 beyond `localhost` without an HTTPS reverse proxy and an authentication layer in front.
 - PE/PC credentials are sent over HTTPS to Prism but transit `localhost` HTTP between the browser and NRCC. This is fine on a workstation but not over a multi-user terminal server.
+- PE credentials are cached **only** in the NRCC server process's memory, scoped to an `HttpOnly`, `SameSite=Strict` session cookie (`nrcc_sid`), with an 8-hour rolling inactivity TTL. They are never written to browser storage and never returned in an API response. To wipe them, click **Forget PE credentials** or restart the NRCC process.
 - Rotate any credentials you used while testing in this tool.
 
 ---

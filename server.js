@@ -13,15 +13,99 @@ const port = Number(process.env.PORT || 3000);
 const wsProxySessions = new Map();
 const vmListVariantCache = new Map();
 
+// Default per-request timeout for Prism HTTP calls. Real Prism Central
+// instances under load routinely take 5-15 seconds to return a v4 vmm
+// page, so the historical 5 s probe timeout was too aggressive and
+// surfaced as `Failed to list VMs. timeout of 5000ms exceeded`. Override
+// with NUTANIX_API_TIMEOUT_MS in the environment if your PC is slower
+// still.
+const PRISM_HTTP_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.NUTANIX_API_TIMEOUT_MS || 30000)
+);
+
+// PE credentials live only in this in-memory map, scoped to an opaque
+// HttpOnly session cookie. They are never written to disk and never sent
+// back to the browser. They evaporate when the NRCC process restarts or
+// after SESSION_TTL_MS of inactivity.
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const serverSessions = new Map();
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  header.split(";").forEach((part) => {
+    const eq = part.indexOf("=");
+    if (eq < 0) return;
+    const key = part.slice(0, eq).trim();
+    if (!key) return;
+    try {
+      out[key] = decodeURIComponent(part.slice(eq + 1).trim());
+    } catch (_error) {
+      out[key] = part.slice(eq + 1).trim();
+    }
+  });
+  return out;
+}
+
+function setSessionCookie(res, sid) {
+  res.cookie("nrcc_sid", sid, {
+    httpOnly: true,
+    sameSite: "strict",
+    path: "/",
+    maxAge: SESSION_TTL_MS
+  });
+}
+
+function ensureSession(req, res, next) {
+  const cookies = parseCookies(req.headers.cookie);
+  let sid = cookies.nrcc_sid;
+  let session = sid ? serverSessions.get(sid) : null;
+  const now = Date.now();
+  if (!session || now - session.lastSeenAtMs > SESSION_TTL_MS) {
+    if (sid) serverSessions.delete(sid);
+    sid = crypto.randomUUID();
+    session = {
+      peCreds: new Map(),
+      createdAtMs: now,
+      lastSeenAtMs: now
+    };
+    serverSessions.set(sid, session);
+  } else {
+    session.lastSeenAtMs = now;
+  }
+  setSessionCookie(res, sid);
+  req.nrccSession = session;
+  req.nrccSid = sid;
+  next();
+}
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 app.use(
   "/vendor/novnc",
   express.static(path.join(__dirname, "node_modules", "@novnc", "novnc"))
 );
+app.use("/api", ensureSession);
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/api/pe-creds", (req, res) => {
+  const peHosts = Array.from(req.nrccSession.peCreds.keys()).sort();
+  res.json({ peHosts });
+});
+
+app.delete("/api/pe-creds", (req, res) => {
+  const cleared = req.nrccSession.peCreds.size;
+  req.nrccSession.peCreds.clear();
+  res.json({ cleared });
+});
+
+app.delete("/api/pe-creds/:peHost", (req, res) => {
+  const removed = req.nrccSession.peCreds.delete(req.params.peHost);
+  res.json({ removed });
 });
 
 function resolveAuth(body) {
@@ -42,7 +126,7 @@ function createPrismClient(pcHost, username, password, tlsSkipVerify) {
   const client = axios.create({
     auth: { username, password },
     headers: { "Content-Type": "application/json" },
-    timeout: 15000,
+    timeout: PRISM_HTTP_TIMEOUT_MS,
     // Lab-only: allow self-signed certs when explicitly enabled.
     httpsAgent: new https.Agent({
       rejectUnauthorized: !tlsSkipVerify
@@ -1105,7 +1189,7 @@ async function selectVmListVariant(client, pageSize, includeHiddenVms) {
   const cachedVariant = vmListVariantCache.get(cacheKey);
   if (cachedVariant !== undefined) {
     const cachedResp = await client.get(buildVmListUrl(pageSize, 0, cachedVariant), {
-      timeout: 8000
+      timeout: PRISM_HTTP_TIMEOUT_MS
     });
     return { variant: cachedVariant, firstResponse: cachedResp, score: 0 };
   }
@@ -1114,7 +1198,7 @@ async function selectVmListVariant(client, pageSize, includeHiddenVms) {
   const settled = await Promise.allSettled(
     variants.map(async (variant) => {
       const resp = await client.get(buildVmListUrl(pageSize, 0, variant), {
-        timeout: 5000
+        timeout: PRISM_HTTP_TIMEOUT_MS
       });
       const parsed = parseVmList(resp);
       const hiddenCount = parsed.filter(
@@ -1126,19 +1210,38 @@ async function selectVmListVariant(client, pageSize, includeHiddenVms) {
   );
 
   let best = null;
-  let lastError = null;
+  const failureReasons = [];
   for (const item of settled) {
     if (item.status === "fulfilled") {
       if (!best || item.value.score > best.score) {
         best = item.value;
       }
-    } else {
-      lastError = item.reason;
+    } else if (item.reason) {
+      const reason = item.reason;
+      const status = reason.response?.status;
+      const data = reason.response?.data;
+      const detail =
+        typeof data === "string"
+          ? data.slice(0, 160)
+          : data
+            ? JSON.stringify(data).slice(0, 160)
+            : reason.message || String(reason);
+      failureReasons.push(
+        `${reason.config?.url || "?"} -> ${status ?? "no-response"} ${detail}`
+      );
     }
   }
 
   if (!best) {
-    throw lastError || new Error("VM listing request failed.");
+    const unique = Array.from(new Set(failureReasons)).slice(0, 5);
+    const summary = unique.length
+      ? `All ${variants.length} VM-list probes failed against ${client.defaults.baseURL}:\n  - ${unique.join(
+          "\n  - "
+        )}`
+      : `All ${variants.length} VM-list probes failed against ${client.defaults.baseURL} with no response.`;
+    const err = new Error(summary);
+    err.allProbesFailed = true;
+    throw err;
   }
   vmListVariantCache.set(cacheKey, best.variant);
   return best;
@@ -1155,7 +1258,7 @@ async function fetchCvmFocusedPage(client, pageSize, offset) {
   await Promise.allSettled(
     filterVariants.map(async (filter) => {
       const url = `/api/vmm/v4.0/ahv/config/vms?$limit=${pageSize}&$page=${offset}&${filter}`;
-      const resp = await client.get(url, { timeout: 4000 });
+      const resp = await client.get(url, { timeout: PRISM_HTTP_TIMEOUT_MS });
       results.push(...parseVmList(resp));
     })
   );
@@ -1190,7 +1293,7 @@ app.post("/api/vms", async (req, res) => {
           ? selected.firstResponse
           : await client.get(
               buildVmListUrl(pageSize, offset, selectedVariant),
-              { timeout: 8000 }
+              { timeout: PRISM_HTTP_TIMEOUT_MS }
             );
       const regularPage = parseVmList(vmResp);
       const cvmFocusedPage = includeHiddenVms
@@ -1410,11 +1513,16 @@ app.post("/api/pe-test", async (req, res) => {
       console.log(
         `[pe-test] OK ${resp.status} ${probe.method} ${probe.url} count=${entities.length}`
       );
+      // Cache the validated credentials in the server-side session map.
+      // The browser is only told the host was authenticated; the credentials
+      // themselves are never returned in the response.
+      req.nrccSession.peCreds.set(peHost, { peUsername, pePassword });
       return res.json({
         ok: true,
         peHost,
         clustersSeen: entities.length,
         viaUrl: `${probe.method} ${probe.url}`,
+        stored: true,
         trace
       });
     } catch (error) {
@@ -1472,8 +1580,6 @@ app.post("/api/console-token", async (req, res) => {
     const peHost = (req.body.peHost || "").trim();
     const cvmIp = (req.body.cvmIp || "").trim();
     const cvmName = (req.body.cvmName || "").trim();
-    const peUsername = (req.body.peUsername || "").trim();
-    const pePassword = req.body.pePassword || "";
 
     if (!pcHost || !username || !password) {
       return res.status(400).json({
@@ -1490,18 +1596,27 @@ app.post("/api/console-token", async (req, res) => {
 
     const apiHost = peHost || pcHost;
     const usingPe = Boolean(peHost);
-    if (usingPe && (!peUsername || !pePassword)) {
-      return res.status(401).json({
-        error: "PE credentials required.",
-        details:
-          `Prism Element at ${apiHost} requires its own credentials. ` +
-          "Provide peUsername/pePassword.",
-        needPeCredentials: true,
-        peHost: apiHost
-      });
+    let apiUsername = username;
+    let apiPassword = password;
+    if (usingPe) {
+      // PE credentials are only ever read from the server-side session
+      // cache. The client cannot pass them inline; it must authenticate
+      // them once via /api/pe-test, which stores them under this session.
+      const cached = req.nrccSession.peCreds.get(peHost);
+      if (!cached) {
+        return res.status(401).json({
+          error: "PE credentials required.",
+          details:
+            `Prism Element at ${apiHost} requires its own credentials. ` +
+            "Authenticate this PE once via /api/pe-test; NRCC will cache " +
+            "the credentials in server memory for this session only.",
+          needPeCredentials: true,
+          peHost: apiHost
+        });
+      }
+      apiUsername = cached.peUsername;
+      apiPassword = cached.pePassword;
     }
-    const apiUsername = usingPe ? peUsername : username;
-    const apiPassword = usingPe ? pePassword : password;
     const client = createPrismClient(
       apiHost,
       apiUsername,
@@ -1766,6 +1881,11 @@ setInterval(() => {
   for (const [sessionId, session] of wsProxySessions.entries()) {
     if (now - session.createdAtMs > 10 * 60 * 1000) {
       wsProxySessions.delete(sessionId);
+    }
+  }
+  for (const [sid, session] of serverSessions.entries()) {
+    if (now - session.lastSeenAtMs > SESSION_TTL_MS) {
+      serverSessions.delete(sid);
     }
   }
 }, 60 * 1000);

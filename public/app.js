@@ -22,48 +22,66 @@ const screenStageEl = document.getElementById("screenStage");
 
 const profileStorageKey = "ntnxConsoleProfile";
 const favoritesStorageKey = "ntnxConsoleFavoriteVms";
-const peCredsStorageKey = "ntnxConsolePeCreds";
 
 const peCredsModal = document.getElementById("peCredsModal");
 const peCredsHostLabel = document.getElementById("peCredsHost");
 const peCredsHostInput = document.getElementById("peCredsHostInput");
 const peCredsUsernameInput = document.getElementById("peCredsUsername");
 const peCredsPasswordInput = document.getElementById("peCredsPassword");
-const peCredsRememberInput = document.getElementById("peCredsRemember");
 const peCredsErrorEl = document.getElementById("peCredsError");
 const peCredsCancelBtn = document.getElementById("peCredsCancel");
 const peCredsSaveBtn = document.getElementById("peCredsSave");
+const forgetPeCredsBtn = document.getElementById("forgetPeCredsBtn");
 
-function loadPeCredsMap() {
+// Set of PE hosts the NRCC server currently has cached credentials for, in
+// its own in-memory session store. The browser never holds the credentials
+// themselves -- only the host names, so the UI knows when a re-prompt is
+// needed.
+let serverPeHosts = new Set();
+
+async function refreshPeCredsCache() {
   try {
-    const raw = localStorage.getItem(peCredsStorageKey);
-    return raw ? JSON.parse(raw) : {};
+    const resp = await fetch("/api/pe-creds", { credentials: "same-origin" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    serverPeHosts = new Set(Array.isArray(data.peHosts) ? data.peHosts : []);
   } catch (_error) {
-    return {};
+    /* offline or transient; leave cache untouched */
   }
 }
 
-function savePeCredsMap(map) {
+async function clearAllPeCreds() {
   try {
-    localStorage.setItem(peCredsStorageKey, JSON.stringify(map));
+    const resp = await fetch("/api/pe-creds", {
+      method: "DELETE",
+      credentials: "same-origin"
+    });
+    if (!resp.ok) {
+      setStatus(`Could not clear PE credentials (HTTP ${resp.status}).`);
+      return;
+    }
+    const data = await resp.json();
+    serverPeHosts.clear();
+    setStatus(
+      data.cleared
+        ? `Cleared cached PE credentials for ${data.cleared} host(s).`
+        : "No cached PE credentials to clear."
+    );
+  } catch (error) {
+    setStatus(`Failed to clear PE credentials: ${error.message}`);
+  }
+}
+
+async function dropPeCreds(peHost) {
+  serverPeHosts.delete(peHost);
+  try {
+    await fetch(`/api/pe-creds/${encodeURIComponent(peHost)}`, {
+      method: "DELETE",
+      credentials: "same-origin"
+    });
   } catch (_error) {
-    /* ignore */
+    /* best-effort */
   }
-}
-
-function getPeCreds(peHost) {
-  const map = loadPeCredsMap();
-  return map[peHost] || null;
-}
-
-function setPeCreds(peHost, creds, remember) {
-  const map = loadPeCredsMap();
-  if (remember) {
-    map[peHost] = creds;
-  } else {
-    delete map[peHost];
-  }
-  savePeCredsMap(map);
 }
 
 function promptForPeCreds(peHost) {
@@ -72,7 +90,6 @@ function promptForPeCreds(peHost) {
     peCredsHostInput.value = peHost;
     peCredsUsernameInput.value = "admin";
     peCredsPasswordInput.value = "";
-    peCredsRememberInput.checked = true;
     peCredsErrorEl.style.display = "none";
     peCredsErrorEl.textContent = "";
     peCredsModal.classList.add("open");
@@ -82,10 +99,12 @@ function promptForPeCreds(peHost) {
       peCredsModal.classList.remove("open");
       peCredsCancelBtn.removeEventListener("click", onCancel);
       peCredsSaveBtn.removeEventListener("click", onSave);
+      // Wipe the password from the input so it doesn't linger in the DOM.
+      peCredsPasswordInput.value = "";
     };
     const onCancel = () => {
       cleanup();
-      resolve(null);
+      resolve(false);
     };
     const onSave = async () => {
       const peUsername = peCredsUsernameInput.value.trim();
@@ -101,6 +120,7 @@ function promptForPeCreds(peHost) {
       try {
         const resp = await fetch("/api/pe-test", {
           method: "POST",
+          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             peHost,
@@ -119,10 +139,9 @@ function promptForPeCreds(peHost) {
           peCredsErrorEl.style.display = "block";
           return;
         }
-        const creds = { peUsername, pePassword };
-        setPeCreds(peHost, creds, peCredsRememberInput.checked);
+        serverPeHosts.add(peHost);
         cleanup();
-        resolve(creds);
+        resolve(true);
       } catch (error) {
         peCredsErrorEl.textContent = `Network error: ${error.message}`;
         peCredsErrorEl.style.display = "block";
@@ -333,6 +352,7 @@ async function loadVms() {
   try {
     const resp = await fetch("/api/vms", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         pcHost,
@@ -460,17 +480,14 @@ async function connectConsole() {
   };
 
   if (selectedVm?.peHost) {
-    let peCreds = getPeCreds(selectedVm.peHost);
-    if (!peCreds) {
+    if (!serverPeHosts.has(selectedVm.peHost)) {
       setStatus(`Need PE credentials for ${selectedVm.peHost}...`);
-      peCreds = await promptForPeCreds(selectedVm.peHost);
-      if (!peCreds) {
+      const ok = await promptForPeCreds(selectedVm.peHost);
+      if (!ok) {
         setStatus("Cancelled. PE credentials are required for this CVM.");
         return;
       }
     }
-    tokenBody.peUsername = peCreds.peUsername;
-    tokenBody.pePassword = peCreds.pePassword;
     setStatus(`Requesting console token via PE ${selectedVm.peHost}...`);
   } else {
     setStatus("Requesting console token...");
@@ -479,29 +496,30 @@ async function connectConsole() {
   try {
     let resp = await fetch("/api/console-token", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(tokenBody)
     });
     let data = await resp.json();
 
-    // If PE rejected stored creds, drop and re-prompt once.
+    // If the server says it has no creds for this PE (or PE rejected the
+    // cached creds), drop them and re-prompt once.
     if (
       !resp.ok &&
       selectedVm?.peHost &&
       (data?.needPeCredentials || resp.status === 401)
     ) {
-      setPeCreds(selectedVm.peHost, null, false);
-      setStatus(`PE rejected saved credentials. Re-enter for ${selectedVm.peHost}.`);
-      const fresh = await promptForPeCreds(selectedVm.peHost);
-      if (!fresh) {
+      await dropPeCreds(selectedVm.peHost);
+      setStatus(`PE credentials needed for ${selectedVm.peHost}.`);
+      const ok = await promptForPeCreds(selectedVm.peHost);
+      if (!ok) {
         setStatus("Cancelled. PE credentials are required for this CVM.");
         return;
       }
-      tokenBody.peUsername = fresh.peUsername;
-      tokenBody.pePassword = fresh.pePassword;
       setStatus(`Retrying console token via PE ${selectedVm.peHost}...`);
       resp = await fetch("/api/console-token", {
         method: "POST",
+        credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(tokenBody)
       });
@@ -558,6 +576,7 @@ async function connectConsole() {
 loadSavedProfile();
 loadFavorites();
 renderVmLists();
+refreshPeCredsCache();
 connectBtn.addEventListener("click", connectConsole);
 loadVmsBtn.addEventListener("click", loadVms);
 showAllBtn.addEventListener("click", () => {
@@ -568,6 +587,9 @@ showFavoritesBtn.addEventListener("click", () => {
   showOnlyFavorites = true;
   renderVmLists();
 });
+if (forgetPeCredsBtn) {
+  forgetPeCredsBtn.addEventListener("click", clearAllPeCreds);
+}
 vmUuidInput.addEventListener("input", renderVmLists);
 nameFilterInput.addEventListener("input", renderVmLists);
 powerStateFilter.addEventListener("change", renderVmLists);
