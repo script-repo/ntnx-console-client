@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NRCC — Nutanix Remote Console Client</title>
+    <style>
+      :root {
+        --ntx-bg: #f4f6fa;
+        --ntx-surface: #ffffff;
+        --ntx-surface-2: #fafbfd;
+        --ntx-border: #e2e6ee;
+        --ntx-border-strong: #cdd4e0;
+        --ntx-text: #131c2e;
+        --ntx-text-muted: #5a6478;
+        --ntx-text-subtle: #8892a3;
+        --ntx-brand: #1a3253;
+        --ntx-brand-2: #213e63;
+        --ntx-accent: #1565ff;
+        --ntx-accent-soft: #e8efff;
+        --ntx-accent-hover: #0f4fd1;
+        --ntx-success: #1f9d55;
+        --ntx-warn: #c2410c;
+        --ntx-danger: #be123c;
+        --ntx-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+        --ntx-shadow-md: 0 4px 14px rgba(15, 23, 42, 0.08);
+        --ntx-shadow-lg: 0 18px 40px rgba(15, 23, 42, 0.18);
+        --ntx-radius: 6px;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family:
+          "Inter",
+          "Segoe UI",
+          -apple-system,
+          BlinkMacSystemFont,
+          "Helvetica Neue",
+          Arial,
+          sans-serif;
+        background: var(--ntx-bg);
+        color: var(--ntx-text);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      .topbar {
+        background: linear-gradient(90deg, var(--ntx-brand) 0%, var(--ntx-brand-2) 100%);
+        color: #fff;
+        padding: 12px 20px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        box-shadow: var(--ntx-shadow-sm);
+      }
+      .topbar-mark {
+        width: 26px;
+        height: 26px;
+        border-radius: 6px;
+        background: linear-gradient(135deg, #4f8dff, #1565ff);
+        display: grid;
+        place-items: center;
+        color: #fff;
+        font-weight: 700;
+        font-size: 13px;
+        letter-spacing: 0.5px;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18);
+      }
+      .topbar-title {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.1px;
+      }
+      .topbar-sub {
+        color: rgba(255, 255, 255, 0.65);
+        font-size: 12px;
+        margin-left: 4px;
+      }
+      .container {
+        max-width: 1600px;
+        margin: 0 auto;
+        padding: 16px;
+      }
+      .panel {
+        background: var(--ntx-surface);
+        border: 1px solid var(--ntx-border);
+        border-radius: var(--ntx-radius);
+        margin-bottom: 14px;
+        box-shadow: var(--ntx-shadow-sm);
+      }
+      .panel-body {
+        padding: 14px 16px;
+      }
+      .toolbar {
+        display: grid;
+        grid-template-columns: 1.1fr 1fr 1fr 1fr auto auto;
+        gap: 10px;
+        align-items: center;
+      }
+      input,
+      select,
+      button {
+        height: 34px;
+        border: 1px solid var(--ntx-border-strong);
+        border-radius: 4px;
+        padding: 0 10px;
+        font-size: 13px;
+        font-family: inherit;
+        color: var(--ntx-text);
+        transition:
+          border-color 120ms ease,
+          box-shadow 120ms ease,
+          background 120ms ease;
+      }
+      input,
+      select {
+        background: #fff;
+      }
+      input:focus,
+      select:focus {
+        outline: none;
+        border-color: var(--ntx-accent);
+        box-shadow: 0 0 0 3px rgba(21, 101, 255, 0.18);
+      }
+      button {
+        background: #fff;
+        cursor: pointer;
+        font-weight: 500;
+        color: var(--ntx-text);
+      }
+      button:hover {
+        background: #f4f7fc;
+        border-color: var(--ntx-text-subtle);
+      }
+      button:focus-visible {
+        outline: none;
+        border-color: var(--ntx-accent);
+        box-shadow: 0 0 0 3px rgba(21, 101, 255, 0.2);
+      }
+      button.primary {
+        background: var(--ntx-accent);
+        border-color: var(--ntx-accent);
+        color: #fff;
+      }
+      button.primary:hover {
+        background: var(--ntx-accent-hover);
+        border-color: var(--ntx-accent-hover);
+      }
+      .option-row {
+        margin-top: 10px;
+        display: flex;
+        gap: 18px;
+        font-size: 12.5px;
+        color: var(--ntx-text-muted);
+      }
+      .option-row label {
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+        cursor: pointer;
+      }
+      .option-row input[type="checkbox"] {
+        height: auto;
+        accent-color: var(--ntx-accent);
+      }
+      .layout {
+        display: flex;
+        gap: 14px;
+      }
+      .sidebar {
+        width: 380px;
+        flex-shrink: 0;
+      }
+      .main {
+        flex: 1;
+        min-width: 0;
+      }
+      .section-title {
+        margin: 0 0 8px 0;
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--ntx-text-subtle);
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+      }
+      .filters {
+        display: grid;
+        gap: 8px;
+      }
+      .vm-actions {
+        display: flex;
+        gap: 6px;
+        margin: 12px 0 8px;
+      }
+      .vm-actions button {
+        height: 28px;
+        padding: 0 12px;
+        font-size: 12px;
+      }
+      #favoritesList,
+      #vmList {
+        display: grid;
+        gap: 4px;
+        max-height: 290px;
+        overflow: auto;
+        padding-right: 2px;
+      }
+      #favoritesList::-webkit-scrollbar,
+      #vmList::-webkit-scrollbar {
+        width: 8px;
+      }
+      #favoritesList::-webkit-scrollbar-thumb,
+      #vmList::-webkit-scrollbar-thumb {
+        background: #cdd4e0;
+        border-radius: 4px;
+      }
+      .vm-row {
+        display: grid;
+        grid-template-columns: 30px 1fr;
+        gap: 6px;
+        align-items: stretch;
+      }
+      .vm-item {
+        border: 1px solid var(--ntx-border);
+        background: var(--ntx-surface);
+        border-radius: 5px;
+        padding: 8px 10px;
+        cursor: pointer;
+        transition:
+          border-color 120ms ease,
+          background 120ms ease,
+          box-shadow 120ms ease;
+      }
+      .vm-item:hover {
+        background: var(--ntx-accent-soft);
+        border-color: #b9cfff;
+      }
+      .vm-item.active {
+        border-color: var(--ntx-accent);
+        background: var(--ntx-accent-soft);
+        box-shadow: 0 0 0 1px var(--ntx-accent) inset;
+      }
+      .vm-name {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--ntx-text);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .vm-meta {
+        margin-top: 3px;
+        color: var(--ntx-text-muted);
+        font-size: 11.5px;
+      }
+      .state-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 1px 8px;
+        border-radius: 999px;
+        font-size: 10.5px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+        color: var(--ntx-text-muted);
+        background: #eef1f6;
+      }
+      .state-pill::before {
+        content: "";
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        opacity: 0.7;
+      }
+      .vm-item .state-pill[data-state="ON"],
+      .vm-item .state-pill[data-state="POWERED_ON"] {
+        color: var(--ntx-success);
+        background: #e8f6ee;
+      }
+      .vm-item .state-pill[data-state="OFF"],
+      .vm-item .state-pill[data-state="POWERED_OFF"] {
+        color: var(--ntx-text-subtle);
+        background: #eef1f6;
+      }
+      .vm-item .state-pill[data-state="PAUSED"],
+      .vm-item .state-pill[data-state="SUSPENDED"] {
+        color: var(--ntx-warn);
+        background: #fdecde;
+      }
+      .star {
+        height: 28px;
+        width: 28px;
+        padding: 0;
+        background: transparent;
+        border: 1px solid transparent;
+        color: #c1c8d4;
+        font-size: 16px;
+        align-self: center;
+      }
+      .star:hover {
+        color: #f5b400;
+        background: transparent;
+        border-color: transparent;
+      }
+      #status {
+        margin-bottom: 12px;
+        color: var(--ntx-text);
+        font-size: 13px;
+        font-weight: 500;
+        padding: 8px 12px;
+        background: var(--ntx-accent-soft);
+        border: 1px solid #c9dbff;
+        border-radius: 5px;
+      }
+      .tabs {
+        display: flex;
+        align-items: flex-end;
+        gap: 0;
+        margin-bottom: 0;
+        padding-left: 4px;
+        position: relative;
+        z-index: 1;
+        flex-wrap: wrap;
+        row-gap: 2px;
+      }
+      .tab {
+        display: inline-flex;
+        gap: 8px;
+        align-items: center;
+        border: 1px solid var(--ntx-border-strong);
+        background: linear-gradient(180deg, #f0f3f9, #e3e8f1);
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 7px 14px 8px 14px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--ntx-text-muted);
+        cursor: pointer;
+        max-width: 240px;
+        position: relative;
+        margin-left: -8px;
+        z-index: 1;
+        transition:
+          background 120ms ease,
+          color 120ms ease,
+          z-index 0s;
+      }
+      .tab:first-child {
+        margin-left: 0;
+      }
+      .tab:hover {
+        background: linear-gradient(180deg, #fafcff, #ebf0f9);
+        color: var(--ntx-text);
+        z-index: 2;
+      }
+      .tab > span:first-child {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 200px;
+      }
+      .tab.active {
+        background: var(--ntx-surface);
+        color: var(--ntx-text);
+        border-color: var(--ntx-border-strong);
+        z-index: 5;
+      }
+      .tab.active::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: -1px;
+        height: 2px;
+        background: var(--ntx-surface);
+      }
+      .tab.active::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        height: 2px;
+        background: var(--ntx-accent);
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+      }
+      .tab-close {
+        border: 0;
+        background: transparent;
+        height: auto;
+        padding: 0 2px;
+        color: var(--ntx-text-subtle);
+        font-size: 14px;
+        line-height: 1;
+        border-radius: 3px;
+      }
+      .tab-close:hover {
+        color: var(--ntx-danger);
+        background: rgba(190, 18, 60, 0.08);
+      }
+      .console-stage {
+        border: 1px solid var(--ntx-border-strong);
+        background: #000;
+        height: 70vh;
+        position: relative;
+        border-radius: 0 var(--ntx-radius) var(--ntx-radius) var(--ntx-radius);
+        overflow: hidden;
+        box-shadow: var(--ntx-shadow-sm);
+      }
+      .console-pane {
+        position: absolute;
+        inset: 0;
+        display: none;
+      }
+      .console-pane.active {
+        display: block;
+      }
+      .muted {
+        color: var(--ntx-text-subtle);
+        font-size: 12px;
+      }
+      details#probeDetails {
+        margin-bottom: 10px;
+        border: 1px solid var(--ntx-border);
+        border-radius: 5px;
+        padding: 6px 10px;
+        background: var(--ntx-surface-2);
+      }
+      details#probeDetails summary {
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--ntx-text-muted);
+      }
+      details#probeDetails pre {
+        white-space: pre-wrap;
+        background: #fff;
+        border: 1px solid var(--ntx-border);
+        padding: 8px;
+        border-radius: 4px;
+        font-size: 11.5px;
+        color: var(--ntx-text-muted);
+        margin-top: 8px;
+      }
+      .modal-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.55);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 50;
+        backdrop-filter: blur(2px);
+      }
+      .modal-backdrop.open {
+        display: flex;
+      }
+      .modal {
+        background: #fff;
+        border: 1px solid var(--ntx-border);
+        border-radius: 8px;
+        width: 440px;
+        max-width: calc(100vw - 32px);
+        box-shadow: var(--ntx-shadow-lg);
+        overflow: hidden;
+      }
+      .modal-header {
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--ntx-border);
+        background: linear-gradient(90deg, var(--ntx-brand), var(--ntx-brand-2));
+        color: #fff;
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .modal-body {
+        padding: 16px 18px;
+        display: grid;
+        gap: 12px;
+        font-size: 13px;
+      }
+      .modal-body p {
+        margin: 0;
+        color: var(--ntx-text-muted);
+        line-height: 1.5;
+      }
+      .modal-body label {
+        display: grid;
+        gap: 4px;
+        font-weight: 600;
+        color: var(--ntx-text);
+        font-size: 12px;
+      }
+      .modal-body input {
+        width: 100%;
+      }
+      .modal-footer {
+        padding: 12px 18px;
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        border-top: 1px solid var(--ntx-border);
+        background: var(--ntx-surface-2);
+      }
+      .modal-error {
+        color: var(--ntx-danger);
+        font-size: 12px;
+        background: #fdf2f4;
+        border: 1px solid #fbd0da;
+        border-radius: 4px;
+        padding: 8px 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-mark">N</div>
+      <h1 class="topbar-title">Nutanix Remote Console Client</h1>
+      <span class="topbar-sub">NRCC</span>
+    </header>
+    <div class="container">
+      <section class="panel">
+        <div class="panel-body">
+          <div class="toolbar">
+            <input id="pcHost" placeholder="Prism Central IP or hostname" />
+            <input id="username" placeholder="Username" autocomplete="username" />
+            <input
+              id="password"
+              type="password"
+              placeholder="Password"
+              autocomplete="current-password"
+            />
+            <input id="vmUuid" placeholder="VM UUID (manual optional)" />
+            <button id="loadVmsBtn">Load VMs</button>
+            <button id="connectBtn" class="primary">Open Console</button>
+          </div>
+          <div class="option-row">
+            <label>
+              <input id="rememberProfile" type="checkbox" />
+              Remember host and username
+            </label>
+            <label>
+              <input id="allowSelfSignedTls" type="checkbox" checked />
+              Allow self-signed TLS (lab)
+            </label>
+            <label>
+              <input id="includeHiddenVms" type="checkbox" checked />
+              Include hidden/system VMs (CVMs)
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <div class="layout">
+        <aside class="sidebar">
+          <section class="panel">
+            <div class="panel-body">
+              <div class="section-title">Filter</div>
+              <div class="filters">
+                <input id="nameFilter" placeholder="Search name (full or partial)" />
+                <select id="powerStateFilter">
+                  <option value="">All power states</option>
+                </select>
+                <select id="categoryFilter">
+                  <option value="">All categories</option>
+                </select>
+              </div>
+              <div class="vm-actions">
+                <button id="showAllBtn">All</button>
+                <button id="showFavoritesBtn">Favorites</button>
+              </div>
+              <div class="section-title">Favorites</div>
+              <div id="favoritesList"></div>
+              <div class="section-title">VMs</div>
+              <div id="vmList"></div>
+            </div>
+          </section>
+        </aside>
+
+        <main class="main">
+          <section class="panel">
+            <div class="panel-body">
+              <div id="status">Idle</div>
+              <details id="probeDetails" style="display:none">
+                <summary>CVM probe details</summary>
+                <pre id="probeDetailsContent"></pre>
+              </details>
+              <div id="consoleTabs" class="tabs"></div>
+              <div id="screenStage" class="console-stage"></div>
+              <p class="muted">Multiple console sessions stay open in tabs.</p>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <div id="peCredsModal" class="modal-backdrop" role="dialog" aria-modal="true">
+      <div class="modal">
+        <div class="modal-header">
+          Prism Element credentials required
+        </div>
+        <div class="modal-body">
+          <p style="margin:0;color:#4b5563">
+            Prism Central credentials don't authenticate to <span id="peCredsHost" style="font-weight:600"></span>.
+            Enter local PE credentials. They will be stored in this browser only and reused for this PE.
+          </p>
+          <label>
+            PE host
+            <input id="peCredsHostInput" readonly />
+          </label>
+          <label>
+            PE username
+            <input id="peCredsUsername" placeholder="admin" autocomplete="off" />
+          </label>
+          <label>
+            PE password
+            <input id="peCredsPassword" type="password" autocomplete="off" />
+          </label>
+          <label style="font-weight:400">
+            <input id="peCredsRemember" type="checkbox" checked />
+            Remember for this PE
+          </label>
+          <div id="peCredsError" class="modal-error" style="display:none"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="peCredsCancel">Cancel</button>
+          <button id="peCredsSave" class="primary">Test &amp; Save</button>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
