@@ -1469,6 +1469,82 @@ app.post("/api/vms", async (req, res) => {
   }
 });
 
+// Lightweight credential probe used by the login screen so the user
+// gets into the app shell within a second or two, instead of waiting
+// for the full multi-cluster VM list to come back from /api/vms.
+app.post("/api/pc-test", async (req, res) => {
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "pcHost, username, and password are required." });
+    }
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    // A handful of fast probes, tried in parallel: whichever returns
+    // first (with auth-acceptance) wins. We bound each at 6 s so a
+    // misbehaving endpoint can't drag the whole login down.
+    const probeTimeoutMs = 6000;
+    const probes = [
+      () => client.get("/api/clustermgmt/v4.0/config/clusters?$limit=1", { timeout: probeTimeoutMs }),
+      () => client.get("/api/clustermgmt/v4.1/config/clusters?$limit=1", { timeout: probeTimeoutMs }),
+      () => client.get("/PrismGateway/services/rest/v2.0/cluster", { timeout: probeTimeoutMs }),
+      () =>
+        client.post(
+          "/api/nutanix/v3/clusters/list",
+          { kind: "cluster", length: 1 },
+          { timeout: probeTimeoutMs }
+        )
+    ];
+    let sawAuthFailure = false;
+    let lastDetail = "";
+    const tryProbe = (fn) =>
+      fn().then(
+        (resp) => ({ ok: true, status: resp.status }),
+        (error) => {
+          const status = error.response?.status || null;
+          if (status === 401) sawAuthFailure = true;
+          const data = error.response?.data;
+          const text =
+            typeof data === "string"
+              ? data
+              : data
+                ? JSON.stringify(data)
+                : error.message || "";
+          lastDetail = text.slice(0, 200);
+          return { ok: false, status, message: lastDetail };
+        }
+      );
+
+    // Promise.any resolves on the first fulfilled probe whose result is
+    // ok. We wrap each probe in an inversion so non-ok results reject,
+    // letting Promise.any short-circuit on the first true success.
+    const inverted = probes.map((fn) =>
+      tryProbe(fn).then((r) => (r.ok ? r : Promise.reject(r)))
+    );
+    try {
+      const winner = await Promise.any(inverted);
+      return res.json({ ok: true, status: winner.status });
+    } catch (_aggregate) {
+      if (sawAuthFailure) {
+        return res.status(401).json({
+          ok: false,
+          error: "Prism Central rejected those credentials (401).",
+          details: lastDetail || undefined
+        });
+      }
+      return res.status(502).json({
+        ok: false,
+        error: `Prism Central at ${pcHost} did not respond to any probe.`,
+        details: lastDetail || undefined
+      });
+    }
+  } catch (error) {
+    const { status, details } = formatAxiosError(error);
+    res.status(status).json({ ok: false, error: "PC test failed.", details });
+  }
+});
+
 app.post("/api/pe-test", async (req, res) => {
   const peHost = (req.body.peHost || "").trim();
   const peUsername = (req.body.peUsername || "").trim();
@@ -1791,6 +1867,254 @@ app.post("/api/console-token", async (req, res) => {
     console.error("Console token failed:", details);
     res.status(status).json({
       error: "Failed to generate console token.",
+      details
+    });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Power actions (Power On / Power Off) for AHV VMs managed by Prism
+// Central. CVMs are intentionally not supported here — they're managed
+// by the cluster's own genesis service and shouldn't be power-cycled
+// from a generic console launcher.
+// ---------------------------------------------------------------------
+
+async function getVmEntityEtag(client, vmUuid) {
+  const candidates = [
+    `/api/vmm/v4.0/ahv/config/vms/${vmUuid}`,
+    `/api/vmm/v4.1/ahv/config/vms/${vmUuid}`,
+    `/api/vmm/v4.2/ahv/config/vms/${vmUuid}`
+  ];
+  for (const url of candidates) {
+    try {
+      const resp = await client.get(url);
+      // Axios normalizes header names to lowercase, but some Prism
+      // responses also expose the entity ETag in the body as a
+      // `$reserved`/`metadata` field. Prefer the HTTP ETag header.
+      const etag =
+        resp.headers?.etag ||
+        resp.headers?.ETag ||
+        resp.data?.data?.$reserved?.["ETag"] ||
+        resp.data?.data?.metadata?.entityVersion ||
+        null;
+      if (etag) {
+        console.log(`[vm-power] got etag from ${url}: ${etag}`);
+        return etag;
+      }
+      // GET worked but no ETag was returned -- try the next API version.
+    } catch (_error) {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+async function postVmAction(client, url, ifMatchEtag) {
+  // Mirror the pattern that startConsoleTokenTask uses: no body, no
+  // Content-Type. Some Prism builds reject `{}` here with `INTERNAL_ERROR`
+  // or `Bad Request` because they don't expect a body for $action POSTs.
+  const headers = { "Content-Type": undefined };
+  if (ifMatchEtag) headers["If-Match"] = ifMatchEtag;
+  return client.request({
+    method: "post",
+    url,
+    headers,
+    data: undefined
+  });
+}
+
+function isEtagRequiredError(status, messageText) {
+  // Different Prism builds signal "I need an If-Match header" in
+  // wildly different ways:
+  //   - HTTP 412 Precondition Failed (textbook)
+  //   - HTTP 428 Precondition Required (textbook)
+  //   - HTTP 400 with code VMM-30300 / errorGroup VM_ETAG_MISSING / wording
+  //     mentioning "If-Match" or "ETag"
+  if (status === 412 || status === 428) return true;
+  if (status === 400) {
+    const t = (messageText || "").toLowerCase();
+    if (
+      t.includes("vmm-30300") ||
+      t.includes("vm_etag_missing") ||
+      t.includes("etag_missing") ||
+      t.includes("if-match") ||
+      t.includes("if_match") ||
+      t.includes("missing etag")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function setVmPowerAction(client, vmUuid, action) {
+  // action: 'on' | 'off' (force power-off; not graceful shutdown).
+  const variants = [
+    `/api/vmm/v4.2/ahv/config/vms/${vmUuid}/$actions/power-${action}`,
+    `/api/vmm/v4.1/ahv/config/vms/${vmUuid}/$actions/power-${action}`,
+    `/api/vmm/v4.0/ahv/config/vms/${vmUuid}/$actions/power-${action}`
+  ];
+  let etag = null;
+  let lastError = null;
+  for (const url of variants) {
+    try {
+      const resp = await postVmAction(client, url, etag);
+      return { resp, usedUrl: url };
+    } catch (error) {
+      const status = error.response?.status;
+      const data = error.response?.data;
+      const messageText =
+        typeof data === "string"
+          ? data
+          : data
+            ? JSON.stringify(data)
+            : error.message || "";
+      console.warn(
+        `[vm-power] ${action} attempt ${url} -> ${status ?? "?"} ${messageText.slice(0, 200)}`
+      );
+      // Endpoint not present on this PC version: move to next candidate.
+      // (Be careful: a 400 that's about a missing ETag is NOT "no api path".)
+      if (
+        status === 400 &&
+        messageText.toLowerCase().includes("no api path") &&
+        !isEtagRequiredError(status, messageText)
+      ) {
+        lastError = error;
+        continue;
+      }
+      // ETag required: fetch the entity ETag and retry the same URL.
+      if (isEtagRequiredError(status, messageText) && !etag) {
+        const fresh = await getVmEntityEtag(client, vmUuid).catch(() => null);
+        if (fresh) {
+          etag = fresh;
+          try {
+            const resp2 = await postVmAction(client, url, etag);
+            return { resp: resp2, usedUrl: url };
+          } catch (retryErr) {
+            const retryStatus = retryErr.response?.status;
+            const retryData = retryErr.response?.data;
+            const retryMsg =
+              typeof retryData === "string"
+                ? retryData
+                : retryData
+                  ? JSON.stringify(retryData)
+                  : retryErr.message || "";
+            console.warn(
+              `[vm-power] ${action} retry-with-etag ${url} -> ${retryStatus ?? "?"} ${retryMsg.slice(0, 200)}`
+            );
+            // If the retry says the endpoint isn't here, fall through to
+            // the next variant. Otherwise propagate the error so the
+            // user sees the real reason.
+            if (
+              retryStatus === 400 &&
+              retryMsg.toLowerCase().includes("no api path")
+            ) {
+              lastError = retryErr;
+              continue;
+            }
+            throw retryErr;
+          }
+        }
+        // Couldn't get an ETag at all -- bail out with the original error.
+        throw error;
+      }
+      throw error;
+    }
+  }
+  throw lastError || new Error(`No supported power-${action} endpoint found.`);
+}
+
+app.post("/api/vm-power", async (req, res) => {
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    const vmUuid = (req.body.vmUuid || "").trim();
+    const action = String(req.body.action || "").toLowerCase();
+    const peHost = (req.body.peHost || "").trim();
+
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({
+        error:
+          "pcHost, username, and password are required (request body or .env fallback)."
+      });
+    }
+    if (!vmUuid) {
+      return res.status(400).json({ error: "vmUuid is required." });
+    }
+    if (action !== "on" && action !== "off") {
+      return res
+        .status(400)
+        .json({ error: "action must be 'on' or 'off'." });
+    }
+    if (peHost) {
+      // CVMs are stamped with peHost; refuse to power-cycle them from here.
+      return res.status(400).json({
+        error: "Power on/off is not available for CVMs through NRCC.",
+        details:
+          "Controller VMs are managed by the cluster's genesis service. " +
+          "Use cluster-level tools (genesis stop / cluster start) instead."
+      });
+    }
+
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    const { resp, usedUrl } = await setVmPowerAction(client, vmUuid, action);
+
+    const taskUuid =
+      resp.data?.data?.extId ||
+      resp.data?.data?.id ||
+      resp.data?.extId ||
+      resp.data?.id;
+
+    if (!taskUuid) {
+      return res.json({
+        ok: true,
+        status: "submitted",
+        via: usedUrl,
+        action
+      });
+    }
+
+    const taskUrl = `/api/prism/v4.0/config/tasks/${taskUuid}`;
+    let taskData = null;
+    for (let i = 0; i < 12; i += 1) {
+      const taskResp = await client.get(taskUrl);
+      taskData = taskResp.data?.data || taskResp.data;
+      const taskStatus =
+        taskData?.status ||
+        taskData?.progressStatus ||
+        taskData?.state ||
+        "";
+
+      if (String(taskStatus).toUpperCase().includes("SUCCEEDED")) {
+        return res.json({
+          ok: true,
+          status: "succeeded",
+          via: usedUrl,
+          action,
+          task: { uuid: taskUuid, status: taskStatus }
+        });
+      }
+      if (String(taskStatus).toUpperCase().includes("FAILED")) {
+        const taskDetails = extractTaskErrorDetails(taskData);
+        return res.status(502).json({
+          error: `Power-${action} task failed.`,
+          details: taskDetails || undefined,
+          task: taskData
+        });
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    return res.json({
+      ok: true,
+      status: "pending",
+      via: usedUrl,
+      action,
+      task: { uuid: taskUuid }
+    });
+  } catch (error) {
+    const { status, details } = formatAxiosError(error);
+    console.error("VM power action failed:", details);
+    res.status(status).json({
+      error: "Failed to change VM power state.",
       details
     });
   }

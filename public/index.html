@@ -20,6 +20,7 @@
         --ntx-accent-soft: #e8efff;
         --ntx-accent-hover: #0f4fd1;
         --ntx-success: #1f9d55;
+        --ntx-success-hover: #197b43;
         --ntx-warn: #c2410c;
         --ntx-danger: #be123c;
         --ntx-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
@@ -78,6 +79,48 @@
         font-size: 12px;
         margin-left: 4px;
       }
+      .topbar-spacer {
+        flex: 1;
+      }
+      .topbar-session {
+        display: none;
+        align-items: center;
+        gap: 12px;
+        font-size: 12.5px;
+        color: rgba(255, 255, 255, 0.85);
+      }
+      .topbar-session.visible {
+        display: flex;
+      }
+      .topbar-user {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+      }
+      .topbar-btn {
+        height: 30px;
+        padding: 0 12px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        color: #fff;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        transition: background 120ms ease, border-color 120ms ease;
+      }
+      .topbar-btn:hover {
+        background: rgba(255, 255, 255, 0.16);
+        border-color: rgba(255, 255, 255, 0.4);
+      }
+      .topbar-btn.danger:hover {
+        background: rgba(190, 18, 60, 0.55);
+        border-color: rgba(255, 200, 215, 0.6);
+      }
       .container {
         max-width: 1600px;
         margin: 0 auto;
@@ -92,12 +135,6 @@
       }
       .panel-body {
         padding: 14px 16px;
-      }
-      .toolbar {
-        display: grid;
-        grid-template-columns: 1.1fr 1fr 1fr 1fr auto auto;
-        gap: 10px;
-        align-items: center;
       }
       input,
       select,
@@ -148,39 +185,6 @@
         background: var(--ntx-accent-hover);
         border-color: var(--ntx-accent-hover);
       }
-      .option-row {
-        margin-top: 10px;
-        display: flex;
-        gap: 18px;
-        font-size: 12.5px;
-        color: var(--ntx-text-muted);
-      }
-      .option-row label {
-        display: inline-flex;
-        gap: 6px;
-        align-items: center;
-        cursor: pointer;
-      }
-      .option-row input[type="checkbox"] {
-        height: auto;
-        accent-color: var(--ntx-accent);
-      }
-      .option-row .link-button {
-        height: auto;
-        padding: 0;
-        margin-left: auto;
-        background: transparent;
-        border: 0;
-        color: var(--ntx-accent);
-        font-size: 12.5px;
-        font-weight: 500;
-        cursor: pointer;
-      }
-      .option-row .link-button:hover {
-        background: transparent;
-        color: var(--ntx-accent-hover);
-        text-decoration: underline;
-      }
       .layout {
         display: flex;
         gap: 14px;
@@ -201,33 +205,51 @@
         text-transform: uppercase;
         letter-spacing: 0.6px;
       }
+      .section-title-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 8px 0;
+      }
+      .section-title-row .section-title {
+        margin: 0;
+        flex: 1;
+      }
       .filters {
         display: grid;
         gap: 8px;
       }
-      .vm-actions {
-        display: flex;
-        gap: 6px;
-        margin: 12px 0 8px;
-      }
-      .vm-actions button {
-        height: 28px;
-        padding: 0 12px;
+      .link-button {
+        height: auto;
+        padding: 0;
+        background: transparent;
+        border: 0;
+        color: var(--ntx-accent);
         font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
       }
-      #favoritesList,
+      .link-button:hover {
+        background: transparent;
+        color: var(--ntx-accent-hover);
+        text-decoration: underline;
+      }
+      #favoritesTree,
       #vmList {
         display: grid;
         gap: 4px;
-        max-height: 290px;
+        max-height: 320px;
         overflow: auto;
         padding-right: 2px;
       }
-      #favoritesList::-webkit-scrollbar,
+      #favoritesTree {
+        max-height: 360px;
+      }
+      #favoritesTree::-webkit-scrollbar,
       #vmList::-webkit-scrollbar {
         width: 8px;
       }
-      #favoritesList::-webkit-scrollbar-thumb,
+      #favoritesTree::-webkit-scrollbar-thumb,
       #vmList::-webkit-scrollbar-thumb {
         background: #cdd4e0;
         border-radius: 4px;
@@ -257,6 +279,9 @@
         border-color: var(--ntx-accent);
         background: var(--ntx-accent-soft);
         box-shadow: 0 0 0 1px var(--ntx-accent) inset;
+      }
+      .vm-item.is-loading {
+        opacity: 0.7;
       }
       .vm-name {
         font-size: 13px;
@@ -323,6 +348,129 @@
         background: transparent;
         border-color: transparent;
       }
+      .star.is-fav {
+        color: #f5b400;
+      }
+
+      /* Favorites folders */
+      .fav-folder {
+        border: 1px solid var(--ntx-border);
+        border-radius: 5px;
+        background: var(--ntx-surface-2);
+      }
+      .fav-folder-header {
+        display: grid;
+        grid-template-columns: 22px 1fr auto auto auto;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 6px;
+        cursor: grab;
+        user-select: none;
+        border-radius: 5px 5px 0 0;
+        transition: background 80ms ease;
+      }
+      .fav-folder-header:hover {
+        background: var(--ntx-accent-soft);
+      }
+      .fav-folder-header.drag-over {
+        background: #c6dcff;
+        box-shadow: inset 0 0 0 2px var(--ntx-accent);
+      }
+      .fav-folder-toggle {
+        height: 22px;
+        width: 22px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: var(--ntx-text-muted);
+        font-size: 11px;
+      }
+      .fav-folder-toggle:hover {
+        background: transparent;
+        color: var(--ntx-text);
+      }
+      .fav-folder-name {
+        font-weight: 600;
+        font-size: 12.5px;
+        color: var(--ntx-text);
+        padding: 2px 4px;
+        border-radius: 3px;
+        outline: none;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .fav-folder-name:focus {
+        background: #fff;
+        box-shadow: 0 0 0 2px var(--ntx-accent);
+      }
+      .fav-folder-icon {
+        color: var(--ntx-warn);
+        margin-right: 4px;
+      }
+      .fav-folder-action {
+        height: 22px;
+        width: 22px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: var(--ntx-text-subtle);
+        font-size: 13px;
+        line-height: 1;
+        border-radius: 3px;
+      }
+      .fav-folder-action:hover {
+        background: rgba(21, 101, 255, 0.08);
+        color: var(--ntx-accent);
+      }
+      .fav-folder-action.danger:hover {
+        background: rgba(190, 18, 60, 0.1);
+        color: var(--ntx-danger);
+      }
+      .fav-folder-action.launch {
+        color: var(--ntx-success);
+      }
+      .fav-folder-action.launch:hover {
+        background: rgba(31, 157, 85, 0.12);
+        color: var(--ntx-success-hover);
+      }
+      .fav-folder-children {
+        padding: 6px 6px 8px 22px;
+        display: grid;
+        gap: 4px;
+        min-height: 28px;
+        position: relative;
+      }
+      .fav-folder.collapsed .fav-folder-children {
+        display: none;
+      }
+      .fav-folder-children.drag-over {
+        background: #eaf2ff;
+        outline: 2px dashed var(--ntx-accent);
+        outline-offset: -3px;
+        border-radius: 4px;
+      }
+      .fav-folder-children:empty::before {
+        content: "Drop favorites here";
+        display: block;
+        color: var(--ntx-text-subtle);
+        font-size: 11.5px;
+        font-style: italic;
+        padding: 6px 4px;
+        text-align: center;
+        border: 1px dashed var(--ntx-border-strong);
+        border-radius: 4px;
+      }
+      #favoritesTree.drag-over-root {
+        outline: 2px dashed var(--ntx-accent);
+        outline-offset: -3px;
+        border-radius: 6px;
+      }
+      .vm-row.dragging,
+      .fav-folder.dragging {
+        opacity: 0.4;
+      }
+
       #status {
         margin-bottom: 12px;
         color: var(--ntx-text);
@@ -332,6 +480,27 @@
         background: var(--ntx-accent-soft);
         border: 1px solid #c9dbff;
         border-radius: 5px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .spinner {
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(21, 101, 255, 0.3);
+        border-top-color: var(--ntx-accent);
+        border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+        display: inline-block;
+        flex-shrink: 0;
+      }
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      .tabs-row {
+        display: flex;
+        align-items: flex-end;
+        gap: 8px;
       }
       .tabs {
         display: flex;
@@ -343,6 +512,8 @@
         z-index: 1;
         flex-wrap: wrap;
         row-gap: 2px;
+        flex: 1;
+        min-width: 0;
       }
       .tab {
         display: inline-flex;
@@ -421,6 +592,115 @@
         color: var(--ntx-danger);
         background: rgba(190, 18, 60, 0.08);
       }
+      .tabs-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        align-items: stretch;
+        flex-shrink: 0;
+        align-self: stretch;
+        justify-content: center;
+        min-width: 110px;
+      }
+      .show-all-btn,
+      .close-all-btn {
+        height: 30px;
+        padding: 0 14px;
+        color: #fff;
+        font-weight: 600;
+        font-size: 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        flex-shrink: 0;
+        transition: background 120ms ease, border-color 120ms ease;
+        white-space: nowrap;
+      }
+      .show-all-btn {
+        background: var(--ntx-success);
+        border: 1px solid var(--ntx-success);
+      }
+      .show-all-btn:hover {
+        background: var(--ntx-success-hover);
+        border-color: var(--ntx-success-hover);
+        color: #fff;
+      }
+      .show-all-btn:disabled {
+        background: #b8d4c2;
+        border-color: #b8d4c2;
+        cursor: not-allowed;
+      }
+      .close-all-btn {
+        background: var(--ntx-danger);
+        border: 1px solid var(--ntx-danger);
+      }
+      .close-all-btn:hover {
+        background: #9c0e31;
+        border-color: #9c0e31;
+        color: #fff;
+      }
+      .close-all-btn:disabled {
+        background: #d9b3bf;
+        border-color: #d9b3bf;
+        cursor: not-allowed;
+      }
+
+      /* Right-click context menu */
+      .ctx-menu {
+        position: fixed;
+        z-index: 90;
+        min-width: 170px;
+        background: #fff;
+        border: 1px solid var(--ntx-border-strong);
+        border-radius: 6px;
+        box-shadow: var(--ntx-shadow-lg);
+        padding: 4px 0;
+        font-size: 13px;
+        display: none;
+      }
+      .ctx-menu.open {
+        display: block;
+      }
+      .ctx-menu-header {
+        padding: 6px 12px 8px;
+        border-bottom: 1px solid var(--ntx-border);
+        color: var(--ntx-text-subtle);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 280px;
+      }
+      .ctx-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 12px;
+        cursor: pointer;
+        color: var(--ntx-text);
+      }
+      .ctx-menu-item:hover {
+        background: var(--ntx-accent-soft);
+        color: var(--ntx-accent-hover);
+      }
+      .ctx-menu-item.disabled {
+        color: var(--ntx-text-subtle);
+        cursor: not-allowed;
+        opacity: 0.6;
+      }
+      .ctx-menu-item.disabled:hover {
+        background: transparent;
+        color: var(--ntx-text-subtle);
+      }
+      .ctx-menu-item .ctx-icon {
+        width: 14px;
+        text-align: center;
+        font-size: 12px;
+      }
+      .ctx-menu-item.power-on .ctx-icon { color: var(--ntx-success); }
+      .ctx-menu-item.power-off .ctx-icon { color: var(--ntx-danger); }
       .console-stage {
         border: 1px solid var(--ntx-border-strong);
         background: #000;
@@ -438,32 +718,40 @@
       .console-pane.active {
         display: block;
       }
+      .console-empty {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 13px;
+        text-align: center;
+        padding: 20px;
+      }
+      .console-empty-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 18px;
+        max-width: 80%;
+      }
+      .console-empty-logo {
+        max-width: min(420px, 60%);
+        width: 100%;
+        height: auto;
+        opacity: 0.85;
+        filter: drop-shadow(0 4px 18px rgba(255, 255, 255, 0.05));
+        user-select: none;
+        -webkit-user-drag: none;
+      }
+      .console-empty-text {
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 13px;
+        line-height: 1.5;
+      }
       .muted {
         color: var(--ntx-text-subtle);
         font-size: 12px;
-      }
-      details#probeDetails {
-        margin-bottom: 10px;
-        border: 1px solid var(--ntx-border);
-        border-radius: 5px;
-        padding: 6px 10px;
-        background: var(--ntx-surface-2);
-      }
-      details#probeDetails summary {
-        cursor: pointer;
-        font-size: 12px;
-        font-weight: 600;
-        color: var(--ntx-text-muted);
-      }
-      details#probeDetails pre {
-        white-space: pre-wrap;
-        background: #fff;
-        border: 1px solid var(--ntx-border);
-        padding: 8px;
-        border-radius: 4px;
-        font-size: 11.5px;
-        color: var(--ntx-text-muted);
-        margin-top: 8px;
       }
       .modal-backdrop {
         position: fixed;
@@ -532,92 +820,397 @@
         border-radius: 4px;
         padding: 8px 10px;
       }
+
+      /* Login screen */
+      .login-screen {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at 20% 25%, rgba(21, 101, 255, 0.28), transparent 55%),
+          radial-gradient(circle at 80% 75%, rgba(33, 62, 99, 0.55), transparent 60%),
+          linear-gradient(135deg, #0d1c33 0%, #1a3253 55%, #213e63 100%);
+        color: #fff;
+        padding: 24px;
+      }
+      .login-screen.hidden {
+        display: none;
+      }
+      .login-card {
+        width: 100%;
+        max-width: 420px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 12px;
+        padding: 32px 32px 28px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.4);
+      }
+      .login-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 22px;
+      }
+      .login-brand-mark {
+        width: 38px;
+        height: 38px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, #4f8dff, #1565ff);
+        display: grid;
+        place-items: center;
+        color: #fff;
+        font-weight: 800;
+        font-size: 16px;
+        box-shadow: 0 4px 14px rgba(21, 101, 255, 0.4);
+      }
+      .login-brand-text {
+        display: flex;
+        flex-direction: column;
+        line-height: 1.2;
+      }
+      .login-brand-title {
+        font-size: 15px;
+        font-weight: 600;
+        color: #fff;
+      }
+      .login-brand-sub {
+        font-size: 11.5px;
+        color: rgba(255, 255, 255, 0.55);
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+      }
+      .login-title {
+        margin: 0 0 4px 0;
+        font-size: 22px;
+        font-weight: 600;
+        color: #fff;
+        letter-spacing: -0.2px;
+      }
+      .login-sub {
+        margin: 0 0 20px 0;
+        font-size: 13px;
+        color: rgba(255, 255, 255, 0.65);
+      }
+      .login-form {
+        display: grid;
+        gap: 12px;
+      }
+      .login-field {
+        display: grid;
+        gap: 5px;
+      }
+      .login-field-label {
+        font-size: 11.5px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.75);
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+      }
+      .login-field input {
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        color: #fff;
+        height: 38px;
+        font-size: 13.5px;
+      }
+      .login-field input::placeholder {
+        color: rgba(255, 255, 255, 0.35);
+      }
+      .login-field input:focus {
+        background: rgba(255, 255, 255, 0.12);
+        border-color: rgba(99, 159, 255, 0.7);
+        box-shadow: 0 0 0 3px rgba(21, 101, 255, 0.32);
+      }
+      .login-options {
+        display: grid;
+        gap: 6px;
+        margin-top: 4px;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.7);
+      }
+      .login-options label {
+        display: inline-flex;
+        gap: 8px;
+        align-items: center;
+        cursor: pointer;
+      }
+      .login-options input[type="checkbox"] {
+        height: auto;
+        accent-color: var(--ntx-accent);
+      }
+      .login-submit {
+        height: 42px;
+        margin-top: 12px;
+        background: var(--ntx-accent);
+        border: 0;
+        color: #fff;
+        font-weight: 600;
+        font-size: 14px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background 120ms ease;
+      }
+      .login-submit:hover {
+        background: var(--ntx-accent-hover);
+      }
+      .login-submit:disabled {
+        background: #6883a8;
+        cursor: progress;
+      }
+      .login-error {
+        margin-top: 4px;
+        font-size: 12.5px;
+        color: #ffd4dd;
+        background: rgba(190, 18, 60, 0.18);
+        border: 1px solid rgba(255, 130, 160, 0.35);
+        padding: 8px 10px;
+        border-radius: 4px;
+      }
+      .login-footer {
+        margin-top: 18px;
+        text-align: center;
+        font-size: 11.5px;
+        color: rgba(255, 255, 255, 0.4);
+      }
+      .app-shell.locked {
+        display: none;
+      }
+
+      /* Show All console grid overlay */
+      .grid-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.78);
+        z-index: 80;
+        display: none;
+        flex-direction: column;
+        padding: 32px 40px;
+        backdrop-filter: blur(3px);
+      }
+      .grid-overlay.open {
+        display: flex;
+      }
+      .grid-overlay-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: #fff;
+        margin-bottom: 18px;
+      }
+      .grid-overlay-title {
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .grid-overlay-sub {
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.6);
+      }
+      .grid-overlay-spacer {
+        flex: 1;
+      }
+      .grid-overlay-hint {
+        font-size: 11.5px;
+        color: rgba(255, 255, 255, 0.55);
+      }
+      .console-grid {
+        flex: 1;
+        display: grid;
+        gap: 16px;
+        overflow: auto;
+        align-content: start;
+      }
+      .console-grid-tile {
+        background: #0a1322;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        overflow: hidden;
+        cursor: pointer;
+        transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+        display: flex;
+        flex-direction: column;
+      }
+      .console-grid-tile:hover {
+        transform: translateY(-2px);
+        border-color: var(--ntx-accent);
+        box-shadow: 0 12px 30px rgba(21, 101, 255, 0.35);
+      }
+      .console-grid-thumb {
+        flex: 1;
+        min-height: 180px;
+        background: #000;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+      }
+      .console-grid-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        display: block;
+      }
+      .console-grid-thumb .thumb-empty {
+        color: rgba(255, 255, 255, 0.4);
+        font-size: 12px;
+      }
+      .console-grid-label {
+        padding: 8px 12px;
+        font-size: 12.5px;
+        color: #fff;
+        background: rgba(255, 255, 255, 0.04);
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .console-grid-empty {
+        color: rgba(255, 255, 255, 0.7);
+        text-align: center;
+        margin: auto;
+        font-size: 13px;
+      }
     </style>
   </head>
   <body>
-    <header class="topbar">
-      <div class="topbar-mark">N</div>
-      <h1 class="topbar-title">Nutanix Remote Console Client</h1>
-      <span class="topbar-sub">NRCC</span>
-    </header>
-    <div class="container">
-      <section class="panel">
-        <div class="panel-body">
-          <div class="toolbar">
-            <input id="pcHost" placeholder="Prism Central IP or hostname" />
-            <input id="username" placeholder="Username" autocomplete="username" />
-            <input
-              id="password"
-              type="password"
-              placeholder="Password"
-              autocomplete="current-password"
-            />
-            <input id="vmUuid" placeholder="VM UUID (manual optional)" />
-            <button id="loadVmsBtn">Load VMs</button>
-            <button id="connectBtn" class="primary">Open Console</button>
+    <!-- Login overlay (Prism Central style) -->
+    <div id="loginScreen" class="login-screen">
+      <div class="login-card">
+        <div class="login-brand">
+          <div class="login-brand-mark">N</div>
+          <div class="login-brand-text">
+            <span class="login-brand-title">Nutanix Remote Console</span>
+            <span class="login-brand-sub">NRCC</span>
           </div>
-          <div class="option-row">
+        </div>
+        <h2 class="login-title">Sign in</h2>
+        <p class="login-sub">Use your Prism Central credentials.</p>
+        <form id="loginForm" class="login-form" autocomplete="on">
+          <div class="login-field">
+            <label class="login-field-label" for="loginPcHost">Prism Central IP</label>
+            <input
+              id="loginPcHost"
+              type="text"
+              placeholder="prism-central.example.com"
+              autocomplete="url"
+              required
+            />
+          </div>
+          <div class="login-field">
+            <label class="login-field-label" for="loginUsername">Username</label>
+            <input
+              id="loginUsername"
+              type="text"
+              placeholder="admin"
+              autocomplete="username"
+              required
+            />
+          </div>
+          <div class="login-field">
+            <label class="login-field-label" for="loginPassword">Password</label>
+            <input
+              id="loginPassword"
+              type="password"
+              placeholder="••••••••"
+              autocomplete="current-password"
+              required
+            />
+          </div>
+          <div class="login-options">
             <label>
-              <input id="rememberProfile" type="checkbox" />
+              <input id="loginRemember" type="checkbox" />
               Remember host and username
             </label>
             <label>
-              <input id="allowSelfSignedTls" type="checkbox" checked />
+              <input id="loginAllowTls" type="checkbox" checked />
               Allow self-signed TLS (lab)
             </label>
             <label>
-              <input id="includeHiddenVms" type="checkbox" checked />
-              Include hidden/system VMs (CVMs)
+              <input id="loginIncludeHidden" type="checkbox" checked />
+              Include hidden / system VMs (CVMs)
             </label>
-            <button id="forgetPeCredsBtn" type="button" class="link-button">
-              Forget PE credentials
-            </button>
           </div>
-        </div>
-      </section>
-
-      <div class="layout">
-        <aside class="sidebar">
-          <section class="panel">
-            <div class="panel-body">
-              <div class="section-title">Filter</div>
-              <div class="filters">
-                <input id="nameFilter" placeholder="Search name (full or partial)" />
-                <select id="powerStateFilter">
-                  <option value="">All power states</option>
-                </select>
-                <select id="categoryFilter">
-                  <option value="">All categories</option>
-                </select>
-              </div>
-              <div class="vm-actions">
-                <button id="showAllBtn">All</button>
-                <button id="showFavoritesBtn">Favorites</button>
-              </div>
-              <div class="section-title">Favorites</div>
-              <div id="favoritesList"></div>
-              <div class="section-title">VMs</div>
-              <div id="vmList"></div>
-            </div>
-          </section>
-        </aside>
-
-        <main class="main">
-          <section class="panel">
-            <div class="panel-body">
-              <div id="status">Idle</div>
-              <details id="probeDetails" style="display:none">
-                <summary>CVM probe details</summary>
-                <pre id="probeDetailsContent"></pre>
-              </details>
-              <div id="consoleTabs" class="tabs"></div>
-              <div id="screenStage" class="console-stage"></div>
-              <p class="muted">Multiple console sessions stay open in tabs.</p>
-            </div>
-          </section>
-        </main>
+          <button id="loginSubmit" type="submit" class="login-submit">Sign in</button>
+          <div id="loginError" class="login-error" style="display:none"></div>
+        </form>
+        <div class="login-footer">Credentials are kept in browser memory only for this session.</div>
       </div>
     </div>
+
+    <!-- Main app (hidden until logged in) -->
+    <div id="appShell" class="app-shell locked">
+      <header class="topbar">
+        <div class="topbar-mark">N</div>
+        <h1 class="topbar-title">Nutanix Remote Console Client</h1>
+        <span class="topbar-sub">NRCC</span>
+        <div class="topbar-spacer"></div>
+        <div id="sessionInfo" class="topbar-session">
+          <span class="topbar-user">
+            <span id="sessionUserLabel"></span>
+          </span>
+          <button id="forgetPeCredsBtn" type="button" class="topbar-btn">Forget PE credentials</button>
+          <button id="logoutBtn" type="button" class="topbar-btn danger">Logout</button>
+        </div>
+      </header>
+      <div class="container">
+        <div class="layout">
+          <aside class="sidebar">
+            <section class="panel">
+              <div class="panel-body">
+                <div class="section-title">Filter</div>
+                <div class="filters">
+                  <input id="nameFilter" placeholder="Search name / IP / UUID" />
+                  <select id="powerStateFilter">
+                    <option value="">All power states</option>
+                  </select>
+                </div>
+                <div class="section-title-row" style="margin-top:14px">
+                  <div class="section-title">Favorites</div>
+                  <button id="addFavFolderBtn" type="button" class="link-button" title="Add a top-level folder">+ Folder</button>
+                </div>
+                <div id="favoritesTree" class="fav-tree" data-drop-target="root"></div>
+                <div class="section-title" style="margin-top:14px">VMs</div>
+                <div id="vmList"></div>
+              </div>
+            </section>
+          </aside>
+
+          <main class="main">
+            <section class="panel">
+              <div class="panel-body">
+                <div id="status">Idle</div>
+                <div class="tabs-row">
+                  <div id="consoleTabs" class="tabs"></div>
+                  <div class="tabs-actions">
+                    <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
+                    <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
+                  </div>
+                </div>
+                <div id="screenStage" class="console-stage">
+                  <div id="consoleEmpty" class="console-empty">
+                    <div class="console-empty-inner">
+                      <img
+                        src="/assets/nutanix-logo.png"
+                        alt="Nutanix"
+                        class="console-empty-logo"
+                        draggable="false"
+                      />
+                      <div class="console-empty-text">
+                        Click a VM in the sidebar to open its console.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <p class="muted">Click a VM to open its console. Multiple sessions stay open in tabs — use <strong>Show All</strong> to see them at once.</p>
+              </div>
+            </section>
+          </main>
+        </div>
+      </div>
+    </div>
+
+    <!-- PE credentials modal -->
     <div id="peCredsModal" class="modal-backdrop" role="dialog" aria-modal="true">
       <div class="modal">
         <div class="modal-header">
@@ -653,6 +1246,23 @@
         </div>
       </div>
     </div>
+
+    <!-- Show All grid overlay -->
+    <div id="consoleGridOverlay" class="grid-overlay" role="dialog" aria-modal="true">
+      <div class="grid-overlay-header">
+        <div>
+          <div class="grid-overlay-title">All open consoles</div>
+          <div class="grid-overlay-sub">Click a tile to switch to that console.</div>
+        </div>
+        <div class="grid-overlay-spacer"></div>
+        <div class="grid-overlay-hint">Click outside or press Esc to close.</div>
+      </div>
+      <div id="consoleGrid" class="console-grid"></div>
+    </div>
+
+    <!-- Right-click context menu (single global instance) -->
+    <div id="ctxMenu" class="ctx-menu" role="menu"></div>
+
     <script type="module" src="/app.js"></script>
   </body>
 </html>

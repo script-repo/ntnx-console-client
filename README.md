@@ -8,12 +8,16 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 
 ## Highlights
 
-- **Single tab, many consoles.** Browser-style overlapping tabs let you keep multiple consoles open and switch instantly.
-- **VM list with filtering.** Search by name / UUID / IP, filter by power state and category, and star favorites (persisted in localStorage).
+- **Prism-Central-style sign-in.** Centered login card asks for the three things you actually need — Prism Central IP, username, password — and nothing else. After login, the page is clean: just the VM list, your consoles, and a logout button in the top right.
+- **Background VM loading.** Logging in immediately discovers VMs across all PC-managed clusters in the background. The UI stays fully navigatable while the list streams in.
+- **Favorites that survive the wait.** Previously starred VMs are pre-populated in the favorites pane the moment you log in (from a local snapshot), so you can open them before the full VM list has finished loading.
+- **Drag-and-drop favorites with folders.** Organize favorites into named folders and sub-folders. Drag VMs between folders, drag folders into other folders, double-click a folder name to rename. Persisted in `localStorage`.
+- **Single tab, many consoles.** Browser-style overlapping tabs keep multiple consoles open. Click a tab to switch; click the **×** to close.
+- **Show All overview.** A green **Show All** button to the right of the console tabs takes a live screenshot of every open console and lays them out in a grid. Click any tile to switch to that console; click outside the grid (or press <kbd>Esc</kbd>) to dismiss.
+- **VM filtering.** Search by name / UUID / IP and filter by power state.
 - **CVM support.** Discovers Controller VMs through the v4 `clustermgmt` API on Prism Central, then redirects the console request to the cluster's Prism Element using the legacy VNC proxy when v4 console-token is unavailable.
 - **Per-PE credentials, server-side only.** Prism Central credentials don't authenticate to Prism Element by default. NRCC prompts once per PE, validates with a real probe, and caches the credentials **in the NRCC server process's memory only** — keyed to an `HttpOnly` session cookie. They are never written to browser `localStorage`, never persisted to disk, and disappear when the NRCC server restarts (or after 8 hours of inactivity).
 - **Pure HTTP/WebSocket.** No agent on the cluster, no plug-in, no special browser extensions. Self-signed TLS toggle for lab environments.
-- **Prism-Central look-and-feel.** Modern UI with status pills, accent-blue interactions, and a navy header.
 
 ---
 
@@ -43,8 +47,8 @@ A Node.js Express app that:
 
 Vanilla JS + noVNC, no build step:
 
-- `index.html` — Prism-Central-styled markup.
-- `app.js` — VM list rendering, filters, favorites, console tab management, PE credential modal.
+- `index.html` — Prism-Central-styled markup, including the sign-in overlay, the favorites tree, the console tab strip, the **Show All** grid overlay, and the PE credentials modal.
+- `app.js` — login / logout flow, background VM loading, filters, favorites tree with drag-and-drop folders, console tab management, PE credential modal, and the screenshot-grid overview.
 - noVNC is served at the URL prefix `/vendor/novnc/`, mapped by `server.js` to `node_modules/@novnc/novnc/` (delivered via the npm package `@novnc/novnc`).
 
 ### Console flow
@@ -128,18 +132,21 @@ Then open <http://localhost:3000>.
 
 ## Usage
 
-1. Enter the **Prism Central IP**, **username**, **password** (top toolbar).
-2. Tick **Allow self-signed TLS** for lab environments. Tick **Include hidden/system VMs (CVMs)** to discover Controller VMs.
-3. Click **Load VMs**. The sidebar populates with all VMs across all PC-managed clusters, sorted alphabetically.
-4. Use the search box and filters (power state / category) to find a VM. Click the star to favorite it (persisted in browser localStorage).
-5. Select a VM and click **Open Console**.
+1. Open <http://localhost:3000>. The Prism-Central-style **Sign in** card appears.
+2. Enter your **Prism Central IP**, **username**, and **password**. Tick **Allow self-signed TLS** for lab environments and **Include hidden / system VMs** if you want CVMs in the list. Tick **Remember host and username** if you want NRCC to repopulate those two fields next time (the password is never stored).
+3. Click **Sign in**. NRCC validates the credentials by listing VMs; on success the login overlay disappears and the main UI is shown. Your previously starred favorites are visible in the sidebar **immediately** — even before the full VM list finishes loading — so you can open a familiar console right away.
+4. The full VM list streams in the background. The whole UI stays interactive during loading.
+5. Search by name / IP / UUID, filter by power state, and click the **★** to favorite a VM.
+6. Drag favorites between **folders**. Click **+ Folder** to create a top-level folder, click the **+** on a folder header to create a sub-folder, click the folder name to rename, and click **×** to delete it (its contents move up to the parent — your favorited VMs are not lost).
+7. **Click a VM** to open its console. The session opens in a new tab.
    - For regular VMs the console opens immediately via PC's v4 token flow.
-   - For CVMs, NRCC prompts once for **PE credentials** (per cluster). The credentials are validated with a probe and cached in the NRCC server's memory for the session — never in the browser, never on disk. To wipe them, click **Forget PE credentials** on the toolbar (or restart the NRCC server).
-6. Multiple consoles stay open in browser-style **tabs**. Click a tab to switch; click the **×** to close.
+   - For CVMs, NRCC prompts once for **PE credentials** (per cluster). The credentials are validated with a probe and cached in the NRCC server's memory for the session — never in the browser, never on disk. To wipe them, click **Forget PE credentials** in the top right (or restart the NRCC server).
+8. With multiple consoles open, click the green **Show All** button to the right of the tab strip to see a live screenshot of every console at once. Click any tile to jump to that console; click outside the grid (or press <kbd>Esc</kbd>) to close it.
+9. Click **Logout** in the top right when you're done. NRCC wipes the in-memory PC credentials and closes every open console.
 
 ### Keyboard shortcuts
 
-The noVNC client itself handles keyboard input. Use **Ctrl-Alt-Del** etc. through the standard web console controls (clipboard / fullscreen are noVNC defaults).
+The noVNC client itself handles keyboard input. Use **Ctrl-Alt-Del** etc. through the standard web console controls (clipboard / fullscreen are noVNC defaults). <kbd>Esc</kbd> closes the **Show All** grid overlay.
 
 ---
 
@@ -178,14 +185,14 @@ Self-signed Prism certificates are normal in lab environments. The **Allow self-
 
 ### Credential handling
 
-- **Prism Central credentials** are entered in the toolbar form fields. The browser holds them only in the live `<input>` elements (cleared on reload) and posts them to the NRCC server with each `/api/vms` and `/api/console-token` call. They are not written to `localStorage` and not cached server-side. If you reload the page you must re-enter them.
+- **Prism Central credentials** are entered on the sign-in card. After login, the browser holds them in a JavaScript-only session object — never in the DOM `<input>`, never in `localStorage` — and posts them to the NRCC server with each `/api/vms` and `/api/console-token` call. They are not cached server-side. Clicking **Logout** wipes the in-memory copy; reloading the page also clears them and returns you to the sign-in card.
 - **Prism Element credentials** are sent exactly once — to `POST /api/pe-test` — when you first open a CVM on that PE. On a successful probe NRCC caches them in **server-side memory only**, keyed to an opaque `HttpOnly`, `SameSite=Strict` session cookie (`nrcc_sid`). After that, every `POST /api/console-token` looks them up by `peHost`; the browser never sees them again, and they are never returned in any API response.
 - The cache lives only in the NRCC process. It is wiped on:
   - **Server restart** (`Ctrl-C` / `npm start` again),
   - **8 hours of session inactivity** (rolling),
-  - clicking **Forget PE credentials** in the toolbar (`DELETE /api/pe-creds`).
+  - clicking **Forget PE credentials** in the top right (`DELETE /api/pe-creds`).
 - To audit what NRCC has cached for your session, `GET /api/pe-creds` returns just the list of PE host names (no usernames, no passwords).
-- The `localStorage` keys NRCC still uses are non-credential: `ntnxConsoleProfile` (PC host + username, only when "Remember host and username" is checked) and `ntnxConsoleFavoriteVms` (favorite VM UUIDs).
+- The `localStorage` keys NRCC uses are non-credential: `ntnxConsoleProfile` (PC host + username, only when "Remember host and username" is checked on the sign-in card) and `ntnxConsoleFavorites` (the favorites tree — folders, ordering, and a non-secret metadata snapshot of each favorited VM so it can be shown immediately on the next login while the live list is still loading).
 
 ### No production hardening
 
