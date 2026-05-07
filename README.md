@@ -14,6 +14,7 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 - **Drag-and-drop favorites with folders.** Organize favorites into named folders and sub-folders. Drag VMs between folders, drag folders into other folders, double-click a folder name to rename. Persisted in `localStorage`.
 - **Single tab, many consoles.** Browser-style overlapping tabs keep multiple consoles open. Click a tab to switch; click the **×** to close.
 - **Show All overview.** A green **Show All** button to the right of the console tabs takes a live screenshot of every open console and lays them out in a grid. Click any tile to switch to that console; click outside the grid (or press <kbd>Esc</kbd>) to dismiss.
+- **Wall of Eyes.** A light-blue **Wall of Eyes** button opens a separate browser window that mirrors every open console at ~20 fps in a tightly packed grid (no gaps; any unused space is charcoal black). Click **Full Screen** to slam the wall onto a second monitor or a video wall — perfect for an at-a-glance NOC view of every VM you're babysitting.
 - **VM filtering.** Search by name / UUID / IP and filter by power state.
 - **CVM support.** Discovers Controller VMs through the v4 `clustermgmt` API on Prism Central, then redirects the console request to the cluster's Prism Element using the legacy VNC proxy when v4 console-token is unavailable.
 - **Per-PE credentials, server-side only.** Prism Central credentials don't authenticate to Prism Element by default. NRCC prompts once per PE, validates with a real probe, and caches the credentials **in the NRCC server process's memory only** — keyed to an `HttpOnly` session cookie. They are never written to browser `localStorage`, never persisted to disk, and disappear when the NRCC server restarts (or after 8 hours of inactivity).
@@ -47,8 +48,9 @@ A Node.js Express app that:
 
 Vanilla JS + noVNC, no build step:
 
-- `index.html` — Prism-Central-styled markup, including the sign-in overlay, the favorites tree, the console tab strip, the **Show All** grid overlay, and the PE credentials modal.
-- `app.js` — login / logout flow, background VM loading, filters, favorites tree with drag-and-drop folders, console tab management, PE credential modal, and the screenshot-grid overview.
+- `index.html` — Prism-Central-styled markup, including the sign-in overlay, the favorites tree, the console tab strip, the **Show All** grid overlay, the **Wall of Eyes** button, and the PE credentials modal.
+- `app.js` — login / logout flow, background VM loading, filters, favorites tree with drag-and-drop folders, console tab management, PE credential modal, the screenshot-grid overview, and the popup-mirror launcher for the Wall of Eyes window.
+- `wall.html` — the standalone page loaded into the Wall of Eyes popup window. It runs same-origin to the main page, reaches back through `window.opener.consoleSessions`, and `drawImage`s every open noVNC `<canvas>` into a single full-window canvas at ~20 fps. An auto-fading toolbar exposes **Full Screen** (Fullscreen API) and **Close**.
 - noVNC is served at the URL prefix `/vendor/novnc/`, mapped by `server.js` to `node_modules/@novnc/novnc/` (delivered via the npm package `@novnc/novnc`).
 
 ### Console flow
@@ -142,11 +144,12 @@ Then open <http://localhost:3000>.
    - For regular VMs the console opens immediately via PC's v4 token flow.
    - For CVMs, NRCC prompts once for **PE credentials** (per cluster). The credentials are validated with a probe and cached in the NRCC server's memory for the session — never in the browser, never on disk. To wipe them, click **Forget PE credentials** in the top right (or restart the NRCC server).
 8. With multiple consoles open, click the green **Show All** button to the right of the tab strip to see a live screenshot of every console at once. Click any tile to jump to that console; click outside the grid (or press <kbd>Esc</kbd>) to close it.
-9. Click **Logout** in the top right when you're done. NRCC wipes the in-memory PC credentials and closes every open console.
+9. For a continuously-updating overview, click the light-blue **Wall of Eyes** button (under **Show All**). NRCC opens a new browser window that mirrors every open console live at ~20 fps in a tightly packed grid. Click **Full Screen** in the wall window's toolbar to push it to a dedicated monitor; charcoal-black fills any unused space.
+10. Click **Logout** in the top right when you're done. NRCC wipes the in-memory PC credentials and closes every open console.
 
 ### Keyboard shortcuts
 
-The noVNC client itself handles keyboard input. Use **Ctrl-Alt-Del** etc. through the standard web console controls (clipboard / fullscreen are noVNC defaults). <kbd>Esc</kbd> closes the **Show All** grid overlay.
+The noVNC client itself handles keyboard input. Use **Ctrl-Alt-Del** etc. through the standard web console controls (clipboard / fullscreen are noVNC defaults). <kbd>Esc</kbd> closes the **Show All** grid overlay. In the **Wall of Eyes** popup window, <kbd>Esc</kbd> exits browser fullscreen (the standard Fullscreen API behaviour); the toolbar (with **Full Screen** and **Close**) auto-fades after ~2.5 s of mouse-idle while in fullscreen and reappears on any movement.
 
 ---
 
@@ -157,6 +160,7 @@ The noVNC client itself handles keyboard input. Use **Ctrl-Alt-Del** etc. throug
 - **Recovering misconfigured network** — a VM whose NIC was misconfigured can still be reached over the AHV console.
 - **CVM diagnostics** — open a CVM console to check boot status without first SSH'ing in (useful when an SSH key is rotated or the CVM is hung in early boot).
 - **Multi-tenant ops** — a single dev workstation can hold authenticated sessions to several Prism Elements at once.
+- **NOC / video-wall view** — drop the **Wall of Eyes** popup onto a second monitor or a TV in fullscreen mode and watch every console you've opened update in real time during a maintenance window or upgrade.
 
 ---
 
@@ -178,6 +182,16 @@ PC and PE have separate user databases. PC's `admin` is not automatically a PE u
 ### Network reachability
 
 Your browser talks only to NRCC on `localhost:3000`, but **the NRCC server must be able to reach Prism on port 9440**. Most enterprise networks block 9440 between subnets — run NRCC on a host that already has Prism connectivity (e.g., your jump host).
+
+### Wall of Eyes is a same-origin browser popup
+
+The Wall of Eyes window is a regular `window.open("/wall.html", ...)` popup of the main NRCC tab. There is no separate server-side stream; the popup paints by reaching back through `window.opener.consoleSessions` and reading each session's noVNC `<canvas>` directly. That means:
+
+- **Same browser only.** The wall has to live in the same browser profile as the main NRCC tab. You can't, for example, open `wall.html` in a different browser and have it find the consoles — there's no `window.opener` to read from.
+- **Don't close the main tab.** If the main NRCC tab is closed, refreshed, or logged out, every open console disconnects and the wall window switches to a "Disconnected" empty state. Reopen the main tab and click **Wall of Eyes** again.
+- **Popup blockers.** If your browser blocks the popup, NRCC reports `Couldn't open Wall of Eyes window — your browser may have blocked the popup.` Allow popups for `localhost:3000` (or whatever host you put in front of NRCC) and retry.
+- **One wall at a time.** Re-clicking **Wall of Eyes** while a wall is already open just refocuses the existing window — it doesn't spawn a second one.
+- **Performance.** The popup repaints at ~20 fps regardless of how many consoles are open. If you stack a wall of 30+ active VMs on a low-end laptop, expect the GPU to pick up the bill.
 
 ### TLS
 

@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NRCC — Wall of Eyes</title>
+    <style>
+      :root {
+        --wall-charcoal: #1a1a1a;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+        background: var(--wall-charcoal);
+        color: #d8dde6;
+        font-family:
+          "Inter",
+          "Segoe UI",
+          -apple-system,
+          BlinkMacSystemFont,
+          "Helvetica Neue",
+          Arial,
+          sans-serif;
+        overflow: hidden;
+      }
+      #wallStage {
+        position: fixed;
+        inset: 0;
+        background: var(--wall-charcoal);
+        display: block;
+      }
+      #wallCanvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        background: var(--wall-charcoal);
+      }
+
+      .wall-toolbar {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        background: rgba(15, 15, 15, 0.65);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        backdrop-filter: blur(4px);
+        opacity: 1;
+        transition: opacity 350ms ease;
+      }
+      .wall-toolbar.faded {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .wall-toolbar .wall-title {
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.78);
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        padding: 0 6px;
+      }
+      .wall-toolbar .wall-count {
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.45);
+        margin-left: 2px;
+      }
+      .wall-toolbar button {
+        height: 28px;
+        padding: 0 12px;
+        font-size: 12px;
+        font-weight: 600;
+        font-family: inherit;
+        color: #fff;
+        background: #5dade2;
+        border: 1px solid #5dade2;
+        border-radius: 5px;
+        cursor: pointer;
+        transition: background 120ms ease, border-color 120ms ease;
+      }
+      .wall-toolbar button:hover {
+        background: #3498db;
+        border-color: #3498db;
+      }
+      .wall-toolbar button.ghost {
+        background: rgba(255, 255, 255, 0.06);
+        border-color: rgba(255, 255, 255, 0.18);
+        color: rgba(255, 255, 255, 0.85);
+      }
+      .wall-toolbar button.ghost:hover {
+        background: rgba(255, 255, 255, 0.12);
+        border-color: rgba(255, 255, 255, 0.32);
+      }
+
+      #wallEmpty {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        text-align: center;
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 14px;
+        padding: 20px;
+        pointer-events: none;
+      }
+      #wallEmpty.hidden {
+        display: none;
+      }
+      #wallEmpty .empty-title {
+        font-size: 18px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.78);
+        margin-bottom: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wallStage">
+      <canvas id="wallCanvas"></canvas>
+    </div>
+
+    <div id="wallEmpty">
+      <div>
+        <div class="empty-title" id="wallEmptyTitle">Wall of Eyes</div>
+        <div id="wallEmptyMessage">No open consoles in the parent NRCC window yet.</div>
+        <div id="wallEmptyHint" style="margin-top:6px;font-size:12px;color:rgba(255,255,255,0.4)">
+          Open a few VM consoles in the main window — they will appear here automatically.
+        </div>
+      </div>
+    </div>
+
+    <div id="wallToolbar" class="wall-toolbar">
+      <span class="wall-title">Wall of Eyes <span id="wallCount" class="wall-count">(0)</span></span>
+      <button id="wallFullscreenBtn" type="button" title="Toggle fullscreen">Full Screen</button>
+      <button id="wallCloseBtn" type="button" class="ghost" title="Close this window">Close</button>
+    </div>
+
+    <script>
+      (function () {
+        var stageEl = document.getElementById("wallStage");
+        var canvas = document.getElementById("wallCanvas");
+        var ctx = canvas.getContext("2d", { alpha: false });
+        var emptyEl = document.getElementById("wallEmpty");
+        var toolbarEl = document.getElementById("wallToolbar");
+        var countEl = document.getElementById("wallCount");
+        var fullscreenBtn = document.getElementById("wallFullscreenBtn");
+        var closeBtn = document.getElementById("wallCloseBtn");
+
+        var CHARCOAL = "#1a1a1a";
+
+        // Resize the backing canvas to match the viewport (with devicePixelRatio).
+        function resizeCanvas() {
+          var dpr = window.devicePixelRatio || 1;
+          var w = window.innerWidth;
+          var h = window.innerHeight;
+          canvas.style.width = w + "px";
+          canvas.style.height = h + "px";
+          canvas.width = Math.max(1, Math.floor(w * dpr));
+          canvas.height = Math.max(1, Math.floor(h * dpr));
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        window.addEventListener("resize", resizeCanvas);
+        resizeCanvas();
+
+        // Pull the list of live noVNC source canvases from the parent window.
+        // Each NRCC console session keeps its noVNC <canvas> inside
+        // `session.screenEl`. Both windows are same-origin so we can read
+        // them directly across the boundary.
+        function getSourceCanvases() {
+          var opener = window.opener;
+          if (!opener || opener.closed) return [];
+          var sessions;
+          try {
+            sessions = opener.consoleSessions;
+          } catch (_e) {
+            return [];
+          }
+          if (!sessions || !sessions.length) return [];
+
+          var sources = [];
+          for (var i = 0; i < sessions.length; i++) {
+            var s = sessions[i];
+            if (!s || !s.screenEl) continue;
+            var c;
+            try {
+              c = s.screenEl.querySelector("canvas");
+            } catch (_e) {
+              continue;
+            }
+            if (!c || !c.width || !c.height) continue;
+            sources.push({
+              canvas: c,
+              name: s.vmName || "(unnamed)",
+              w: c.width,
+              h: c.height
+            });
+          }
+          return sources;
+        }
+
+        // Pick the column count that maximizes the area covered by the
+        // tile content (preserving aspect ratio inside each cell). This
+        // gives the most "compact" packing of N tiles into the viewport.
+        function pickColumnCount(n, vw, vh, avgAspect) {
+          if (n <= 1) return 1;
+          var bestCols = 1;
+          var bestArea = -1;
+          for (var cols = 1; cols <= n; cols++) {
+            var rows = Math.ceil(n / cols);
+            var tileW = vw / cols;
+            var tileH = vh / rows;
+            // fit avgAspect into (tileW, tileH) preserving aspect
+            var fitW = Math.min(tileW, tileH * avgAspect);
+            var fitH = fitW / avgAspect;
+            var area = fitW * fitH * n;
+            if (area > bestArea) {
+              bestArea = area;
+              bestCols = cols;
+            }
+          }
+          return bestCols;
+        }
+
+        var lastFrameMs = 0;
+        var FRAME_INTERVAL_MS = 50; // ~20 fps
+
+        function render(nowMs) {
+          if (nowMs - lastFrameMs < FRAME_INTERVAL_MS) {
+            requestAnimationFrame(render);
+            return;
+          }
+          lastFrameMs = nowMs;
+
+          var vw = window.innerWidth;
+          var vh = window.innerHeight;
+
+          // Always start by painting the whole viewport charcoal so any
+          // dead space (empty cells, letterboxing, gone consoles) is the
+          // background colour.
+          ctx.fillStyle = CHARCOAL;
+          ctx.fillRect(0, 0, vw, vh);
+
+          var sources = getSourceCanvases();
+          var n = sources.length;
+          countEl.textContent = "(" + n + ")";
+
+          if (!n) {
+            emptyEl.classList.remove("hidden");
+            requestAnimationFrame(render);
+            return;
+          }
+          emptyEl.classList.add("hidden");
+
+          // Average source aspect drives the grid choice.
+          var aspectSum = 0;
+          for (var i = 0; i < n; i++) aspectSum += sources[i].w / sources[i].h;
+          var avgAspect = aspectSum / n;
+
+          var cols = pickColumnCount(n, vw, vh, avgAspect);
+          var rows = Math.ceil(n / cols);
+          var tileW = vw / cols;
+          var tileH = vh / rows;
+
+          for (var idx = 0; idx < n; idx++) {
+            var src = sources[idx];
+            var col = idx % cols;
+            var row = Math.floor(idx / cols);
+            var x = col * tileW;
+            var y = row * tileH;
+
+            var srcAspect = src.w / src.h;
+            var dstW = tileW;
+            var dstH = tileW / srcAspect;
+            if (dstH > tileH) {
+              dstH = tileH;
+              dstW = tileH * srcAspect;
+            }
+            var dx = x + (tileW - dstW) / 2;
+            var dy = y + (tileH - dstH) / 2;
+
+            try {
+              ctx.drawImage(src.canvas, dx, dy, dstW, dstH);
+            } catch (_e) {
+              // Source not yet drawable (size 0, transient between
+              // disconnect/reconnect). Skip this frame for this tile.
+            }
+          }
+
+          requestAnimationFrame(render);
+        }
+        requestAnimationFrame(render);
+
+        // Auto-fade the toolbar after a short idle period, restore on move.
+        var fadeTimer = null;
+        function bumpToolbar() {
+          toolbarEl.classList.remove("faded");
+          if (fadeTimer) clearTimeout(fadeTimer);
+          fadeTimer = setTimeout(function () {
+            if (document.fullscreenElement) toolbarEl.classList.add("faded");
+          }, 2500);
+        }
+        window.addEventListener("mousemove", bumpToolbar);
+        window.addEventListener("keydown", bumpToolbar);
+        document.addEventListener("fullscreenchange", function () {
+          if (!document.fullscreenElement) {
+            toolbarEl.classList.remove("faded");
+            if (fadeTimer) clearTimeout(fadeTimer);
+          } else {
+            bumpToolbar();
+          }
+        });
+
+        fullscreenBtn.addEventListener("click", function () {
+          var docEl = document.documentElement;
+          if (!document.fullscreenElement) {
+            var req =
+              docEl.requestFullscreen ||
+              docEl.webkitRequestFullscreen ||
+              docEl.msRequestFullscreen;
+            if (req) {
+              req.call(docEl);
+              fullscreenBtn.textContent = "Exit Full Screen";
+            }
+          } else {
+            var exit =
+              document.exitFullscreen ||
+              document.webkitExitFullscreen ||
+              document.msExitFullscreen;
+            if (exit) {
+              exit.call(document);
+              fullscreenBtn.textContent = "Full Screen";
+            }
+          }
+        });
+        document.addEventListener("fullscreenchange", function () {
+          fullscreenBtn.textContent = document.fullscreenElement
+            ? "Exit Full Screen"
+            : "Full Screen";
+        });
+
+        closeBtn.addEventListener("click", function () {
+          window.close();
+        });
+
+        // If the parent window goes away we can no longer mirror anything;
+        // keep painting charcoal + show an empty state instead of crashing.
+        var openerCheck = setInterval(function () {
+          if (!window.opener || window.opener.closed) {
+            clearInterval(openerCheck);
+            document.getElementById("wallEmptyTitle").textContent = "Disconnected";
+            document.getElementById("wallEmptyMessage").textContent =
+              "The main NRCC window was closed.";
+            document.getElementById("wallEmptyHint").textContent =
+              "Reopen NRCC and click \u201cWall of Eyes\u201d again.";
+          }
+        }, 1000);
+      })();
+    </script>
+  </body>
+</html>

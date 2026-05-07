@@ -33,6 +33,7 @@ const screenStageEl = document.getElementById("screenStage");
 const consoleEmptyEl = document.getElementById("consoleEmpty");
 const showAllBtn = document.getElementById("showAllBtn");
 const closeAllBtn = document.getElementById("closeAllBtn");
+const wallOfEyesBtn = document.getElementById("wallOfEyesBtn");
 const consoleGridOverlay = document.getElementById("consoleGridOverlay");
 const consoleGridEl = document.getElementById("consoleGrid");
 const ctxMenu = document.getElementById("ctxMenu");
@@ -91,6 +92,14 @@ const favStore = {
 // Open console sessions
 let consoleSessions = [];
 let activeSessionId = null;
+
+// The Wall of Eyes popup reads our open consoles by reaching back through
+// `window.opener.consoleSessions`. ES modules are scoped, so explicitly
+// publish it on the window object for cross-window access.
+window.consoleSessions = consoleSessions;
+
+// Reference to the currently-open Wall of Eyes popup window, if any.
+let wallOfEyesWindow = null;
 
 // =====================================================================
 // Utilities
@@ -1085,6 +1094,10 @@ function updateConsoleControls() {
   consoleEmptyEl.style.display = has ? "none" : "grid";
   showAllBtn.disabled = !has;
   closeAllBtn.disabled = !has;
+  // The Wall of Eyes popup is allowed to open with zero consoles -- it
+  // just shows an empty-state and starts mirroring as soon as you open
+  // some -- but it's also pointless from a cold start, so disable it.
+  wallOfEyesBtn.disabled = !has;
 }
 
 function closeAllSessions() {
@@ -1481,6 +1494,64 @@ window.addEventListener("keydown", (event) => {
 });
 
 // =====================================================================
+// Wall of Eyes (multi-console popup mirror)
+// =====================================================================
+
+function openWallOfEyes() {
+  // If a wall window is already open, just bring it forward instead of
+  // spawning a second one.
+  if (wallOfEyesWindow && !wallOfEyesWindow.closed) {
+    try {
+      wallOfEyesWindow.focus();
+      return;
+    } catch (_e) {
+      // fall through and reopen
+    }
+  }
+
+  const features = [
+    "popup=yes",
+    "noopener=no",
+    "width=1280",
+    "height=800",
+    "menubar=no",
+    "toolbar=no",
+    "location=no",
+    "status=no"
+  ].join(",");
+
+  const win = window.open("/wall.html", "nrcc-wall-of-eyes", features);
+  if (!win) {
+    setStatus(
+      "Couldn't open Wall of Eyes window — your browser may have blocked the popup."
+    );
+    return;
+  }
+  wallOfEyesWindow = win;
+  setStatus(`Opened Wall of Eyes (${consoleSessions.length} console(s)).`);
+  // Best-effort: clear our reference once the popup is closed so a
+  // subsequent click reopens it.
+  const watch = setInterval(() => {
+    if (win.closed) {
+      clearInterval(watch);
+      if (wallOfEyesWindow === win) wallOfEyesWindow = null;
+    }
+  }, 1500);
+}
+
+// Close the Wall of Eyes popup automatically when the parent navigates
+// away or logs out, so a stale popup doesn't sit there mirroring nothing.
+window.addEventListener("beforeunload", () => {
+  if (wallOfEyesWindow && !wallOfEyesWindow.closed) {
+    try {
+      wallOfEyesWindow.close();
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+});
+
+// =====================================================================
 // Launch All (open consoles for every VM in a folder, recursively)
 // =====================================================================
 
@@ -1606,6 +1677,7 @@ nameFilterInput.addEventListener("input", renderVmList);
 powerStateFilter.addEventListener("change", renderVmList);
 
 showAllBtn.addEventListener("click", openShowAll);
+wallOfEyesBtn.addEventListener("click", openWallOfEyes);
 closeAllBtn.addEventListener("click", () => {
   if (!consoleSessions.length) return;
   const ok = confirm(

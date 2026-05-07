@@ -603,7 +603,8 @@
         min-width: 110px;
       }
       .show-all-btn,
-      .close-all-btn {
+      .close-all-btn,
+      .wall-eyes-btn {
         height: 30px;
         padding: 0 14px;
         color: #fff;
@@ -641,6 +642,21 @@
       .close-all-btn:disabled {
         background: #d9b3bf;
         border-color: #d9b3bf;
+        cursor: not-allowed;
+      }
+      .wall-eyes-btn {
+        background: #5dade2;
+        border: 1px solid #5dade2;
+        color: #fff;
+      }
+      .wall-eyes-btn:hover {
+        background: #3498db;
+        border-color: #3498db;
+        color: #fff;
+      }
+      .wall-eyes-btn:disabled {
+        background: #b8d6e5;
+        border-color: #b8d6e5;
         cursor: not-allowed;
       }
 
@@ -1185,6 +1201,7 @@
                   <div class="tabs-actions">
                     <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
                     <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
+                    <button id="wallOfEyesBtn" type="button" class="wall-eyes-btn" disabled title="Open a live wall of every console in a new browser window">Wall of Eyes</button>
                   </div>
                 </div>
                 <div id="screenStage" class="console-stage">
