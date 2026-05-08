@@ -37,7 +37,7 @@ const closeAllBtn = document.getElementById("closeAllBtn");
 const wallOfEyesBtn = document.getElementById("wallOfEyesBtn");
 const ctrlAltDelBtn = document.getElementById("ctrlAltDelBtn");
 const pasteBtn = document.getElementById("pasteBtn");
-const consolePasteBtn = document.getElementById("consolePasteBtn");
+const pasteKeymapSelect = document.getElementById("pasteKeymap");
 const consoleGridOverlay = document.getElementById("consoleGridOverlay");
 const consoleGridEl = document.getElementById("consoleGrid");
 const ctxMenu = document.getElementById("ctxMenu");
@@ -1104,7 +1104,16 @@ function updateConsoleControls() {
   wallOfEyesBtn.disabled = !has;
   ctrlAltDelBtn.disabled = !has;
   pasteBtn.disabled = !has;
-  consolePasteBtn.disabled = !has;
+  pasteKeymapSelect.disabled = !has;
+  // Sync the keymap select to whatever the active tab is using, so
+  // users can see at a glance which layout will be applied if they
+  // hit Paste right now.
+  const active = consoleSessions.find((s) => s.id === activeSessionId);
+  if (active) {
+    pasteKeymapSelect.value = active.keymap || lastUsedKeymap || DEFAULT_KEYMAP_ID;
+  } else {
+    pasteKeymapSelect.value = lastUsedKeymap || DEFAULT_KEYMAP_ID;
+  }
 }
 
 function sendCtrlAltDel() {
@@ -1125,84 +1134,579 @@ function sendCtrlAltDel() {
 // typists fighting over the same console.
 let activePasteToken = 0;
 
-// US-QWERTY map of the keys that share a physical key with another
-// character via Shift. Both halves are listed because we also need to
-// know the underlying physical-key DOM code (e.g. Digit7 for both '7'
-// and '&'), which the QEMU extended-key-event path turns into a scancode.
+// =====================================================================
+// Guest keyboard layouts for Paste
+// =====================================================================
 //
-// Without this, QEMU's VNC server translates a bare '&' keysym to
-// "scancode for 7, no Shift held" and the guest faithfully types '7'
-// instead of '&'. Same story for !@#$%^*()_+{}|:"<>? and friends. The
-// fix is to physically hold ShiftLeft around any shifted character.
-const US_KEY_MAP = (() => {
-  const map = new Map();
-  const add = (ch, code, shifted) => map.set(ch, { code, shifted });
-  // Letters
-  for (let i = 0; i < 26; i++) {
-    const lower = String.fromCharCode(0x61 + i);
-    const upper = String.fromCharCode(0x41 + i);
-    const code = `Key${upper}`;
-    add(lower, code, false);
-    add(upper, code, true);
-  }
-  // Top number row
-  const digits = "0123456789";
-  const digitShifted = ")!@#$%^&*(";
-  for (let i = 0; i < 10; i++) {
-    const code = `Digit${digits[i]}`;
-    add(digits[i], code, false);
-    add(digitShifted[i], code, true);
-  }
-  // Symbol keys (unshifted, shifted)
-  const symbols = [
-    ["`", "~", "Backquote"],
-    ["-", "_", "Minus"],
-    ["=", "+", "Equal"],
-    ["[", "{", "BracketLeft"],
-    ["]", "}", "BracketRight"],
-    ["\\", "|", "Backslash"],
-    [";", ":", "Semicolon"],
-    ["'", "\"", "Quote"],
-    [",", "<", "Comma"],
-    [".", ">", "Period"],
-    ["/", "?", "Slash"]
-  ];
-  for (const [u, s, code] of symbols) {
-    add(u, code, false);
-    add(s, code, true);
-  }
-  add(" ", "Space", false);
-  return map;
-})();
+// The Paste action types each clipboard character into the guest VM as
+// a synthesized keystroke. AHV's QEMU uses the QEMU extended-key-event
+// (scancode) path, so the scancode + modifier travels untranslated and
+// is interpreted by the *guest* OS keyboard layout. That means we have
+// to know which physical key (DOM code, e.g. "Digit7") and which
+// modifiers (Shift / AltGr) produce a given character on the layout
+// the guest is configured for.
+//
+// Each entry in *_DATA below is `[unshifted, shifted, altgr, code]`,
+// where `altgr` is null if no AltGr-modified character is reachable
+// from that key. `buildLayout` flattens the table into a Map keyed by
+// character, so the typing engine can do an O(1) lookup per code point.
+//
+// Sources cross-checked: QEMU pc-bios/keymaps/*, X11 xkb-data
+// (/usr/share/X11/xkb/symbols/*), and the Wikipedia keyboard-layout
+// reference images for each locale. Letters / digits that share both
+// a position and a shifted character with US-QWERTY are added by the
+// helper `addUsBaseLetters` / `addUsBaseDigits` so each table only has
+// to list the differences.
 
 // X11 keysyms we need beyond the printable Latin-1 range that
 // keysymdef.lookup already returns directly.
-const XK_BACKSPACE = 0xff08;
-const XK_TAB       = 0xff09;
-const XK_RETURN    = 0xff0d;
-const XK_SHIFT_L   = 0xffe1;
+const XK_BACKSPACE  = 0xff08;
+const XK_TAB        = 0xff09;
+const XK_RETURN     = 0xff0d;
+const XK_SHIFT_L    = 0xffe1;
+const XK_ISO_LEVEL3 = 0xfe03; // AltGr (right Alt as Mode_switch / Level3)
 
-// Resolve a Unicode code point into the (keysym, code, shifted) tuple
-// the VNC server needs. Returns null for code points that can't be
-// expressed as a single keystroke (which we then drop from the paste).
-function keystrokeForCodePoint(cp) {
-  if (cp === 0x09) return { keysym: XK_TAB, code: "Tab", shifted: false };
-  if (cp === 0x0a || cp === 0x0d) return { keysym: XK_RETURN, code: "Enter", shifted: false };
-  if (cp === 0x08) return { keysym: XK_BACKSPACE, code: "Backspace", shifted: false };
+function addUsBaseLetters(rows) {
+  for (let i = 0; i < 26; i++) {
+    const lower = String.fromCharCode(0x61 + i);
+    const upper = String.fromCharCode(0x41 + i);
+    rows.push([lower, upper, null, `Key${upper}`]);
+  }
+}
+
+function addUsBaseDigits(rows) {
+  const unshifted = "1234567890";
+  const shifted   = "!@#$%^&*()";
+  for (let i = 0; i < 10; i++) {
+    rows.push([unshifted[i], shifted[i], null, `Digit${unshifted[i]}`]);
+  }
+}
+
+// US QWERTY (en-us): the AHV default and what almost every enterprise
+// VM ships with. Pure Latin-1 + ASCII punctuation; no AltGr layer.
+const US_DATA = (() => {
+  const rows = [];
+  addUsBaseLetters(rows);
+  addUsBaseDigits(rows);
+  rows.push(
+    ["`",  "~",  null, "Backquote"],
+    ["-",  "_",  null, "Minus"],
+    ["=",  "+",  null, "Equal"],
+    ["[",  "{",  null, "BracketLeft"],
+    ["]",  "}",  null, "BracketRight"],
+    ["\\", "|",  null, "Backslash"],
+    [";",  ":",  null, "Semicolon"],
+    ["'",  "\"", null, "Quote"],
+    [",",  "<",  null, "Comma"],
+    [".",  ">",  null, "Period"],
+    ["/",  "?",  null, "Slash"],
+    [" ",  null, null, "Space"]
+  );
+  return rows;
+})();
+
+// UK QWERTY (en-gb): same letters/digits as US, but `2` is doublequote
+// (not @), `3` is `£` (not #), Backquote is `` ` / ¬ ``, Quote is `' / @`,
+// Backslash is `# / ~`, IntlBackslash carries `\ / |`. AltGr+4 = €.
+const UK_DATA = (() => {
+  const rows = [];
+  addUsBaseLetters(rows);
+  // Digit row diffs from US
+  rows.push(
+    ["1", "!", null, "Digit1"],
+    ["2", "\"", null, "Digit2"],
+    ["3", "£", null, "Digit3"],
+    ["4", "$", "€",  "Digit4"],
+    ["5", "%", null, "Digit5"],
+    ["6", "^", null, "Digit6"],
+    ["7", "&", null, "Digit7"],
+    ["8", "*", null, "Digit8"],
+    ["9", "(", null, "Digit9"],
+    ["0", ")", null, "Digit0"]
+  );
+  rows.push(
+    ["`",  "¬",  null, "Backquote"],
+    ["-",  "_",  null, "Minus"],
+    ["=",  "+",  null, "Equal"],
+    ["[",  "{",  null, "BracketLeft"],
+    ["]",  "}",  null, "BracketRight"],
+    ["#",  "~",  null, "Backslash"],
+    [";",  ":",  null, "Semicolon"],
+    ["'",  "@",  null, "Quote"],
+    [",",  "<",  null, "Comma"],
+    [".",  ">",  null, "Period"],
+    ["/",  "?",  null, "Slash"],
+    ["\\", "|",  null, "IntlBackslash"],
+    [" ",  null, null, "Space"]
+  );
+  return rows;
+})();
+
+// French AZERTY (fr-FR). Top row digits are SHIFTED; unshifted row is
+// `& é " ' ( - è _ ç à`. AltGr layer carries `~ # { [ | \` ^ @ ] }` on
+// the digit row, plus `€` on E and `¤` on $.
+const FR_DATA = [
+  // Letter row 1 (AZERTY): A and Q swap, Z and W swap (vs US-QWERTY)
+  ["a", "A", null, "KeyQ"],
+  ["z", "Z", null, "KeyW"],
+  ["e", "E", "€",  "KeyE"],
+  ["r", "R", null, "KeyR"],
+  ["t", "T", null, "KeyT"],
+  ["y", "Y", null, "KeyY"],
+  ["u", "U", null, "KeyU"],
+  ["i", "I", null, "KeyI"],
+  ["o", "O", null, "KeyO"],
+  ["p", "P", null, "KeyP"],
+  // Letter row 2
+  ["q", "Q", null, "KeyA"],
+  ["s", "S", null, "KeyS"],
+  ["d", "D", null, "KeyD"],
+  ["f", "F", null, "KeyF"],
+  ["g", "G", null, "KeyG"],
+  ["h", "H", null, "KeyH"],
+  ["j", "J", null, "KeyJ"],
+  ["k", "K", null, "KeyK"],
+  ["l", "L", null, "KeyL"],
+  ["m", "M", null, "Semicolon"],
+  // Letter row 3 (Z and W swap)
+  ["w", "W", null, "KeyZ"],
+  ["x", "X", null, "KeyX"],
+  ["c", "C", null, "KeyC"],
+  ["v", "V", null, "KeyV"],
+  ["b", "B", null, "KeyB"],
+  ["n", "N", null, "KeyN"],
+  // Top number row (unshifted = letters with diacritics)
+  ["&", "1", null, "Digit1"],
+  ["é", "2", "~",  "Digit2"],
+  ["\"", "3", "#", "Digit3"],
+  ["'", "4", "{",  "Digit4"],
+  ["(", "5", "[",  "Digit5"],
+  ["-", "6", "|",  "Digit6"],
+  ["è", "7", "`",  "Digit7"],
+  ["_", "8", "\\", "Digit8"],
+  ["ç", "9", "^",  "Digit9"],
+  ["à", "0", "@",  "Digit0"],
+  [")", "°", "]",  "Minus"],
+  ["=", "+", "}",  "Equal"],
+  // Punctuation
+  ["$", "£", "¤",  "BracketRight"],
+  ["*", "µ", null, "Backslash"],
+  ["ù", "%", null, "Quote"],
+  [",", "?", null, "KeyM"],
+  [";", ".", null, "Comma"],
+  [":", "/", null, "Period"],
+  ["!", "§", null, "Slash"],
+  ["²", null, null, "Backquote"],
+  ["<", ">", null, "IntlBackslash"],
+  [" ", null, null, "Space"]
+];
+
+// German QWERTZ (de-DE). Y and Z swap. AltGr carries `@ \ | { [ ] } ~ €`
+// on the top row; `µ` on M; superscripts on 2/3.
+const DE_DATA = (() => {
+  const rows = [];
+  // Letters: US base, but Y and Z are swapped
+  for (let i = 0; i < 26; i++) {
+    const lower = String.fromCharCode(0x61 + i);
+    const upper = String.fromCharCode(0x41 + i);
+    let code = `Key${upper}`;
+    if (upper === "Y") code = "KeyZ";
+    else if (upper === "Z") code = "KeyY";
+    rows.push([lower, upper, null, code]);
+  }
+  // E gets €, M gets µ via AltGr
+  for (const r of rows) {
+    if (r[0] === "e") r[2] = "€";
+    if (r[0] === "m") r[2] = "µ";
+    if (r[0] === "q") r[2] = "@";
+  }
+  rows.push(
+    ["1", "!", null, "Digit1"],
+    ["2", "\"", "²", "Digit2"],
+    ["3", "§", "³", "Digit3"],
+    ["4", "$", null, "Digit4"],
+    ["5", "%", null, "Digit5"],
+    ["6", "&", null, "Digit6"],
+    ["7", "/", "{",  "Digit7"],
+    ["8", "(", "[",  "Digit8"],
+    ["9", ")", "]",  "Digit9"],
+    ["0", "=", "}",  "Digit0"],
+    ["ß", "?", "\\", "Minus"],
+    ["´", "`", null, "Equal"],
+    ["ü", "Ü", null, "BracketLeft"],
+    ["+", "*", "~",  "BracketRight"],
+    ["ö", "Ö", null, "Semicolon"],
+    ["ä", "Ä", null, "Quote"],
+    ["#", "'", null, "Backslash"],
+    [",", ";", null, "Comma"],
+    [".", ":", null, "Period"],
+    ["-", "_", null, "Slash"],
+    ["^", "°", null, "Backquote"],
+    ["<", ">", "|",  "IntlBackslash"],
+    [" ", null, null, "Space"]
+  );
+  return rows;
+})();
+
+// Spanish (es-ES). QWERTY-base with `Ñ`, `¿/¡`, AltGr carries
+// `| @ # ¬ € ¬ \ ` on the symbol row, plus `[ ] { }` on the bracket row.
+const ES_DATA = (() => {
+  const rows = [];
+  addUsBaseLetters(rows);
+  // E, +2 = €, +Q = nothing standard; AltGr+letter additions:
+  for (const r of rows) {
+    if (r[0] === "e") r[2] = "€";
+  }
+  rows.push(
+    ["1", "!", "|",  "Digit1"],
+    ["2", "\"", "@", "Digit2"],
+    ["3", "·", "#",  "Digit3"],
+    ["4", "$", "~",  "Digit4"],
+    ["5", "%", null, "Digit5"],
+    ["6", "&", "¬",  "Digit6"],
+    ["7", "/", null, "Digit7"],
+    ["8", "(", null, "Digit8"],
+    ["9", ")", null, "Digit9"],
+    ["0", "=", null, "Digit0"],
+    ["'", "?", null, "Minus"],
+    ["¡", "¿", null, "Equal"],
+    ["`", "^", "[",  "BracketLeft"],
+    ["+", "*", "]",  "BracketRight"],
+    ["ñ", "Ñ", null, "Semicolon"],
+    ["´", "¨", "{",  "Quote"],
+    ["ç", "Ç", "}",  "Backslash"],
+    [",", ";", null, "Comma"],
+    [".", ":", null, "Period"],
+    ["-", "_", null, "Slash"],
+    ["º", "ª", "\\", "Backquote"],
+    ["<", ">", null, "IntlBackslash"],
+    [" ", null, null, "Space"]
+  );
+  return rows;
+})();
+
+// Italian (it-IT). Similar to Spanish in structure but different
+// accented vowels and with `@` on Quote (AltGr+ò) and `#` on AltGr+à.
+const IT_DATA = (() => {
+  const rows = [];
+  addUsBaseLetters(rows);
+  for (const r of rows) {
+    if (r[0] === "e") r[2] = "€";
+  }
+  rows.push(
+    ["1", "!", null, "Digit1"],
+    ["2", "\"", null, "Digit2"],
+    ["3", "£", null, "Digit3"],
+    ["4", "$", null, "Digit4"],
+    ["5", "%", null, "Digit5"],
+    ["6", "&", null, "Digit6"],
+    ["7", "/", null, "Digit7"],
+    ["8", "(", null, "Digit8"],
+    ["9", ")", null, "Digit9"],
+    ["0", "=", null, "Digit0"],
+    ["'", "?", null, "Minus"],
+    ["ì", "^", null, "Equal"],
+    ["è", "é", "[",  "BracketLeft"],
+    ["+", "*", "]",  "BracketRight"],
+    ["ò", "ç", "@",  "Semicolon"],
+    ["à", "°", "#",  "Quote"],
+    ["ù", "§", null, "Backslash"],
+    [",", ";", null, "Comma"],
+    [".", ":", null, "Period"],
+    ["-", "_", null, "Slash"],
+    ["\\", "|", null, "Backquote"],
+    ["<", ">", null, "IntlBackslash"],
+    [" ", null, null, "Space"]
+  );
+  return rows;
+})();
+
+// Brazilian ABNT2 (pt-BR). QWERTY-base with cedilla on Quote, accented
+// chars via dead keys (we don't synthesize dead-key sequences — those
+// characters fall through to the raw-keysym path).
+const BR_DATA = (() => {
+  const rows = [];
+  addUsBaseLetters(rows);
+  for (const r of rows) {
+    if (r[0] === "e") r[2] = "€";
+  }
+  rows.push(
+    ["1", "!", null, "Digit1"],
+    ["2", "@", null, "Digit2"],
+    ["3", "#", null, "Digit3"],
+    ["4", "$", null, "Digit4"],
+    ["5", "%", "¢",  "Digit5"],
+    ["6", "¨", null, "Digit6"],
+    ["7", "&", null, "Digit7"],
+    ["8", "*", null, "Digit8"],
+    ["9", "(", null, "Digit9"],
+    ["0", ")", null, "Digit0"],
+    ["-", "_", null, "Minus"],
+    ["=", "+", "§",  "Equal"],
+    ["'", "`", null, "BracketLeft"],
+    ["[", "{", "ª",  "BracketRight"],
+    ["ç", "Ç", null, "Semicolon"],
+    ["~", "^", null, "Quote"],
+    ["]", "}", "º",  "Backslash"],
+    [",", "<", null, "Comma"],
+    [".", ">", null, "Period"],
+    [";", ":", null, "Slash"],
+    ["/", "?", "°",  "IntlBackslash"],
+    ["\\", "|", null, "Backquote"],
+    [" ", null, null, "Space"]
+  );
+  return rows;
+})();
+
+// Swedish / Finnish (sv-SE / fi-FI). QWERTY-base with å, ä, ö on the
+// right side, € on AltGr+E, @ on AltGr+2, $ on AltGr+4. Norwegian and
+// Danish are very close but swap Ø/Å — a separate option later if anyone
+// needs them.
+const NORDIC_DATA = (() => {
+  const rows = [];
+  addUsBaseLetters(rows);
+  for (const r of rows) {
+    if (r[0] === "e") r[2] = "€";
+  }
+  rows.push(
+    ["1", "!", null, "Digit1"],
+    ["2", "\"", "@", "Digit2"],
+    ["3", "#", "£",  "Digit3"],
+    ["4", "¤", "$",  "Digit4"],
+    ["5", "%", "€",  "Digit5"],
+    ["6", "&", null, "Digit6"],
+    ["7", "/", "{",  "Digit7"],
+    ["8", "(", "[",  "Digit8"],
+    ["9", ")", "]",  "Digit9"],
+    ["0", "=", "}",  "Digit0"],
+    ["+", "?", "\\", "Minus"],
+    ["´", "`", null, "Equal"],
+    ["å", "Å", null, "BracketLeft"],
+    ["¨", "^", "~",  "BracketRight"],
+    ["ö", "Ö", null, "Semicolon"],
+    ["ä", "Ä", null, "Quote"],
+    ["'", "*", null, "Backslash"],
+    [",", ";", null, "Comma"],
+    [".", ":", null, "Period"],
+    ["-", "_", null, "Slash"],
+    ["§", "½", null, "Backquote"],
+    ["<", ">", "|",  "IntlBackslash"],
+    [" ", null, null, "Space"]
+  );
+  return rows;
+})();
+
+// US Dvorak (dvorak). Same physical keyboard, completely remapped
+// letter/punctuation positions. Top number row matches US-QWERTY.
+const DVORAK_DATA = (() => {
+  // Map: char -> US physical-key code
+  const layout = {
+    // Top letter row
+    "'": "KeyQ", "\"": "KeyQ",
+    ",": "KeyW", "<": "KeyW",
+    ".": "KeyE", ">": "KeyE",
+    "p": "KeyR", "P": "KeyR",
+    "y": "KeyT", "Y": "KeyT",
+    "f": "KeyY", "F": "KeyY",
+    "g": "KeyU", "G": "KeyU",
+    "c": "KeyI", "C": "KeyI",
+    "r": "KeyO", "R": "KeyO",
+    "l": "KeyP", "L": "KeyP",
+    "/": "BracketLeft", "?": "BracketLeft",
+    "=": "BracketRight", "+": "BracketRight",
+    // Home row
+    "a": "KeyA", "A": "KeyA",
+    "o": "KeyS", "O": "KeyS",
+    "e": "KeyD", "E": "KeyD",
+    "u": "KeyF", "U": "KeyF",
+    "i": "KeyG", "I": "KeyG",
+    "d": "KeyH", "D": "KeyH",
+    "h": "KeyJ", "H": "KeyJ",
+    "t": "KeyK", "T": "KeyK",
+    "n": "KeyL", "N": "KeyL",
+    "s": "Semicolon", "S": "Semicolon",
+    "-": "Quote", "_": "Quote",
+    // Bottom row
+    ";": "KeyZ", ":": "KeyZ",
+    "q": "KeyX", "Q": "KeyX",
+    "j": "KeyC", "J": "KeyC",
+    "k": "KeyV", "K": "KeyV",
+    "x": "KeyB", "X": "KeyB",
+    "b": "KeyN", "B": "KeyN",
+    "m": "KeyM", "M": "KeyM",
+    "w": "Comma", "W": "Comma",
+    "v": "Period", "V": "Period",
+    "z": "Slash", "Z": "Slash"
+  };
+  const isShifted = (ch) => /^[A-Z?<>+_:"]$/.test(ch) || ch === "\"";
+  const rows = [];
+  // Group same code together as [unshifted, shifted]
+  const groups = new Map();
+  for (const [ch, code] of Object.entries(layout)) {
+    if (!groups.has(code)) groups.set(code, [null, null]);
+    const slot = groups.get(code);
+    if (isShifted(ch)) slot[1] = ch;
+    else slot[0] = ch;
+  }
+  for (const [code, [u, s]] of groups) {
+    rows.push([u, s, null, code]);
+  }
+  // Digits + symbol keys keep US-QWERTY positions
+  addUsBaseDigits(rows);
+  rows.push(
+    ["`",  "~",  null, "Backquote"],
+    ["\\", "|",  null, "Backslash"],
+    [" ",  null, null, "Space"]
+  );
+  return rows;
+})();
+
+// US Colemak (colemak). Same physical keyboard, ergonomic remap that
+// keeps QWERTY positions for Z X C V B and most punctuation.
+const COLEMAK_DATA = (() => {
+  const layout = {
+    "q": "KeyQ", "Q": "KeyQ",
+    "w": "KeyW", "W": "KeyW",
+    "f": "KeyE", "F": "KeyE",
+    "p": "KeyR", "P": "KeyR",
+    "g": "KeyT", "G": "KeyT",
+    "j": "KeyY", "J": "KeyY",
+    "l": "KeyU", "L": "KeyU",
+    "u": "KeyI", "U": "KeyI",
+    "y": "KeyO", "Y": "KeyO",
+    ";": "KeyP", ":": "KeyP",
+    // Home row
+    "a": "KeyA", "A": "KeyA",
+    "r": "KeyS", "R": "KeyS",
+    "s": "KeyD", "S": "KeyD",
+    "t": "KeyF", "T": "KeyF",
+    "d": "KeyG", "D": "KeyG",
+    "h": "KeyH", "H": "KeyH",
+    "n": "KeyJ", "N": "KeyJ",
+    "e": "KeyK", "E": "KeyK",
+    "i": "KeyL", "I": "KeyL",
+    "o": "Semicolon", "O": "Semicolon",
+    // Bottom row (same as QWERTY for Z X C V B M , . /)
+    "z": "KeyZ", "Z": "KeyZ",
+    "x": "KeyX", "X": "KeyX",
+    "c": "KeyC", "C": "KeyC",
+    "v": "KeyV", "V": "KeyV",
+    "b": "KeyB", "B": "KeyB",
+    "k": "KeyN", "K": "KeyN",
+    "m": "KeyM", "M": "KeyM"
+  };
+  const isShifted = (ch) => /^[A-Z:]$/.test(ch);
+  const rows = [];
+  const groups = new Map();
+  for (const [ch, code] of Object.entries(layout)) {
+    if (!groups.has(code)) groups.set(code, [null, null]);
+    const slot = groups.get(code);
+    if (isShifted(ch)) slot[1] = ch;
+    else slot[0] = ch;
+  }
+  for (const [code, [u, s]] of groups) {
+    rows.push([u, s, null, code]);
+  }
+  addUsBaseDigits(rows);
+  rows.push(
+    ["`",  "~",  null, "Backquote"],
+    ["-",  "_",  null, "Minus"],
+    ["=",  "+",  null, "Equal"],
+    ["[",  "{",  null, "BracketLeft"],
+    ["]",  "}",  null, "BracketRight"],
+    ["\\", "|",  null, "Backslash"],
+    ["'",  "\"", null, "Quote"],
+    [",",  "<",  null, "Comma"],
+    [".",  ">",  null, "Period"],
+    ["/",  "?",  null, "Slash"],
+    [" ",  null, null, "Space"]
+  );
+  return rows;
+})();
+
+function buildLayout(rows) {
+  const map = new Map();
+  for (const [unshifted, shifted, altgr, code] of rows) {
+    if (unshifted != null && !map.has(unshifted)) {
+      map.set(unshifted, { code, shifted: false, altgr: false });
+    }
+    if (shifted != null && !map.has(shifted)) {
+      map.set(shifted, { code, shifted: true, altgr: false });
+    }
+    if (altgr != null && !map.has(altgr)) {
+      map.set(altgr, { code, shifted: false, altgr: true });
+    }
+  }
+  return map;
+}
+
+// Public registry of supported guest keyboard layouts. The order here
+// is the order of the dropdown in the UI; the first entry is also the
+// default for users who have never picked one.
+const KEYMAPS = [
+  { id: "us",      label: "US QWERTY",         data: US_DATA },
+  { id: "uk",      label: "UK QWERTY",         data: UK_DATA },
+  { id: "fr",      label: "French (AZERTY)",   data: FR_DATA },
+  { id: "de",      label: "German (QWERTZ)",   data: DE_DATA },
+  { id: "es",      label: "Spanish",           data: ES_DATA },
+  { id: "it",      label: "Italian",           data: IT_DATA },
+  { id: "pt-br",   label: "Brazilian (ABNT2)", data: BR_DATA },
+  { id: "nordic",  label: "Swedish / Finnish", data: NORDIC_DATA },
+  { id: "dvorak",  label: "US Dvorak",         data: DVORAK_DATA },
+  { id: "colemak", label: "US Colemak",        data: COLEMAK_DATA }
+];
+
+const DEFAULT_KEYMAP_ID = "us";
+const KEYMAP_STORAGE_KEY = "ntnxConsoleLastKeymap";
+
+// Built keymaps are cached lazily — building all 10 up-front would be
+// fine size-wise but pointless work for users who only ever paste into
+// US-QWERTY VMs.
+const _builtKeymapCache = new Map();
+function getKeymap(layoutId) {
+  const id = KEYMAPS.some((k) => k.id === layoutId) ? layoutId : DEFAULT_KEYMAP_ID;
+  if (!_builtKeymapCache.has(id)) {
+    const def = KEYMAPS.find((k) => k.id === id);
+    _builtKeymapCache.set(id, buildLayout(def.data));
+  }
+  return _builtKeymapCache.get(id);
+}
+
+let lastUsedKeymap = DEFAULT_KEYMAP_ID;
+try {
+  const saved = localStorage.getItem(KEYMAP_STORAGE_KEY);
+  if (saved && KEYMAPS.some((k) => k.id === saved)) lastUsedKeymap = saved;
+} catch (_e) { /* localStorage may be disabled in some browsers */ }
+
+function rememberKeymapChoice(layoutId) {
+  if (!KEYMAPS.some((k) => k.id === layoutId)) return;
+  lastUsedKeymap = layoutId;
+  try { localStorage.setItem(KEYMAP_STORAGE_KEY, layoutId); } catch (_e) { /* ignore */ }
+}
+
+// Resolve a Unicode code point into the (keysym, code, shifted, altgr)
+// tuple the VNC server needs, using the supplied per-layout char map.
+// Returns null for code points that can't be expressed as a single
+// keystroke (which we then drop from the paste).
+function keystrokeForCodePoint(cp, keyMap) {
+  if (cp === 0x09) return { keysym: XK_TAB, code: "Tab", shifted: false, altgr: false };
+  if (cp === 0x0a || cp === 0x0d) return { keysym: XK_RETURN, code: "Enter", shifted: false, altgr: false };
+  if (cp === 0x08) return { keysym: XK_BACKSPACE, code: "Backspace", shifted: false, altgr: false };
 
   const ch = String.fromCodePoint(cp);
-  const mapped = US_KEY_MAP.get(ch);
+  const mapped = keyMap.get(ch);
   const keysym = keysymdef.lookup(cp);
   if (!keysym) return null;
 
   if (mapped) {
-    return { keysym, code: mapped.code, shifted: mapped.shifted };
+    return { keysym, code: mapped.code, shifted: mapped.shifted, altgr: mapped.altgr };
   }
-  // Anything else (accented characters, unicode punctuation, emoji, ...)
-  // gets sent without a physical-key hint. The QEMU ext-key path will
-  // skip these (no scancode), and the plain-RFB path delivers the
-  // keysym as-is — which most guests with the right keymap will accept.
-  return { keysym, code: "", shifted: false };
+  // Anything else (accented characters not in the chosen layout, unicode
+  // punctuation, emoji, ...) gets sent without a physical-key hint. The
+  // QEMU ext-key path will skip these (no scancode), and the plain-RFB
+  // path delivers the keysym as-is — which most guests with a matching
+  // X11/xkb keymap will still accept.
+  return { keysym, code: "", shifted: false, altgr: false };
 }
 
 // Type `text` into the active session by sending a synthetic key down/up
@@ -1214,6 +1718,10 @@ async function typeTextIntoSession(session, text, opts = {}) {
   const { perCharDelayMs = 0, perLineDelayMs = 0 } = opts;
   const rfb = session?.rfb;
   if (!rfb) return;
+
+  const layoutId = session.keymap || lastUsedKeymap || DEFAULT_KEYMAP_ID;
+  const keyMap = getKeymap(layoutId);
+  const layoutLabel = (KEYMAPS.find((k) => k.id === layoutId) || {}).label || layoutId;
 
   const myToken = ++activePasteToken;
   const normalized = text.replace(/\r\n?/g, "\n");
@@ -1228,20 +1736,29 @@ async function typeTextIntoSession(session, text, opts = {}) {
   let typed = 0;
   let dropped = 0;
 
-  // Track the current shift state so a run of shifted characters
-  // (e.g. "ABCDEF" or "!@#$%") only toggles ShiftLeft once at the
-  // boundaries, instead of pressing/releasing it for every character.
+  // Track the current modifier state so a run of shifted (or AltGr-ed)
+  // characters only toggles each modifier once at the boundaries,
+  // instead of pressing/releasing it for every character. Shift and
+  // AltGr are tracked independently because some characters need both
+  // (rare, but possible on a few layouts).
   let shiftHeld = false;
+  let altgrHeld = false;
   const setShift = (down) => {
     if (down === shiftHeld) return;
     rfb.sendKey(XK_SHIFT_L, "ShiftLeft", down);
     shiftHeld = down;
   };
+  const setAltGr = (down) => {
+    if (down === altgrHeld) return;
+    rfb.sendKey(XK_ISO_LEVEL3, "AltRight", down);
+    altgrHeld = down;
+  };
 
   const cleanup = () => {
-    if (shiftHeld) {
-      try { setShift(false); } catch (_e) { /* connection may be gone */ }
-    }
+    try {
+      if (shiftHeld) setShift(false);
+      if (altgrHeld) setAltGr(false);
+    } catch (_e) { /* connection may be gone */ }
   };
 
   try {
@@ -1253,10 +1770,17 @@ async function typeTextIntoSession(session, text, opts = {}) {
         return;
       }
       const cp = ch.codePointAt(0);
-      const stroke = keystrokeForCodePoint(cp);
+      const stroke = keystrokeForCodePoint(cp, keyMap);
       if (!stroke) { dropped++; continue; }
 
-      setShift(stroke.shifted);
+      // Order matters slightly: release modifiers we no longer need
+      // *before* pressing new ones, so the guest never sees a stray
+      // Shift+AltGr combo for one keystroke during transitions.
+      if (!stroke.shifted && shiftHeld) setShift(false);
+      if (!stroke.altgr && altgrHeld) setAltGr(false);
+      if (stroke.shifted && !shiftHeld) setShift(true);
+      if (stroke.altgr && !altgrHeld) setAltGr(true);
+
       rfb.sendKey(stroke.keysym, stroke.code, true);
       rfb.sendKey(stroke.keysym, stroke.code, false);
       typed++;
@@ -1268,8 +1792,8 @@ async function typeTextIntoSession(session, text, opts = {}) {
     cleanup();
   }
 
-  const droppedSuffix = dropped ? ` (${dropped} unsupported char${dropped === 1 ? "" : "s"} skipped)` : "";
-  setStatus(`Typed ${typed} character${typed === 1 ? "" : "s"} into ${session.vmName}.${droppedSuffix}`);
+  const droppedSuffix = dropped ? ` (${dropped} char${dropped === 1 ? "" : "s"} not in ${layoutLabel} layout, skipped)` : "";
+  setStatus(`Typed ${typed} character${typed === 1 ? "" : "s"} into ${session.vmName} (${layoutLabel}).${droppedSuffix}`);
 }
 
 async function readClipboardOrWarn() {
@@ -1293,20 +1817,12 @@ async function pasteClipboardToConsole() {
   const text = await readClipboardOrWarn();
   if (text == null) return;
   setStatus(`Typing clipboard into ${session.vmName}...`, { spinner: true });
-  await typeTextIntoSession(session, text);
-}
-
-async function consolePasteClipboard() {
-  const session = consoleSessions.find((s) => s.id === activeSessionId);
-  if (!session?.rfb) return;
-  const text = await readClipboardOrWarn();
-  if (text == null) return;
-  setStatus(`Typing clipboard into ${session.vmName} (terminal-safe)...`, { spinner: true });
-  // Linux PTYs (and especially some bash readline configs) drop bytes
-  // when input arrives faster than the line discipline can buffer it,
-  // so pace the keystrokes a touch and give the shell extra time to
-  // finish executing each line before the next one starts.
-  await typeTextIntoSession(session, text, { perCharDelayMs: 4, perLineDelayMs: 30 });
+  // Use a small per-keystroke delay (and a slightly longer pause after
+  // each newline) so the same code path is safe everywhere: Windows
+  // GUIs, Linux logins, and Linux terminals where a fast PTY can drop
+  // bytes from bursty input. The cost is ~2ms per character — a
+  // 200-char command is ~0.4s, well below the threshold of annoyance.
+  await typeTextIntoSession(session, text, { perCharDelayMs: 2, perLineDelayMs: 25 });
 }
 
 function closeAllSessions() {
@@ -1472,7 +1988,18 @@ async function openConsoleFor(vmUuid, opts = {}) {
       setStatus(`Security failure (${vmName}): ${event.detail.status}`)
     );
 
-    const newSession = { id: sessionId, vmUuid, vmName, rfb, screenEl, tabEl: null };
+    const newSession = {
+      id: sessionId,
+      vmUuid,
+      vmName,
+      rfb,
+      screenEl,
+      tabEl: null,
+      // New tabs inherit whichever guest keymap the user picked most
+      // recently (persisted in localStorage). They can change it on
+      // the action bar at any time without affecting other open tabs.
+      keymap: lastUsedKeymap || DEFAULT_KEYMAP_ID
+    };
     const tabEl = createSessionTab(newSession);
     newSession.tabEl = tabEl;
     consoleSessions.push(newSession);
@@ -1889,7 +2416,21 @@ showAllBtn.addEventListener("click", openShowAll);
 wallOfEyesBtn.addEventListener("click", openWallOfEyes);
 ctrlAltDelBtn.addEventListener("click", sendCtrlAltDel);
 pasteBtn.addEventListener("click", pasteClipboardToConsole);
-consolePasteBtn.addEventListener("click", consolePasteClipboard);
+pasteKeymapSelect.addEventListener("change", () => {
+  const newId = pasteKeymapSelect.value;
+  if (!KEYMAPS.some((k) => k.id === newId)) return;
+  const active = consoleSessions.find((s) => s.id === activeSessionId);
+  if (active) {
+    active.keymap = newId;
+  }
+  rememberKeymapChoice(newId);
+  const label = (KEYMAPS.find((k) => k.id === newId) || {}).label || newId;
+  if (active) {
+    setStatus(`Paste keymap for ${active.vmName} set to ${label}.`);
+  } else {
+    setStatus(`Default paste keymap for new tabs set to ${label}.`);
+  }
+});
 closeAllBtn.addEventListener("click", () => {
   if (!consoleSessions.length) return;
   const ok = confirm(
@@ -1906,6 +2447,9 @@ loadSavedProfile();
 loadFavoritesStore();
 renderAll();
 refreshPeCredsCache();
+// Reflect the saved guest-keymap preference in the action bar even
+// before any tabs are open, so the user knows what new tabs will inherit.
+pasteKeymapSelect.value = lastUsedKeymap;
 showLoginScreen();
 setTimeout(() => {
   if (loginPcHostInput.value && loginUsernameInput.value) {

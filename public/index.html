@@ -613,8 +613,7 @@
       .close-all-btn,
       .wall-eyes-btn,
       .ctrl-alt-del-btn,
-      .paste-btn,
-      .console-paste-btn {
+      .paste-btn {
         height: 32px;
         padding: 0 12px;
         color: #fff;
@@ -626,6 +625,36 @@
         transition: background 120ms ease, border-color 120ms ease;
         white-space: nowrap;
         width: 100%;
+      }
+      .paste-keymap-label {
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        color: var(--ntx-text-subtle);
+        margin-top: 2px;
+        padding: 0 2px;
+      }
+      .paste-keymap-select {
+        height: 28px;
+        width: 100%;
+        padding: 0 6px;
+        font-size: 11.5px;
+        color: var(--ntx-text);
+        background: #fff;
+        border: 1px solid var(--ntx-border-strong);
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .paste-keymap-select:focus {
+        outline: none;
+        border-color: var(--ntx-accent);
+        box-shadow: 0 0 0 2px rgba(21, 101, 255, 0.18);
+      }
+      .paste-keymap-select:disabled {
+        background: #eef1f6;
+        color: var(--ntx-text-subtle);
+        cursor: not-allowed;
       }
       .show-all-btn {
         background: var(--ntx-success);
@@ -696,20 +725,6 @@
       .paste-btn:disabled {
         background: #c4b5fd;
         border-color: #c4b5fd;
-        cursor: not-allowed;
-      }
-      .console-paste-btn {
-        background: #0891b2;
-        border: 1px solid #0891b2;
-      }
-      .console-paste-btn:hover {
-        background: #0e7490;
-        border-color: #0e7490;
-        color: #fff;
-      }
-      .console-paste-btn:disabled {
-        background: #a5d8e6;
-        border-color: #a5d8e6;
         cursor: not-allowed;
       }
 
@@ -1268,8 +1283,21 @@
                   </div>
                   <div class="tabs-actions">
                     <button id="ctrlAltDelBtn" type="button" class="ctrl-alt-del-btn" disabled title="Send Ctrl+Alt+Del to the active console (unlock Windows)">Ctrl+Alt+Del</button>
-                    <button id="pasteBtn" type="button" class="paste-btn" disabled title="Type clipboard contents into the active console at the cursor (works in any guest OS, no clipboard agent required)">Paste</button>
-                    <button id="consolePasteBtn" type="button" class="console-paste-btn" disabled title="Type clipboard into a Linux terminal with a small per-character delay so line discipline doesn't drop characters">Console Paste</button>
+                    <button id="pasteBtn" type="button" class="paste-btn" disabled title="Type the clipboard contents into the active console one keystroke at a time. Works on any guest OS (Windows, Linux GUI, Linux terminal, BIOS) — no clipboard-sync agent required.">Paste</button>
+                    <label class="paste-keymap-label" for="pasteKeymap">Guest keymap</label>
+                    <select id="pasteKeymap" class="paste-keymap-select" disabled
+                            title="Keyboard layout the guest VM is configured for. Determines which physical keys Paste sends for each character. Choice is per console tab; new tabs inherit your most recent selection.">
+                      <option value="us">US QWERTY</option>
+                      <option value="uk">UK QWERTY</option>
+                      <option value="fr">French (AZERTY)</option>
+                      <option value="de">German (QWERTZ)</option>
+                      <option value="es">Spanish</option>
+                      <option value="it">Italian</option>
+                      <option value="pt-br">Brazilian (ABNT2)</option>
+                      <option value="nordic">Swedish / Finnish</option>
+                      <option value="dvorak">US Dvorak</option>
+                      <option value="colemak">US Colemak</option>
+                    </select>
                     <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
                     <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
                     <button id="wallOfEyesBtn" type="button" class="wall-eyes-btn" disabled title="Open a live wall of every console in a new browser window">Wall of Eyes</button>
