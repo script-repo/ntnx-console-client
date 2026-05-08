@@ -36,6 +36,7 @@ const closeAllBtn = document.getElementById("closeAllBtn");
 const wallOfEyesBtn = document.getElementById("wallOfEyesBtn");
 const ctrlAltDelBtn = document.getElementById("ctrlAltDelBtn");
 const pasteBtn = document.getElementById("pasteBtn");
+const consolePasteBtn = document.getElementById("consolePasteBtn");
 const consoleGridOverlay = document.getElementById("consoleGridOverlay");
 const consoleGridEl = document.getElementById("consoleGrid");
 const ctxMenu = document.getElementById("ctxMenu");
@@ -1102,6 +1103,7 @@ function updateConsoleControls() {
   wallOfEyesBtn.disabled = !has;
   ctrlAltDelBtn.disabled = !has;
   pasteBtn.disabled = !has;
+  consolePasteBtn.disabled = !has;
 }
 
 function sendCtrlAltDel() {
@@ -1128,6 +1130,26 @@ async function pasteClipboardToConsole() {
     rfb.sendKey(0xffe3, "ControlLeft", true);
     rfb.sendKey(0x76, "KeyV", true);
     rfb.sendKey(0x76, "KeyV", false);
+    rfb.sendKey(0xffe3, "ControlLeft", false);
+    setStatus(`Pasted clipboard to ${session.vmName}.`);
+  } catch (_err) {
+    setStatus("Clipboard read failed — check browser permissions.");
+  }
+}
+
+async function consolePasteClipboard() {
+  const session = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!session?.rfb) return;
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text) { setStatus("Clipboard is empty."); return; }
+    const rfb = session.rfb;
+    rfb.clipboardPasteFrom(text);
+    rfb.sendKey(0xffe3, "ControlLeft", true);
+    rfb.sendKey(0xffe1, "ShiftLeft", true);
+    rfb.sendKey(0x76, "KeyV", true);
+    rfb.sendKey(0x76, "KeyV", false);
+    rfb.sendKey(0xffe1, "ShiftLeft", false);
     rfb.sendKey(0xffe3, "ControlLeft", false);
     setStatus(`Pasted clipboard to ${session.vmName}.`);
   } catch (_err) {
@@ -1715,6 +1737,7 @@ showAllBtn.addEventListener("click", openShowAll);
 wallOfEyesBtn.addEventListener("click", openWallOfEyes);
 ctrlAltDelBtn.addEventListener("click", sendCtrlAltDel);
 pasteBtn.addEventListener("click", pasteClipboardToConsole);
+consolePasteBtn.addEventListener("click", consolePasteClipboard);
 closeAllBtn.addEventListener("click", () => {
   if (!consoleSessions.length) return;
   const ok = confirm(

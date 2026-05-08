@@ -606,7 +606,8 @@
       .close-all-btn,
       .wall-eyes-btn,
       .ctrl-alt-del-btn,
-      .paste-btn {
+      .paste-btn,
+      .console-paste-btn {
         height: 30px;
         padding: 0 14px;
         color: #fff;
@@ -687,6 +688,20 @@
       .paste-btn:disabled {
         background: #c4b5fd;
         border-color: #c4b5fd;
+        cursor: not-allowed;
+      }
+      .console-paste-btn {
+        background: #0891b2;
+        border: 1px solid #0891b2;
+      }
+      .console-paste-btn:hover {
+        background: #0e7490;
+        border-color: #0e7490;
+        color: #fff;
+      }
+      .console-paste-btn:disabled {
+        background: #a5d8e6;
+        border-color: #a5d8e6;
         cursor: not-allowed;
       }
 
@@ -1231,6 +1246,7 @@
                   <div class="tabs-actions">
                     <button id="ctrlAltDelBtn" type="button" class="ctrl-alt-del-btn" disabled title="Send Ctrl+Alt+Del to the active console (unlock Windows)">Ctrl+Alt+Del</button>
                     <button id="pasteBtn" type="button" class="paste-btn" disabled title="Paste clipboard contents into the active console at the cursor">Paste</button>
+                    <button id="consolePasteBtn" type="button" class="console-paste-btn" disabled title="Paste clipboard into a Linux terminal (sends Ctrl+Shift+V)">Console Paste</button>
                     <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
                     <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
                     <button id="wallOfEyesBtn" type="button" class="wall-eyes-btn" disabled title="Open a live wall of every console in a new browser window">Wall of Eyes</button>
