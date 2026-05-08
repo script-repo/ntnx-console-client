@@ -1125,25 +1125,84 @@ function sendCtrlAltDel() {
 // typists fighting over the same console.
 let activePasteToken = 0;
 
-// Map a Unicode code point to the (keysym, dom-code) tuple expected by
-// rfb.sendKey. Most characters fall through to keysymdef.lookup, which
-// covers the entire X11 keysym space; we just special-case the keys that
-// don't survive that round-trip cleanly (Tab, Enter, Backspace).
+// US-QWERTY map of the keys that share a physical key with another
+// character via Shift. Both halves are listed because we also need to
+// know the underlying physical-key DOM code (e.g. Digit7 for both '7'
+// and '&'), which the QEMU extended-key-event path turns into a scancode.
+//
+// Without this, QEMU's VNC server translates a bare '&' keysym to
+// "scancode for 7, no Shift held" and the guest faithfully types '7'
+// instead of '&'. Same story for !@#$%^*()_+{}|:"<>? and friends. The
+// fix is to physically hold ShiftLeft around any shifted character.
+const US_KEY_MAP = (() => {
+  const map = new Map();
+  const add = (ch, code, shifted) => map.set(ch, { code, shifted });
+  // Letters
+  for (let i = 0; i < 26; i++) {
+    const lower = String.fromCharCode(0x61 + i);
+    const upper = String.fromCharCode(0x41 + i);
+    const code = `Key${upper}`;
+    add(lower, code, false);
+    add(upper, code, true);
+  }
+  // Top number row
+  const digits = "0123456789";
+  const digitShifted = ")!@#$%^&*(";
+  for (let i = 0; i < 10; i++) {
+    const code = `Digit${digits[i]}`;
+    add(digits[i], code, false);
+    add(digitShifted[i], code, true);
+  }
+  // Symbol keys (unshifted, shifted)
+  const symbols = [
+    ["`", "~", "Backquote"],
+    ["-", "_", "Minus"],
+    ["=", "+", "Equal"],
+    ["[", "{", "BracketLeft"],
+    ["]", "}", "BracketRight"],
+    ["\\", "|", "Backslash"],
+    [";", ":", "Semicolon"],
+    ["'", "\"", "Quote"],
+    [",", "<", "Comma"],
+    [".", ">", "Period"],
+    ["/", "?", "Slash"]
+  ];
+  for (const [u, s, code] of symbols) {
+    add(u, code, false);
+    add(s, code, true);
+  }
+  add(" ", "Space", false);
+  return map;
+})();
+
+// X11 keysyms we need beyond the printable Latin-1 range that
+// keysymdef.lookup already returns directly.
+const XK_BACKSPACE = 0xff08;
+const XK_TAB       = 0xff09;
+const XK_RETURN    = 0xff0d;
+const XK_SHIFT_L   = 0xffe1;
+
+// Resolve a Unicode code point into the (keysym, code, shifted) tuple
+// the VNC server needs. Returns null for code points that can't be
+// expressed as a single keystroke (which we then drop from the paste).
 function keystrokeForCodePoint(cp) {
-  if (cp === 0x09) return { keysym: 0xff09, code: "Tab" };
-  if (cp === 0x0a || cp === 0x0d) return { keysym: 0xff0d, code: "Enter" };
-  if (cp === 0x08) return { keysym: 0xff08, code: "Backspace" };
+  if (cp === 0x09) return { keysym: XK_TAB, code: "Tab", shifted: false };
+  if (cp === 0x0a || cp === 0x0d) return { keysym: XK_RETURN, code: "Enter", shifted: false };
+  if (cp === 0x08) return { keysym: XK_BACKSPACE, code: "Backspace", shifted: false };
+
+  const ch = String.fromCodePoint(cp);
+  const mapped = US_KEY_MAP.get(ch);
   const keysym = keysymdef.lookup(cp);
   if (!keysym) return null;
-  // The 'code' hint is only consulted when the VNC server speaks the
-  // QEMU extended key event extension; for plain RFB, the keysym alone
-  // is what gets shipped, so a generic stand-in is fine for printables.
-  let code = "";
-  if (cp >= 0x30 && cp <= 0x39) code = `Digit${String.fromCodePoint(cp)}`;
-  else if (cp >= 0x41 && cp <= 0x5a) code = `Key${String.fromCodePoint(cp)}`;
-  else if (cp >= 0x61 && cp <= 0x7a) code = `Key${String.fromCodePoint(cp - 0x20)}`;
-  else if (cp === 0x20) code = "Space";
-  return { keysym, code };
+
+  if (mapped) {
+    return { keysym, code: mapped.code, shifted: mapped.shifted };
+  }
+  // Anything else (accented characters, unicode punctuation, emoji, ...)
+  // gets sent without a physical-key hint. The QEMU ext-key path will
+  // skip these (no scancode), and the plain-RFB path delivers the
+  // keysym as-is — which most guests with the right keymap will accept.
+  return { keysym, code: "", shifted: false };
 }
 
 // Type `text` into the active session by sending a synthetic key down/up
@@ -1169,21 +1228,44 @@ async function typeTextIntoSession(session, text, opts = {}) {
   let typed = 0;
   let dropped = 0;
 
-  for (const ch of codePoints) {
-    if (myToken !== activePasteToken) return;
-    if (session !== consoleSessions.find((s) => s.id === activeSessionId)) {
-      setStatus(`Paste cancelled (active console changed).`);
-      return;
-    }
-    const cp = ch.codePointAt(0);
-    const stroke = keystrokeForCodePoint(cp);
-    if (!stroke) { dropped++; continue; }
-    rfb.sendKey(stroke.keysym, stroke.code, true);
-    rfb.sendKey(stroke.keysym, stroke.code, false);
-    typed++;
+  // Track the current shift state so a run of shifted characters
+  // (e.g. "ABCDEF" or "!@#$%") only toggles ShiftLeft once at the
+  // boundaries, instead of pressing/releasing it for every character.
+  let shiftHeld = false;
+  const setShift = (down) => {
+    if (down === shiftHeld) return;
+    rfb.sendKey(XK_SHIFT_L, "ShiftLeft", down);
+    shiftHeld = down;
+  };
 
-    const delay = (cp === 0x0a && perLineDelayMs) ? perLineDelayMs : perCharDelayMs;
-    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+  const cleanup = () => {
+    if (shiftHeld) {
+      try { setShift(false); } catch (_e) { /* connection may be gone */ }
+    }
+  };
+
+  try {
+    for (const ch of codePoints) {
+      if (myToken !== activePasteToken) { cleanup(); return; }
+      if (session !== consoleSessions.find((s) => s.id === activeSessionId)) {
+        cleanup();
+        setStatus(`Paste cancelled (active console changed).`);
+        return;
+      }
+      const cp = ch.codePointAt(0);
+      const stroke = keystrokeForCodePoint(cp);
+      if (!stroke) { dropped++; continue; }
+
+      setShift(stroke.shifted);
+      rfb.sendKey(stroke.keysym, stroke.code, true);
+      rfb.sendKey(stroke.keysym, stroke.code, false);
+      typed++;
+
+      const delay = (cp === 0x0a && perLineDelayMs) ? perLineDelayMs : perCharDelayMs;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    }
+  } finally {
+    cleanup();
   }
 
   const droppedSuffix = dropped ? ` (${dropped} unsupported char${dropped === 1 ? "" : "s"} skipped)` : "";
