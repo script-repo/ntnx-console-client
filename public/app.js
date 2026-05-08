@@ -1,4 +1,5 @@
 import RFB from "/vendor/novnc/core/rfb.js";
+import keysymdef from "/vendor/novnc/core/input/keysymdef.js";
 
 // =====================================================================
 // DOM references
@@ -1119,42 +1120,111 @@ function sendCtrlAltDel() {
   setStatus(`Sent Ctrl+Alt+Del to ${session.vmName}.`);
 }
 
+// Sentinel used so each in-flight paste cancels the previous one (clicking
+// Paste twice in a row, switching tabs mid-paste, etc) instead of two
+// typists fighting over the same console.
+let activePasteToken = 0;
+
+// Map a Unicode code point to the (keysym, dom-code) tuple expected by
+// rfb.sendKey. Most characters fall through to keysymdef.lookup, which
+// covers the entire X11 keysym space; we just special-case the keys that
+// don't survive that round-trip cleanly (Tab, Enter, Backspace).
+function keystrokeForCodePoint(cp) {
+  if (cp === 0x09) return { keysym: 0xff09, code: "Tab" };
+  if (cp === 0x0a || cp === 0x0d) return { keysym: 0xff0d, code: "Enter" };
+  if (cp === 0x08) return { keysym: 0xff08, code: "Backspace" };
+  const keysym = keysymdef.lookup(cp);
+  if (!keysym) return null;
+  // The 'code' hint is only consulted when the VNC server speaks the
+  // QEMU extended key event extension; for plain RFB, the keysym alone
+  // is what gets shipped, so a generic stand-in is fine for printables.
+  let code = "";
+  if (cp >= 0x30 && cp <= 0x39) code = `Digit${String.fromCodePoint(cp)}`;
+  else if (cp >= 0x41 && cp <= 0x5a) code = `Key${String.fromCodePoint(cp)}`;
+  else if (cp >= 0x61 && cp <= 0x7a) code = `Key${String.fromCodePoint(cp - 0x20)}`;
+  else if (cp === 0x20) code = "Space";
+  return { keysym, code };
+}
+
+// Type `text` into the active session by sending a synthetic key down/up
+// for each code point. This bypasses the OS clipboard entirely, which is
+// what we want — AHV guests have no clipboard-sync agent, so simply
+// stuffing the VNC clipboard and pressing Ctrl+V (the previous behaviour)
+// pasted whatever the guest had on its OS clipboard, not the host's.
+async function typeTextIntoSession(session, text, opts = {}) {
+  const { perCharDelayMs = 0, perLineDelayMs = 0 } = opts;
+  const rfb = session?.rfb;
+  if (!rfb) return;
+
+  const myToken = ++activePasteToken;
+  const normalized = text.replace(/\r\n?/g, "\n");
+
+  // Best-effort: also seed the VNC server's clipboard so guests that
+  // *do* have clipboard integration (rare on AHV, but not unheard of)
+  // can use the host clipboard as well.
+  try { rfb.clipboardPasteFrom(normalized); } catch (_e) { /* not fatal */ }
+
+  // Iterate by code point so emoji and surrogate pairs are handled.
+  const codePoints = Array.from(normalized);
+  let typed = 0;
+  let dropped = 0;
+
+  for (const ch of codePoints) {
+    if (myToken !== activePasteToken) return;
+    if (session !== consoleSessions.find((s) => s.id === activeSessionId)) {
+      setStatus(`Paste cancelled (active console changed).`);
+      return;
+    }
+    const cp = ch.codePointAt(0);
+    const stroke = keystrokeForCodePoint(cp);
+    if (!stroke) { dropped++; continue; }
+    rfb.sendKey(stroke.keysym, stroke.code, true);
+    rfb.sendKey(stroke.keysym, stroke.code, false);
+    typed++;
+
+    const delay = (cp === 0x0a && perLineDelayMs) ? perLineDelayMs : perCharDelayMs;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+  }
+
+  const droppedSuffix = dropped ? ` (${dropped} unsupported char${dropped === 1 ? "" : "s"} skipped)` : "";
+  setStatus(`Typed ${typed} character${typed === 1 ? "" : "s"} into ${session.vmName}.${droppedSuffix}`);
+}
+
+async function readClipboardOrWarn() {
+  if (!navigator.clipboard?.readText) {
+    setStatus("Clipboard API unavailable — page must be served over HTTPS or localhost.");
+    return null;
+  }
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text) { setStatus("Clipboard is empty."); return null; }
+    return text;
+  } catch (_err) {
+    setStatus("Clipboard read failed — check browser permissions (allow clipboard access).");
+    return null;
+  }
+}
+
 async function pasteClipboardToConsole() {
   const session = consoleSessions.find((s) => s.id === activeSessionId);
   if (!session?.rfb) return;
-  try {
-    const text = await navigator.clipboard.readText();
-    if (!text) { setStatus("Clipboard is empty."); return; }
-    const rfb = session.rfb;
-    rfb.clipboardPasteFrom(text);
-    rfb.sendKey(0xffe3, "ControlLeft", true);
-    rfb.sendKey(0x76, "KeyV", true);
-    rfb.sendKey(0x76, "KeyV", false);
-    rfb.sendKey(0xffe3, "ControlLeft", false);
-    setStatus(`Pasted clipboard to ${session.vmName}.`);
-  } catch (_err) {
-    setStatus("Clipboard read failed — check browser permissions.");
-  }
+  const text = await readClipboardOrWarn();
+  if (text == null) return;
+  setStatus(`Typing clipboard into ${session.vmName}...`, { spinner: true });
+  await typeTextIntoSession(session, text);
 }
 
 async function consolePasteClipboard() {
   const session = consoleSessions.find((s) => s.id === activeSessionId);
   if (!session?.rfb) return;
-  try {
-    const text = await navigator.clipboard.readText();
-    if (!text) { setStatus("Clipboard is empty."); return; }
-    const rfb = session.rfb;
-    rfb.clipboardPasteFrom(text);
-    rfb.sendKey(0xffe3, "ControlLeft", true);
-    rfb.sendKey(0xffe1, "ShiftLeft", true);
-    rfb.sendKey(0x76, "KeyV", true);
-    rfb.sendKey(0x76, "KeyV", false);
-    rfb.sendKey(0xffe1, "ShiftLeft", false);
-    rfb.sendKey(0xffe3, "ControlLeft", false);
-    setStatus(`Pasted clipboard to ${session.vmName}.`);
-  } catch (_err) {
-    setStatus("Clipboard read failed — check browser permissions.");
-  }
+  const text = await readClipboardOrWarn();
+  if (text == null) return;
+  setStatus(`Typing clipboard into ${session.vmName} (terminal-safe)...`, { spinner: true });
+  // Linux PTYs (and especially some bash readline configs) drop bytes
+  // when input arrives faster than the line discipline can buffer it,
+  // so pace the keystrokes a touch and give the shell extra time to
+  // finish executing each line before the next one starts.
+  await typeTextIntoSession(session, text, { perCharDelayMs: 4, perLineDelayMs: 30 });
 }
 
 function closeAllSessions() {

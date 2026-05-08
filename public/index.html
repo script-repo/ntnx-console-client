@@ -497,10 +497,14 @@
       @keyframes spin {
         to { transform: rotate(360deg); }
       }
-      .tabs-row {
+      .console-row {
         display: flex;
-        align-items: flex-end;
-        gap: 8px;
+        align-items: stretch;
+        gap: 12px;
+      }
+      .console-row .console-stage {
+        flex: 1;
+        min-width: 0;
       }
       .tabs {
         display: flex;
@@ -512,7 +516,6 @@
         z-index: 1;
         flex-wrap: wrap;
         row-gap: 2px;
-        flex: 1;
         min-width: 0;
       }
       .tab {
@@ -595,12 +598,16 @@
       .tabs-actions {
         display: flex;
         flex-direction: column;
-        gap: 6px;
+        gap: 8px;
         align-items: stretch;
         flex-shrink: 0;
+        width: 140px;
+        padding: 8px;
+        background: var(--ntx-surface-2);
+        border: 1px solid var(--ntx-border);
+        border-radius: var(--ntx-radius);
+        box-shadow: var(--ntx-shadow-sm);
         align-self: stretch;
-        justify-content: center;
-        min-width: 110px;
       }
       .show-all-btn,
       .close-all-btn,
@@ -608,8 +615,8 @@
       .ctrl-alt-del-btn,
       .paste-btn,
       .console-paste-btn {
-        height: 30px;
-        padding: 0 14px;
+        height: 32px;
+        padding: 0 12px;
         color: #fff;
         font-weight: 600;
         font-size: 12px;
@@ -618,6 +625,7 @@
         flex-shrink: 0;
         transition: background 120ms ease, border-color 120ms ease;
         white-space: nowrap;
+        width: 100%;
       }
       .show-all-btn {
         background: var(--ntx-success);
@@ -1241,30 +1249,30 @@
             <section class="panel">
               <div class="panel-body">
                 <div id="status">Idle</div>
-                <div class="tabs-row">
-                  <div id="consoleTabs" class="tabs"></div>
+                <div id="consoleTabs" class="tabs"></div>
+                <div class="console-row">
+                  <div id="screenStage" class="console-stage">
+                    <div id="consoleEmpty" class="console-empty">
+                      <div class="console-empty-inner">
+                        <img
+                          src="/assets/nutanix-logo.png"
+                          alt="Nutanix"
+                          class="console-empty-logo"
+                          draggable="false"
+                        />
+                        <div class="console-empty-text">
+                          Click a VM in the sidebar to open its console.
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                   <div class="tabs-actions">
                     <button id="ctrlAltDelBtn" type="button" class="ctrl-alt-del-btn" disabled title="Send Ctrl+Alt+Del to the active console (unlock Windows)">Ctrl+Alt+Del</button>
-                    <button id="pasteBtn" type="button" class="paste-btn" disabled title="Paste clipboard contents into the active console at the cursor">Paste</button>
-                    <button id="consolePasteBtn" type="button" class="console-paste-btn" disabled title="Paste clipboard into a Linux terminal (sends Ctrl+Shift+V)">Console Paste</button>
+                    <button id="pasteBtn" type="button" class="paste-btn" disabled title="Type clipboard contents into the active console at the cursor (works in any guest OS, no clipboard agent required)">Paste</button>
+                    <button id="consolePasteBtn" type="button" class="console-paste-btn" disabled title="Type clipboard into a Linux terminal with a small per-character delay so line discipline doesn't drop characters">Console Paste</button>
                     <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
                     <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
                     <button id="wallOfEyesBtn" type="button" class="wall-eyes-btn" disabled title="Open a live wall of every console in a new browser window">Wall of Eyes</button>
-                  </div>
-                </div>
-                <div id="screenStage" class="console-stage">
-                  <div id="consoleEmpty" class="console-empty">
-                    <div class="console-empty-inner">
-                      <img
-                        src="/assets/nutanix-logo.png"
-                        alt="Nutanix"
-                        class="console-empty-logo"
-                        draggable="false"
-                      />
-                      <div class="console-empty-text">
-                        Click a VM in the sidebar to open its console.
-                      </div>
-                    </div>
                   </div>
                 </div>
                 <p class="muted">Click a VM to open its console. Multiple sessions stay open in tabs — use <strong>Show All</strong> to see them at once.</p>

@@ -13,10 +13,10 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 - **Favorites that survive the wait.** Previously starred VMs are pre-populated in the favorites pane the moment you log in (from a local snapshot), so you can open them before the full VM list has finished loading.
 - **Drag-and-drop favorites with folders.** Organize favorites into named folders and sub-folders. Drag VMs between folders, drag folders into other folders, double-click a folder name to rename. Persisted in `localStorage`.
 - **Single tab, many consoles.** Browser-style overlapping tabs keep multiple consoles open. Click a tab to switch; click the **×** to close.
-- **Show All overview.** A green **Show All** button to the right of the console tabs takes a live screenshot of every open console and lays them out in a grid. Click any tile to switch to that console; click outside the grid (or press <kbd>Esc</kbd>) to dismiss.
+- **Show All overview.** A green **Show All** button on the console action bar takes a live screenshot of every open console and lays them out in a grid. Click any tile to switch to that console; click outside the grid (or press <kbd>Esc</kbd>) to dismiss.
 - **Wall of Eyes.** A light-blue **Wall of Eyes** button opens a separate browser window that mirrors every open console at ~20 fps in a tightly packed grid (no gaps; any unused space is charcoal black). Click **Full Screen** to slam the wall onto a second monitor or a video wall — perfect for an at-a-glance NOC view of every VM you're babysitting.
-- **One-click console actions.** Each console tab includes **Ctrl+Alt+Del** and **Paste** buttons, so common actions are always easy to reach.
-- **More reliable paste on Linux.** The **Paste** button syncs your clipboard and then sends <kbd>Ctrl</kbd>+<kbd>V</kbd>, which helps paste work better in Linux consoles and terminal windows.
+- **One-click console actions.** A vertical action bar to the right of the console keeps **Ctrl+Alt+Del**, **Paste**, **Console Paste**, **Close All**, **Show All**, and **Wall of Eyes** within thumb-reach without crowding the tabs.
+- **Clipboard paste that actually works on AHV.** AHV guests don't ship a clipboard-sync agent, so a generic <kbd>Ctrl</kbd>+<kbd>V</kbd> on the VNC channel pastes whatever the *guest* had on its clipboard — not the host's. NRCC's **Paste** button instead types your clipboard into the focused window one keystroke at a time, which works on any guest OS, login screen, or text input. **Console Paste** does the same with a small per-character delay so a Linux PTY's line discipline doesn't drop bytes on bursty input.
 - **VM filtering.** Search by name / UUID / IP and filter by power state.
 - **CVM support.** Discovers Controller VMs through the v4 `clustermgmt` API on Prism Central, then redirects the console request to the cluster's Prism Element using the legacy VNC proxy when v4 console-token is unavailable.
 - **Per-PE credentials, server-side only.** Prism Central credentials don't authenticate to Prism Element by default. NRCC prompts once per PE, validates with a real probe, and caches the credentials **in the NRCC server process's memory only** — keyed to an `HttpOnly` session cookie. They are never written to browser `localStorage`, never persisted to disk, and disappear when the NRCC server restarts (or after 8 hours of inactivity).
@@ -50,8 +50,8 @@ A Node.js Express app that:
 
 Vanilla JS + noVNC, no build step:
 
-- `index.html` — Prism-Central-styled markup, including the sign-in overlay, favorites tree, console tabs, per-console toolbar actions (**Ctrl+Alt+Del** and **Paste**), the **Show All** grid overlay, the **Wall of Eyes** button, and the PE credentials modal.
-- `app.js` — login / logout flow, background VM loading, filters, favorites tree with drag-and-drop folders, console tab management, per-console actions (Ctrl+Alt+Del and paste), PE credential modal, the screenshot-grid overview, and the popup mirror launcher for the Wall of Eyes window.
+- `index.html` — Prism-Central-styled markup, including the sign-in overlay, favorites tree, console tabs, the right-hand action bar (**Ctrl+Alt+Del**, **Paste**, **Console Paste**, **Close All**, **Show All**, **Wall of Eyes**), the **Show All** grid overlay, and the PE credentials modal.
+- `app.js` — login / logout flow, background VM loading, filters, favorites tree with drag-and-drop folders, console tab management, per-console actions (Ctrl+Alt+Del plus a clipboard-typing paste implementation that bypasses the missing AHV clipboard agent), PE credential modal, the screenshot-grid overview, and the popup mirror launcher for the Wall of Eyes window.
 - `wall.html` — the standalone page loaded into the Wall of Eyes popup window. It runs same-origin to the main page, reaches back through `window.opener.consoleSessions`, and `drawImage`s every open noVNC `<canvas>` into a single full-window canvas at ~20 fps. An auto-fading toolbar exposes **Full Screen** (Fullscreen API) and **Close**.
 - noVNC is served at the URL prefix `/vendor/novnc/`, mapped by `server.js` to `node_modules/@novnc/novnc/` (delivered via the npm package `@novnc/novnc`).
 
@@ -151,8 +151,10 @@ Then open <http://localhost:3000>.
 
 ### Keyboard shortcuts and console actions
 
-- NRCC includes **Ctrl+Alt+Del** and **Paste** buttons in each console toolbar, so you can use these actions right away.
-- For Linux and terminal-heavy guests, the **Paste** button runs a two-step sequence: clipboard sync, then <kbd>Ctrl</kbd>+<kbd>V</kbd>.
+- The right-hand action bar exposes **Ctrl+Alt+Del**, **Paste**, and **Console Paste** for the active tab.
+- **Paste** types your clipboard into the focused guest window one keystroke at a time — no clipboard-sync agent required, so it works on freshly imaged Windows installers, Linux login prompts, and everything in between.
+- **Console Paste** does the same with a small per-character delay (and a slightly larger pause after each newline) so a Linux PTY's line discipline doesn't drop bytes on bursty input.
+- Both Paste buttons also seed the VNC clipboard via `clipboardPasteFrom`, so guests that *do* have a clipboard agent can use the host clipboard normally.
 - <kbd>Esc</kbd> closes the **Show All** grid overlay.
 - In the **Wall of Eyes** popup window, <kbd>Esc</kbd> exits browser fullscreen (the standard Fullscreen API behaviour); the toolbar (with **Full Screen** and **Close**) auto-fades after ~2.5 s of mouse-idle while in fullscreen and reappears on any movement.
 
