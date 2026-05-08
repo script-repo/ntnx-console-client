@@ -108,8 +108,30 @@ app.delete("/api/pe-creds/:peHost", (req, res) => {
   res.json({ removed });
 });
 
+
+function normalizePrismHost(value) {
+  const host = String(value || "").trim();
+  if (!host) return "";
+  // Accept plain hostnames, FQDNs, and IPv4/IPv6 literals (optionally
+  // wrapped as [ipv6]). Reject schemes, paths, credentials, and ports.
+  if (host.includes("://") || host.includes("/") || host.includes("@")) {
+    throw new Error("Invalid Prism host format.");
+  }
+  const bracketedIpv6 = /^\[[0-9a-fA-F:.]+\]$/;
+  const bareIpv6 = /^[0-9a-fA-F:.]+$/;
+  const hostnameOrIpv4 = /^[A-Za-z0-9.-]+$/;
+  if (
+    !hostnameOrIpv4.test(host) &&
+    !bracketedIpv6.test(host) &&
+    !bareIpv6.test(host)
+  ) {
+    throw new Error("Invalid Prism host format.");
+  }
+  return host;
+}
+
 function resolveAuth(body) {
-  const pcHost = (body.pcHost || process.env.NUTANIX_PC_HOST || "").trim();
+  const pcHost = normalizePrismHost(body.pcHost || process.env.NUTANIX_PC_HOST || "");
   const username = (body.username || process.env.NUTANIX_USERNAME || "").trim();
   const password = body.password || process.env.NUTANIX_PASSWORD || "";
   const tlsSkipVerify =
@@ -1460,6 +1482,9 @@ app.post("/api/vms", async (req, res) => {
       listVariant: selectedVariant || "default"
     });
   } catch (error) {
+    if (error?.message === "Invalid Prism host format.") {
+      return res.status(400).json({ error: error.message });
+    }
     const { status, details } = formatAxiosError(error);
     console.error("VM list failed:", details);
     return res.status(status).json({
@@ -1540,13 +1565,21 @@ app.post("/api/pc-test", async (req, res) => {
       });
     }
   } catch (error) {
+    if (error?.message === "Invalid Prism host format.") {
+      return res.status(400).json({ error: error.message });
+    }
     const { status, details } = formatAxiosError(error);
     res.status(status).json({ ok: false, error: "PC test failed.", details });
   }
 });
 
 app.post("/api/pe-test", async (req, res) => {
-  const peHost = (req.body.peHost || "").trim();
+  let peHost = "";
+  try {
+    peHost = normalizePrismHost(req.body.peHost || "");
+  } catch (error) {
+    return res.status(400).json({ ok: false, error: error.message });
+  }
   const peUsername = (req.body.peUsername || "").trim();
   const pePassword = req.body.pePassword || "";
   const tlsSkipVerify = Boolean(req.body.tlsSkipVerify);
@@ -1653,7 +1686,7 @@ app.post("/api/console-token", async (req, res) => {
   try {
     const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
     let vmUuid = req.body.vmUuid;
-    const peHost = (req.body.peHost || "").trim();
+    const peHost = normalizePrismHost(req.body.peHost || "");
     const cvmIp = (req.body.cvmIp || "").trim();
     const cvmName = (req.body.cvmName || "").trim();
 
@@ -1863,6 +1896,9 @@ app.post("/api/console-token", async (req, res) => {
         : "Browser must already have a valid Prism session cookie for this host."
     });
   } catch (error) {
+    if (error?.message === "Invalid Prism host format.") {
+      return res.status(400).json({ error: error.message });
+    }
     const { status, details } = formatAxiosError(error);
     console.error("Console token failed:", details);
     res.status(status).json({
@@ -2029,7 +2065,7 @@ app.post("/api/vm-power", async (req, res) => {
     const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
     const vmUuid = (req.body.vmUuid || "").trim();
     const action = String(req.body.action || "").toLowerCase();
-    const peHost = (req.body.peHost || "").trim();
+    const peHost = normalizePrismHost(req.body.peHost || "");
 
     if (!pcHost || !username || !password) {
       return res.status(400).json({
@@ -2111,6 +2147,9 @@ app.post("/api/vm-power", async (req, res) => {
       task: { uuid: taskUuid }
     });
   } catch (error) {
+    if (error?.message === "Invalid Prism host format.") {
+      return res.status(400).json({ error: error.message });
+    }
     const { status, details } = formatAxiosError(error);
     console.error("VM power action failed:", details);
     res.status(status).json({
