@@ -34,6 +34,8 @@ const consoleEmptyEl = document.getElementById("consoleEmpty");
 const showAllBtn = document.getElementById("showAllBtn");
 const closeAllBtn = document.getElementById("closeAllBtn");
 const wallOfEyesBtn = document.getElementById("wallOfEyesBtn");
+const ctrlAltDelBtn = document.getElementById("ctrlAltDelBtn");
+const pasteBtn = document.getElementById("pasteBtn");
 const consoleGridOverlay = document.getElementById("consoleGridOverlay");
 const consoleGridEl = document.getElementById("consoleGrid");
 const ctxMenu = document.getElementById("ctxMenu");
@@ -1098,6 +1100,31 @@ function updateConsoleControls() {
   // just shows an empty-state and starts mirroring as soon as you open
   // some -- but it's also pointless from a cold start, so disable it.
   wallOfEyesBtn.disabled = !has;
+  ctrlAltDelBtn.disabled = !has;
+  pasteBtn.disabled = !has;
+}
+
+function sendCtrlAltDel() {
+  const session = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!session?.rfb) return;
+  const rfb = session.rfb;
+  rfb.sendKey(0xffe3, "ControlLeft", true);
+  rfb.sendKey(0xffe9, "AltLeft", true);
+  rfb.sendKey(0xffff, "Delete", true);
+  rfb.sendKey(0xffff, "Delete", false);
+  rfb.sendKey(0xffe9, "AltLeft", false);
+  rfb.sendKey(0xffe3, "ControlLeft", false);
+}
+
+async function pasteClipboardToConsole() {
+  const session = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!session?.rfb) return;
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) session.rfb.clipboardPasteFrom(text);
+  } catch (_err) {
+    setStatus("Clipboard read failed — check browser permissions.");
+  }
 }
 
 function closeAllSessions() {
@@ -1678,6 +1705,8 @@ powerStateFilter.addEventListener("change", renderVmList);
 
 showAllBtn.addEventListener("click", openShowAll);
 wallOfEyesBtn.addEventListener("click", openWallOfEyes);
+ctrlAltDelBtn.addEventListener("click", sendCtrlAltDel);
+pasteBtn.addEventListener("click", pasteClipboardToConsole);
 closeAllBtn.addEventListener("click", () => {
   if (!consoleSessions.length) return;
   const ok = confirm(
