@@ -10,3 +10,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.log
+
+# Multi-user deployment artifacts
+certs/
+screenshots/

@@ -1,4 +1,6 @@
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
@@ -12,6 +14,152 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const wsProxySessions = new Map();
 const vmListVariantCache = new Map();
+
+// =====================================================================
+// Multi-user deployment configuration. The default (false) preserves
+// the original single-user HTTP behaviour byte-for-byte; setting
+// NRCC_MULTI_USER=true enables HTTPS, the chat WebSocket, and the
+// chat UI in the browser.
+// =====================================================================
+const MULTI_USER_MODE = String(process.env.NRCC_MULTI_USER || "").toLowerCase() === "true";
+const TLS_CERT_DIR = path.resolve(process.env.NRCC_TLS_CERT_DIR || "./certs");
+const TLS_CERT_PATH_ENV = process.env.NRCC_TLS_CERT || "";
+const TLS_KEY_PATH_ENV = process.env.NRCC_TLS_KEY || "";
+const CHAT_BUFFER_SIZE = Math.max(10, Number(process.env.NRCC_CHAT_BUFFER || 200));
+const SCREENSHOTS_DIR = path.resolve(process.env.NRCC_SCREENSHOTS_DIR || "./screenshots");
+const SCREENSHOT_MAX_PER_VM = Math.max(1, Number(process.env.NRCC_SCREENSHOT_MAX_PER_VM || 100));
+
+// Strict UUID match used everywhere we accept a VM UUID from the client.
+// Lowercase and hyphenated, no curly braces, no upper-case (the server
+// side normalises to lowercase before any filesystem use).
+const VM_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Ensure the screenshots directory exists at boot. Doing this once here
+// means individual writes only have to mkdir the per-VM subfolder.
+try { fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true }); }
+catch (err) { console.warn(`[screenshots] could not create ${SCREENSHOTS_DIR}: ${err.message}`); }
+
+// Pull every IPv4 address on the box for the self-signed cert's SAN
+// list, so a browser pointed at the LAN IP doesn't trip a CN mismatch
+// warning on top of the "self-signed" warning it already shows.
+function localIPv4Addresses() {
+  const out = new Set(["127.0.0.1"]);
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const list of Object.values(ifaces)) {
+      for (const ni of (list || [])) {
+        if (ni && ni.family === "IPv4" && !ni.internal && ni.address) out.add(ni.address);
+      }
+    }
+  } catch (_e) { /* best effort */ }
+  return Array.from(out);
+}
+
+// Load TLS material in this priority order:
+//   1) explicit NRCC_TLS_CERT + NRCC_TLS_KEY paths;
+//   2) cert.pem / key.pem inside NRCC_TLS_CERT_DIR (default ./certs);
+//   3) generate a fresh self-signed cert into NRCC_TLS_CERT_DIR.
+// In all cases we log the SHA-256 fingerprint so an operator can pin
+// or verify it from the browser's "view certificate" pane.
+function loadOrCreateTlsMaterial() {
+  let certPath = TLS_CERT_PATH_ENV;
+  let keyPath = TLS_KEY_PATH_ENV;
+  let source = "env";
+
+  if (!certPath || !keyPath) {
+    certPath = path.join(TLS_CERT_DIR, "cert.pem");
+    keyPath = path.join(TLS_CERT_DIR, "key.pem");
+    source = "cert dir";
+  }
+
+  if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+    console.log(
+      `[tls] no certificate found at ${certPath} - generating a self-signed cert. ` +
+      `Browsers will show a security warning until you trust this cert or supply your own.`
+    );
+    const selfsigned = require("selfsigned");
+    const hostname = os.hostname();
+    const altNames = [
+      { type: 2, value: "localhost" },
+      ...(hostname && hostname !== "localhost" ? [{ type: 2, value: hostname }] : []),
+      ...localIPv4Addresses().map((ip) => ({ type: 7, ip }))
+    ];
+    const attrs = [{ name: "commonName", value: hostname || "nrcc.local" }];
+    const generated = selfsigned.generate(attrs, {
+      keySize: 2048,
+      days: 825,
+      algorithm: "sha256",
+      extensions: [
+        { name: "basicConstraints", cA: false },
+        { name: "keyUsage", digitalSignature: true, keyEncipherment: true },
+        { name: "extKeyUsage", serverAuth: true },
+        { name: "subjectAltName", altNames }
+      ]
+    });
+    fs.mkdirSync(path.dirname(certPath), { recursive: true });
+    fs.writeFileSync(certPath, generated.cert, { mode: 0o644 });
+    // Best-effort 0o600 on the key. Windows ignores POSIX modes silently.
+    fs.writeFileSync(keyPath, generated.private, { mode: 0o600 });
+    source = "auto-generated";
+  }
+
+  const cert = fs.readFileSync(certPath);
+  const key = fs.readFileSync(keyPath);
+  const fingerprint = crypto.createHash("sha256").update(cert).digest("hex").match(/.{2}/g).join(":").toUpperCase();
+  console.log(`[tls] using cert ${certPath} (${source})`);
+  console.log(`[tls] sha256 fingerprint: ${fingerprint}`);
+  return { cert, key };
+}
+
+// =====================================================================
+// In-memory per-VM chat store. Messages are kept in a ring buffer per
+// VM UUID; presence is a Set of live WebSocket connections keyed by
+// the same UUID. Everything is lost on process restart -- this is by
+// design (NRCC is an admin tool, not a chat service). Persistence
+// would need a SQLite or JSONL backend; out of scope for this drop.
+// =====================================================================
+class ChatStore {
+  constructor(maxPerVm) {
+    this.bufferLimit = maxPerVm;
+    this.messages = new Map();   // vmUuid -> Array<{id, vmUuid, username, text, tsMs}>
+    this.presence = new Map();   // vmUuid -> Set<ws>
+  }
+  append(vmUuid, message) {
+    let buf = this.messages.get(vmUuid);
+    if (!buf) { buf = []; this.messages.set(vmUuid, buf); }
+    buf.push(message);
+    if (buf.length > this.bufferLimit) buf.splice(0, buf.length - this.bufferLimit);
+  }
+  history(vmUuid) {
+    return (this.messages.get(vmUuid) || []).slice();
+  }
+  join(vmUuid, ws) {
+    let set = this.presence.get(vmUuid);
+    if (!set) { set = new Set(); this.presence.set(vmUuid, set); }
+    set.add(ws);
+  }
+  leave(vmUuid, ws) {
+    const set = this.presence.get(vmUuid);
+    if (!set) return;
+    set.delete(ws);
+    if (set.size === 0) this.presence.delete(vmUuid);
+  }
+  socketsIn(vmUuid) {
+    return Array.from(this.presence.get(vmUuid) || []);
+  }
+  // Presence reported to clients is the set of distinct usernames
+  // viewing the channel (a single user with two browser tabs counts
+  // once), sorted for stable display.
+  usersIn(vmUuid) {
+    const seen = new Set();
+    for (const ws of this.socketsIn(vmUuid)) {
+      if (ws.nrccUsername) seen.add(ws.nrccUsername);
+    }
+    return Array.from(seen).sort((a, b) => a.localeCompare(b));
+  }
+}
+
+const chatStore = MULTI_USER_MODE ? new ChatStore(CHAT_BUFFER_SIZE) : null;
 
 // Default per-request timeout for Prism HTTP calls. Real Prism Central
 // instances under load routinely take 5-15 seconds to return a v4 vmm
@@ -80,7 +228,9 @@ function ensureSession(req, res, next) {
   next();
 }
 
-app.use(express.json());
+// Bumped from the default 100kb so screenshot uploads (base64 PNGs of
+// 1920x1080+ consoles, ~3-5 MB) fit inside a single JSON POST.
+app.use(express.json({ limit: "12mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use(
   "/vendor/novnc",
@@ -90,6 +240,18 @@ app.use("/api", ensureSession);
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true });
+});
+
+// Surfaced to the front-end on boot so it knows whether to render the
+// chat UI and which retention/buffer limits to advertise. Single-user
+// deployments simply see multiUser=false and skip the chat plumbing.
+app.get("/api/config", (req, res) => {
+  res.json({
+    multiUser: MULTI_USER_MODE,
+    chatBufferSize: CHAT_BUFFER_SIZE,
+    screenshotMaxPerVm: SCREENSHOT_MAX_PER_VM,
+    currentUser: req.nrccSession.currentUser || null
+  });
 });
 
 app.get("/api/pe-creds", (req, res) => {
@@ -106,6 +268,164 @@ app.delete("/api/pe-creds", (req, res) => {
 app.delete("/api/pe-creds/:peHost", (req, res) => {
   const removed = req.nrccSession.peCreds.delete(req.params.peHost);
   res.json({ removed });
+});
+
+// Best-effort cleanup on user logout: wipes the server-side identity
+// stash and any cached PE credentials. Doesn't destroy the cookie
+// itself (the next login is welcome to reuse the SID and rebuild
+// state); just clears the values so the chat WebSocket can't bind to
+// a stale username before a re-login completes.
+app.post("/api/logout", (req, res) => {
+  req.nrccSession.peCreds.clear();
+  req.nrccSession.currentUser = null;
+  req.nrccSession.pcHost = null;
+  res.json({ ok: true });
+});
+
+// =====================================================================
+// Per-VM screenshots. Available in both single- and multi-user modes.
+// Browser captures `canvas.toBlob('image/png')` and POSTs the base64
+// payload here; we write it under <SCREENSHOTS_DIR>/<uuid>/<ts>.png
+// and prune oldest beyond NRCC_SCREENSHOT_MAX_PER_VM. UUID and
+// filename are both validated against strict regexes so a malicious
+// path component can't escape the per-VM directory.
+// =====================================================================
+const SAFE_FILENAME_REGEX = /^[\w.-]+\.png$/;
+
+function safeVmDir(vmUuid) {
+  const lower = String(vmUuid || "").toLowerCase();
+  if (!VM_UUID_REGEX.test(lower)) return null;
+  const dir = path.join(SCREENSHOTS_DIR, lower);
+  // Defence in depth: confirm the resolved path is still under the base dir.
+  if (!dir.startsWith(SCREENSHOTS_DIR + path.sep) && dir !== SCREENSHOTS_DIR) {
+    return null;
+  }
+  return dir;
+}
+
+function listScreenshotEntries(vmDir) {
+  let names;
+  try { names = fs.readdirSync(vmDir); }
+  catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+  const items = [];
+  for (const name of names) {
+    if (!SAFE_FILENAME_REGEX.test(name)) continue;
+    try {
+      const stat = fs.statSync(path.join(vmDir, name));
+      if (!stat.isFile()) continue;
+      items.push({ filename: name, sizeBytes: stat.size, tsMs: stat.mtimeMs });
+    } catch (_e) { /* file vanished mid-list, skip */ }
+  }
+  // Newest first.
+  items.sort((a, b) => b.tsMs - a.tsMs);
+  return items;
+}
+
+app.post("/api/screenshots/:vmUuid", (req, res) => {
+  const vmDir = safeVmDir(req.params.vmUuid);
+  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+
+  let { pngBase64 } = req.body || {};
+  if (typeof pngBase64 !== "string" || !pngBase64) {
+    return res.status(400).json({ error: "Missing pngBase64 body." });
+  }
+  // Strip an optional data URL prefix.
+  const commaIdx = pngBase64.indexOf(",");
+  if (pngBase64.startsWith("data:") && commaIdx > 0) {
+    pngBase64 = pngBase64.slice(commaIdx + 1);
+  }
+  // Hard cap at ~10 MB encoded (~7 MB decoded) so a runaway client
+  // can't fill the disk in one POST.
+  if (pngBase64.length > 10 * 1024 * 1024) {
+    return res.status(413).json({ error: "Screenshot exceeds 10 MB limit." });
+  }
+
+  let buf;
+  try { buf = Buffer.from(pngBase64, "base64"); }
+  catch (_e) { return res.status(400).json({ error: "Invalid base64 payload." }); }
+  // PNG magic: 89 50 4E 47 0D 0A 1A 0A.
+  if (buf.length < 8 || buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47) {
+    return res.status(400).json({ error: "Payload is not a PNG." });
+  }
+
+  try { fs.mkdirSync(vmDir, { recursive: true }); }
+  catch (err) {
+    return res.status(500).json({ error: `Could not create vm folder: ${err.message}` });
+  }
+
+  // ISO 8601 timestamp with colons -> dashes for filesystem portability.
+  const stamp = new Date().toISOString().replace(/:/g, "-");
+  const filename = `${stamp}.png`;
+  const fullPath = path.join(vmDir, filename);
+  try {
+    fs.writeFileSync(fullPath, buf);
+  } catch (err) {
+    return res.status(500).json({ error: `Could not write screenshot: ${err.message}` });
+  }
+
+  // Retention enforcement: keep only the newest SCREENSHOT_MAX_PER_VM.
+  let prunedCount = 0;
+  try {
+    const all = listScreenshotEntries(vmDir);
+    if (all.length > SCREENSHOT_MAX_PER_VM) {
+      const overflow = all.slice(SCREENSHOT_MAX_PER_VM);
+      for (const item of overflow) {
+        try { fs.unlinkSync(path.join(vmDir, item.filename)); prunedCount++; }
+        catch (_e) { /* ignore individual failures */ }
+      }
+    }
+  } catch (_e) { /* best-effort pruning */ }
+
+  res.json({
+    filename,
+    savedPath: path.relative(process.cwd(), fullPath),
+    sizeBytes: buf.length,
+    prunedCount
+  });
+});
+
+app.get("/api/screenshots/:vmUuid", (req, res) => {
+  const vmDir = safeVmDir(req.params.vmUuid);
+  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+  try {
+    res.json({ items: listScreenshotEntries(vmDir) });
+  } catch (err) {
+    res.status(500).json({ error: `Could not list screenshots: ${err.message}` });
+  }
+});
+
+app.get("/api/screenshots/:vmUuid/:filename", (req, res) => {
+  const vmDir = safeVmDir(req.params.vmUuid);
+  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+  const filename = String(req.params.filename || "");
+  if (!SAFE_FILENAME_REGEX.test(filename)) {
+    return res.status(400).json({ error: "Invalid filename." });
+  }
+  const fullPath = path.join(vmDir, filename);
+  if (!fs.existsSync(fullPath)) return res.status(404).json({ error: "Not found." });
+  res.set("Cache-Control", "private, max-age=300");
+  res.type("image/png");
+  res.sendFile(fullPath);
+});
+
+app.delete("/api/screenshots/:vmUuid/:filename", (req, res) => {
+  const vmDir = safeVmDir(req.params.vmUuid);
+  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+  const filename = String(req.params.filename || "");
+  if (!SAFE_FILENAME_REGEX.test(filename)) {
+    return res.status(400).json({ error: "Invalid filename." });
+  }
+  const fullPath = path.join(vmDir, filename);
+  try {
+    fs.unlinkSync(fullPath);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === "ENOENT") return res.status(404).json({ error: "Not found." });
+    res.status(500).json({ error: `Could not delete: ${err.message}` });
+  }
 });
 
 
@@ -1549,6 +1869,12 @@ app.post("/api/pc-test", async (req, res) => {
     );
     try {
       const winner = await Promise.any(inverted);
+      // Stash the authenticated username on the server-side session so
+      // the chat WebSocket has a server-trusted identity to bind to,
+      // independent of anything the browser claims later. The PC creds
+      // themselves still live only in the browser.
+      req.nrccSession.currentUser = username;
+      req.nrccSession.pcHost = pcHost;
       return res.json({ ok: true, status: winner.status });
     } catch (_aggregate) {
       if (sawAuthFailure) {
@@ -2159,18 +2485,35 @@ app.post("/api/vm-power", async (req, res) => {
   }
 });
 
-const server = http.createServer(app);
+const server = MULTI_USER_MODE
+  ? https.createServer(loadOrCreateTlsMaterial(), app)
+  : http.createServer(app);
 const wsServer = new WebSocketServer({ noServer: true });
+// Chat WebSocketServer is only attached when multi-user mode is on; in
+// single-user mode it stays null and any /ws-chat upgrade is rejected.
+const wsChatServer = MULTI_USER_MODE ? new WebSocketServer({ noServer: true }) : null;
 
 server.on("upgrade", (req, socket, head) => {
-  const requestUrl = new URL(req.url, "http://localhost");
-  if (!requestUrl.pathname.startsWith("/ws-proxy/")) {
-    socket.destroy();
+  // The upgrade handler runs before Express middleware, so build a URL
+  // with whatever protocol scheme the request actually used.
+  const scheme = MULTI_USER_MODE ? "https" : "http";
+  const requestUrl = new URL(req.url, `${scheme}://localhost`);
+
+  if (requestUrl.pathname.startsWith("/ws-proxy/")) {
+    wsServer.handleUpgrade(req, socket, head, (ws) => {
+      wsServer.emit("connection", ws, req, requestUrl);
+    });
     return;
   }
-  wsServer.handleUpgrade(req, socket, head, (ws) => {
-    wsServer.emit("connection", ws, req, requestUrl);
-  });
+
+  if (wsChatServer && requestUrl.pathname === "/ws-chat") {
+    wsChatServer.handleUpgrade(req, socket, head, (ws) => {
+      wsChatServer.emit("connection", ws, req, requestUrl);
+    });
+    return;
+  }
+
+  socket.destroy();
 });
 
 wsServer.on("connection", (clientSocket, req, requestUrl) => {
@@ -2239,6 +2582,147 @@ wsServer.on("connection", (clientSocket, req, requestUrl) => {
   clientSocket.on("error", () => closeBoth(1011, "Client error"));
 });
 
+// =====================================================================
+// Chat WebSocket. Only attached when MULTI_USER_MODE is on. The handler
+// uses the existing nrcc_sid HttpOnly cookie to look up the server-side
+// session and pull a server-trusted username from session.currentUser
+// (set by /api/pc-test on a successful login). Anything the client
+// claims about its own identity is ignored.
+// =====================================================================
+function chatBroadcast(vmUuid, payload) {
+  if (!chatStore) return;
+  const json = JSON.stringify(payload);
+  for (const ws of chatStore.socketsIn(vmUuid)) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(json); } catch (_e) { /* ignore */ }
+    }
+  }
+}
+
+function chatSend(ws, payload) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send(JSON.stringify(payload)); } catch (_e) { /* ignore */ }
+}
+
+function chatLeaveCurrent(ws, opts = {}) {
+  if (!chatStore || !ws.nrccVmUuid) return;
+  const vmUuid = ws.nrccVmUuid;
+  chatStore.leave(vmUuid, ws);
+  ws.nrccVmUuid = null;
+  if (!opts.silent) {
+    chatBroadcast(vmUuid, {
+      type: "system",
+      vmUuid,
+      text: `${ws.nrccUsername} left`,
+      tsMs: Date.now()
+    });
+  }
+  chatBroadcast(vmUuid, { type: "presence", vmUuid, users: chatStore.usersIn(vmUuid) });
+}
+
+if (wsChatServer) {
+  wsChatServer.on("connection", (ws, req) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const sid = cookies.nrcc_sid;
+    const session = sid ? serverSessions.get(sid) : null;
+    if (!session || !session.currentUser) {
+      try { ws.close(4401, "Not authenticated"); } catch (_e) { /* ignore */ }
+      return;
+    }
+    ws.nrccUsername = String(session.currentUser);
+    ws.nrccVmUuid = null;
+    ws.isAlive = true;
+
+    ws.on("pong", () => { ws.isAlive = true; });
+
+    ws.on("message", (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch (_e) {
+        return chatSend(ws, { type: "error", error: "Invalid JSON." });
+      }
+      if (!msg || typeof msg.type !== "string") {
+        return chatSend(ws, { type: "error", error: "Missing message type." });
+      }
+
+      if (msg.type === "ping") {
+        return chatSend(ws, { type: "pong", tsMs: Date.now() });
+      }
+
+      if (msg.type === "join") {
+        const next = msg.vmUuid ? String(msg.vmUuid).toLowerCase() : null;
+        if (next && !VM_UUID_REGEX.test(next)) {
+          return chatSend(ws, { type: "error", error: "Invalid vmUuid." });
+        }
+        if (ws.nrccVmUuid === next) return; // no-op switch to current channel
+        chatLeaveCurrent(ws);
+        if (!next) return;
+
+        chatStore.join(next, ws);
+        ws.nrccVmUuid = next;
+        chatSend(ws, { type: "history", vmUuid: next, messages: chatStore.history(next) });
+        chatBroadcast(next, {
+          type: "system",
+          vmUuid: next,
+          text: `${ws.nrccUsername} joined`,
+          tsMs: Date.now()
+        });
+        chatBroadcast(next, { type: "presence", vmUuid: next, users: chatStore.usersIn(next) });
+        return;
+      }
+
+      if (msg.type === "leave") {
+        chatLeaveCurrent(ws);
+        return;
+      }
+
+      if (msg.type === "msg") {
+        const vmUuid = ws.nrccVmUuid;
+        if (!vmUuid) {
+          return chatSend(ws, { type: "error", error: "Join a channel before posting." });
+        }
+        const text = typeof msg.text === "string" ? msg.text.trim() : "";
+        if (!text) return chatSend(ws, { type: "error", error: "Empty message." });
+        if (text.length > 2000) {
+          return chatSend(ws, { type: "error", error: "Message too long (max 2000 chars)." });
+        }
+        const record = {
+          id: crypto.randomUUID(),
+          vmUuid,
+          username: ws.nrccUsername,
+          text,
+          tsMs: Date.now()
+        };
+        chatStore.append(vmUuid, record);
+        chatBroadcast(vmUuid, { type: "msg", ...record });
+        return;
+      }
+
+      chatSend(ws, { type: "error", error: `Unknown message type: ${msg.type}` });
+    });
+
+    const cleanup = () => chatLeaveCurrent(ws);
+    ws.on("close", cleanup);
+    ws.on("error", cleanup);
+
+    chatSend(ws, { type: "hello", username: ws.nrccUsername });
+  });
+
+  // Heartbeat: terminate any chat socket that hasn't responded to a
+  // ping in the last 30s. This stops dead-but-not-yet-closed sockets
+  // (browser tab suspended, NAT timeout, etc.) from squatting in the
+  // presence list forever.
+  setInterval(() => {
+    for (const ws of wsChatServer.clients) {
+      if (ws.isAlive === false) {
+        try { ws.terminate(); } catch (_e) { /* ignore */ }
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch (_e) { /* ignore */ }
+    }
+  }, 30 * 1000);
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [sessionId, session] of wsProxySessions.entries()) {
@@ -2254,5 +2738,9 @@ setInterval(() => {
 }, 60 * 1000);
 
 server.listen(port, () => {
-  console.log(`Nutanix console launcher running at http://localhost:${port}`);
+  const scheme = MULTI_USER_MODE ? "https" : "http";
+  console.log(`Nutanix console launcher running at ${scheme}://localhost:${port}`);
+  if (MULTI_USER_MODE) {
+    console.log("[mode] multi-user features enabled: HTTPS, per-VM chat, presence");
+  }
 });

@@ -38,6 +38,29 @@ const wallOfEyesBtn = document.getElementById("wallOfEyesBtn");
 const ctrlAltDelBtn = document.getElementById("ctrlAltDelBtn");
 const pasteBtn = document.getElementById("pasteBtn");
 const pasteKeymapSelect = document.getElementById("pasteKeymap");
+const screenshotBtn = document.getElementById("screenshotBtn");
+const screenshotBrowseBtn = document.getElementById("screenshotBrowseBtn");
+const screenshotBrowseModal = document.getElementById("screenshotBrowseModal");
+const screenshotBrowseGrid = document.getElementById("screenshotBrowseGrid");
+const screenshotBrowseEmpty = document.getElementById("screenshotBrowseEmpty");
+const screenshotBrowseTitle = document.getElementById("screenshotBrowseTitle");
+const screenshotBrowseCount = document.getElementById("screenshotBrowseCount");
+const screenshotBrowseRefresh = document.getElementById("screenshotBrowseRefresh");
+const screenshotBrowseCloseBtn = document.getElementById("screenshotBrowseClose");
+
+const chatRoot = document.getElementById("chatRoot");
+const chatLauncher = document.getElementById("chatLauncher");
+const chatLauncherBadge = document.getElementById("chatLauncherBadge");
+const chatPanel = document.getElementById("chatPanel");
+const chatPanelTitle = document.getElementById("chatPanelTitle");
+const chatPanelSubtitle = document.getElementById("chatPanelSubtitle");
+const chatPanelClose = document.getElementById("chatPanelClose");
+const chatPresenceEl = document.getElementById("chatPanelPresence");
+const chatMessagesEl = document.getElementById("chatMessages");
+const chatForm = document.getElementById("chatForm");
+const chatInput = document.getElementById("chatInput");
+const chatSendBtn = document.getElementById("chatSendBtn");
+const chatStatusEl = document.getElementById("chatStatus");
 const consoleGridOverlay = document.getElementById("consoleGridOverlay");
 const consoleGridEl = document.getElementById("consoleGrid");
 const ctxMenu = document.getElementById("ctxMenu");
@@ -975,6 +998,9 @@ async function login(event) {
     session.loggedIn = true;
     persistProfileIfNeeded(pcHost, username);
     sessionUserLabel.textContent = `${username}@${pcHost}`;
+    // Mirror the PC username into appConfig so the chat UI can label
+    // own messages without having to wait for the WS hello.
+    appConfig.currentUser = username;
     showApp();
 
     // Render favorites immediately so users see them before the live
@@ -984,6 +1010,10 @@ async function login(event) {
     // Kick off the VM list load in the background. Don't await -- the
     // app stays interactive while it streams in.
     refreshVmsInBackground();
+
+    // Multi-user only: open the chat WebSocket so presence is live the
+    // moment the user lands in the app shell.
+    if (appConfig.multiUser) openChatSocket();
 
     // Clear the password field so it doesn't linger in the DOM.
     loginPasswordInput.value = "";
@@ -1011,6 +1041,15 @@ function logout() {
   closeShowAll();
   hideContextMenu();
   updateConsoleControls();
+  // Tell the server to clear the cached identity / PE creds for this
+  // session cookie. Fire-and-forget; the client-side logout proceeds
+  // even if the server is unreachable.
+  try {
+    fetch("/api/logout", { method: "POST", credentials: "same-origin" })
+      .catch(() => { /* ignore network errors during logout */ });
+  } catch (_e) { /* ignore */ }
+  // Multi-user only: tear down the chat socket and forget chat state.
+  if (typeof teardownChat === "function") teardownChat();
   showLoginScreen();
   setStatus("Idle");
   setTimeout(() => loginPasswordInput.focus(), 100);
@@ -1091,6 +1130,10 @@ function setActiveSession(sessionId) {
     s.screenEl.classList.toggle("active", s.id === sessionId);
   });
   updateConsoleControls();
+  // Multi-user only: switch the chat panel to follow the active VM.
+  if (typeof onActiveSessionChangedForChat === "function") {
+    onActiveSessionChangedForChat();
+  }
 }
 
 function updateConsoleControls() {
@@ -1105,6 +1148,8 @@ function updateConsoleControls() {
   ctrlAltDelBtn.disabled = !has;
   pasteBtn.disabled = !has;
   pasteKeymapSelect.disabled = !has;
+  screenshotBtn.disabled = !has;
+  screenshotBrowseBtn.disabled = !has;
   // Sync the keymap select to whatever the active tab is using, so
   // users can see at a glance which layout will be applied if they
   // hit Paste right now.
@@ -1848,6 +1893,11 @@ function closeSession(sessionId) {
       setActiveSession(consoleSessions[consoleSessions.length - 1].id);
     } else {
       activeSessionId = null;
+      // Multi-user only: tell the chat server we've left this VM's
+      // channel so presence is accurate even with no active tab.
+      if (appConfig.multiUser && typeof onActiveSessionChangedForChat === "function") {
+        onActiveSessionChangedForChat();
+      }
     }
   }
   updateConsoleControls();
@@ -2397,6 +2447,582 @@ async function launchAllInFolder(folderId) {
 }
 
 // =====================================================================
+// App config probe + per-VM screenshots + multi-user chat
+// =====================================================================
+//
+// /api/config tells the front-end which deployment mode the server is
+// running in. In single-user mode we still wire up screenshot capture
+// and browse (it's a useful local feature regardless), but the chat
+// surface stays hidden -- there's no /ws-chat to talk to.
+
+const appConfig = {
+  multiUser: false,
+  chatBufferSize: 200,
+  screenshotMaxPerVm: 100,
+  currentUser: null
+};
+
+async function loadAppConfig() {
+  try {
+    const resp = await fetch("/api/config", { credentials: "same-origin" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    appConfig.multiUser = Boolean(data.multiUser);
+    appConfig.chatBufferSize = Number(data.chatBufferSize) || appConfig.chatBufferSize;
+    appConfig.screenshotMaxPerVm = Number(data.screenshotMaxPerVm) || appConfig.screenshotMaxPerVm;
+    appConfig.currentUser = data.currentUser || null;
+    if (appConfig.multiUser) {
+      chatRoot.hidden = false;
+    }
+  } catch (_e) {
+    /* probe failures are non-fatal; the app behaves as single-user */
+  }
+}
+
+// ---- Screenshots --------------------------------------------------------
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error("FileReader error"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function activeConsoleCanvas() {
+  const session = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!session) return { session: null, canvas: null };
+  const canvas = session.screenEl.querySelector("canvas");
+  return { session, canvas };
+}
+
+async function captureActiveScreenshot() {
+  const { session, canvas } = activeConsoleCanvas();
+  if (!session) {
+    setStatus("Open a console first to take a screenshot.");
+    return;
+  }
+  if (!canvas) {
+    setStatus(`No canvas to capture for ${session.vmName}.`);
+    return;
+  }
+  setStatus(`Capturing screenshot of ${session.vmName}...`);
+  let blob;
+  try {
+    blob = await new Promise((resolve, reject) => {
+      try { canvas.toBlob((b) => b ? resolve(b) : reject(new Error("toBlob returned null")), "image/png"); }
+      catch (err) { reject(err); }
+    });
+  } catch (err) {
+    setStatus(`Capture failed: ${err.message || err}`);
+    return;
+  }
+  let pngBase64;
+  try { pngBase64 = await blobToBase64(blob); }
+  catch (err) {
+    setStatus(`Capture failed: ${err.message || err}`);
+    return;
+  }
+  try {
+    const resp = await fetch(`/api/screenshots/${encodeURIComponent(session.vmUuid)}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pngBase64, width: canvas.width, height: canvas.height })
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setStatus(`Save failed: ${data.error || resp.statusText}`);
+      return;
+    }
+    let msg = `Screenshot saved: ${data.filename}`;
+    if (data.prunedCount > 0) {
+      msg += ` (pruned ${data.prunedCount} older screenshot${data.prunedCount === 1 ? "" : "s"})`;
+    }
+    setStatus(msg);
+  } catch (err) {
+    setStatus(`Save failed: ${err.message || err}`);
+  }
+}
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function fmtTimestamp(tsMs) {
+  if (!Number.isFinite(tsMs)) return "";
+  const d = new Date(tsMs);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString();
+}
+
+async function refreshScreenshotBrowser(vmUuid, vmName) {
+  screenshotBrowseGrid.innerHTML = "";
+  screenshotBrowseEmpty.hidden = true;
+  screenshotBrowseCount.textContent = "Loading...";
+  let items = [];
+  try {
+    const resp = await fetch(`/api/screenshots/${encodeURIComponent(vmUuid)}`, {
+      credentials: "same-origin"
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      screenshotBrowseCount.textContent = `Error: ${data.error || resp.statusText}`;
+      return;
+    }
+    items = Array.isArray(data.items) ? data.items : [];
+  } catch (err) {
+    screenshotBrowseCount.textContent = `Error: ${err.message || err}`;
+    return;
+  }
+  if (items.length === 0) {
+    screenshotBrowseEmpty.hidden = false;
+    screenshotBrowseCount.textContent = "";
+    return;
+  }
+  screenshotBrowseCount.textContent = `${items.length} screenshot${items.length === 1 ? "" : "s"} (max ${appConfig.screenshotMaxPerVm} kept per VM)`;
+  for (const item of items) {
+    const url = `/api/screenshots/${encodeURIComponent(vmUuid)}/${encodeURIComponent(item.filename)}`;
+    const tile = document.createElement("div");
+    tile.className = "screenshot-tile";
+    tile.innerHTML = `
+      <a class="screenshot-tile-thumb" href="${url}" target="_blank" rel="noopener">
+        <img loading="lazy" alt="" src="${url}" />
+      </a>
+      <div class="screenshot-tile-meta">
+        <span title="${item.filename}">${fmtTimestamp(item.tsMs)}</span>
+        <span>${fmtBytes(item.sizeBytes)}</span>
+      </div>
+      <div class="screenshot-tile-actions">
+        <a href="${url}" download="${item.filename}">Download</a>
+        <button type="button" class="screenshot-delete" data-filename="${item.filename}">Delete</button>
+      </div>
+    `;
+    tile.querySelector(".screenshot-delete").addEventListener("click", async () => {
+      if (!confirm(`Delete ${item.filename}?`)) return;
+      try {
+        const resp = await fetch(`/api/screenshots/${encodeURIComponent(vmUuid)}/${encodeURIComponent(item.filename)}`, {
+          method: "DELETE",
+          credentials: "same-origin"
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          setStatus(`Delete failed: ${err.error || resp.statusText}`);
+          return;
+        }
+        await refreshScreenshotBrowser(vmUuid, vmName);
+        setStatus(`Deleted ${item.filename}.`);
+      } catch (err) {
+        setStatus(`Delete failed: ${err.message || err}`);
+      }
+    });
+    screenshotBrowseGrid.appendChild(tile);
+  }
+}
+
+let screenshotBrowserVm = null;
+
+function openScreenshotBrowser() {
+  const session = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!session) {
+    setStatus("Open a console first to browse screenshots.");
+    return;
+  }
+  screenshotBrowserVm = { vmUuid: session.vmUuid, vmName: session.vmName };
+  screenshotBrowseTitle.textContent = `Screenshots - ${session.vmName}`;
+  screenshotBrowseModal.classList.add("open");
+  refreshScreenshotBrowser(session.vmUuid, session.vmName);
+}
+
+function closeScreenshotBrowser() {
+  screenshotBrowseModal.classList.remove("open");
+  screenshotBrowserVm = null;
+}
+
+screenshotBrowseRefresh.addEventListener("click", () => {
+  if (screenshotBrowserVm) {
+    refreshScreenshotBrowser(screenshotBrowserVm.vmUuid, screenshotBrowserVm.vmName);
+  }
+});
+screenshotBrowseCloseBtn.addEventListener("click", closeScreenshotBrowser);
+screenshotBrowseModal.addEventListener("click", (event) => {
+  if (event.target === screenshotBrowseModal) closeScreenshotBrowser();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && screenshotBrowseModal.classList.contains("open")) {
+    closeScreenshotBrowser();
+  }
+});
+
+screenshotBtn.addEventListener("click", () => { captureActiveScreenshot(); });
+screenshotBrowseBtn.addEventListener("click", openScreenshotBrowser);
+
+// ---- Multi-user chat ----------------------------------------------------
+
+let chatSocket = null;
+let chatReconnectTimer = null;
+let chatReconnectAttempt = 0;
+let chatHeartbeatTimer = null;
+let chatPanelOpen = false;
+let chatCurrentVmUuid = null;
+let chatUnreadTotal = 0;
+const chatStateByVm = new Map(); // vmUuid -> { messages: [], presence: [], unread: 0 }
+
+function chatStateFor(vmUuid) {
+  let state = chatStateByVm.get(vmUuid);
+  if (!state) {
+    state = { messages: [], presence: [], unread: 0 };
+    chatStateByVm.set(vmUuid, state);
+  }
+  return state;
+}
+
+function chatTimeText(tsMs) {
+  const d = new Date(tsMs);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function renderChatMessages() {
+  if (!chatCurrentVmUuid) {
+    chatMessagesEl.innerHTML = `<div class="chat-empty">Open a console to start chatting about it.</div>`;
+    return;
+  }
+  const state = chatStateFor(chatCurrentVmUuid);
+  if (!state.messages.length) {
+    chatMessagesEl.innerHTML = `<div class="chat-empty">No messages yet for this VM. Say hi!</div>`;
+    return;
+  }
+  // Detect whether the user is at the bottom *before* re-rendering so
+  // we don't yank them off a scroll-up reading position when a new
+  // message arrives.
+  const wasAtBottom = chatMessagesEl.scrollTop + chatMessagesEl.clientHeight + 32 >= chatMessagesEl.scrollHeight;
+  const html = state.messages.map((m) => {
+    if (m.kind === "system") {
+      return `<li class="chat-msg-system">${escapeHtml(m.text)} . ${chatTimeText(m.tsMs)}</li>`;
+    }
+    const selfClass = m.username === appConfig.currentUser ? " chat-msg-self" : "";
+    const pendingClass = m.pending ? " chat-msg-pending" : "";
+    return `<li class="chat-msg${selfClass}${pendingClass}">
+      <div class="chat-msg-meta">
+        <span class="chat-msg-user">${escapeHtml(m.username)}</span>
+        <span class="chat-msg-time">${chatTimeText(m.tsMs)}</span>
+      </div>
+      <div class="chat-msg-text">${escapeHtml(m.text)}</div>
+    </li>`;
+  }).join("");
+  chatMessagesEl.innerHTML = html;
+  if (wasAtBottom || chatPanelOpen === false) {
+    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  }
+}
+
+function renderChatPresence() {
+  if (!chatCurrentVmUuid) {
+    chatPresenceEl.textContent = "";
+    return;
+  }
+  const state = chatStateFor(chatCurrentVmUuid);
+  if (!state.presence.length) {
+    chatPresenceEl.textContent = "Just you so far";
+    return;
+  }
+  const others = state.presence.filter((u) => u !== appConfig.currentUser);
+  if (state.presence.includes(appConfig.currentUser)) {
+    if (others.length === 0) chatPresenceEl.textContent = "You only";
+    else chatPresenceEl.textContent = `You + ${others.join(", ")}`;
+  } else {
+    chatPresenceEl.textContent = state.presence.join(", ");
+  }
+}
+
+function renderChatHeader() {
+  if (!chatCurrentVmUuid) {
+    chatPanelTitle.textContent = "VM chat";
+    chatPanelSubtitle.textContent = "No console selected";
+    chatInput.disabled = true;
+    chatSendBtn.disabled = true;
+    return;
+  }
+  const session = consoleSessions.find((s) => s.vmUuid === chatCurrentVmUuid);
+  chatPanelTitle.textContent = session ? session.vmName : "VM chat";
+  chatPanelSubtitle.textContent = chatCurrentVmUuid;
+  const live = chatSocket && chatSocket.readyState === WebSocket.OPEN;
+  chatInput.disabled = !live;
+  chatSendBtn.disabled = !live;
+}
+
+function setChatStatus(text) {
+  if (!text) {
+    chatStatusEl.hidden = true;
+    chatStatusEl.textContent = "";
+  } else {
+    chatStatusEl.hidden = false;
+    chatStatusEl.textContent = text;
+  }
+}
+
+function updateChatBadge() {
+  let total = 0;
+  for (const state of chatStateByVm.values()) total += state.unread;
+  chatUnreadTotal = total;
+  if (total > 0) {
+    chatLauncherBadge.hidden = false;
+    chatLauncherBadge.textContent = total > 99 ? "99+" : String(total);
+  } else {
+    chatLauncherBadge.hidden = true;
+  }
+}
+
+function chatSocketSend(payload) {
+  if (!chatSocket || chatSocket.readyState !== WebSocket.OPEN) return false;
+  try { chatSocket.send(JSON.stringify(payload)); return true; }
+  catch (_e) { return false; }
+}
+
+function joinChannelForActiveSession() {
+  const active = consoleSessions.find((s) => s.id === activeSessionId);
+  const vmUuid = active ? active.vmUuid : null;
+  chatCurrentVmUuid = vmUuid;
+  // Visiting a VM clears its unread count.
+  if (vmUuid) {
+    const state = chatStateFor(vmUuid);
+    state.unread = 0;
+    updateChatBadge();
+  }
+  if (chatSocket && chatSocket.readyState === WebSocket.OPEN) {
+    chatSocketSend({ type: "join", vmUuid });
+  }
+  renderChatHeader();
+  renderChatPresence();
+  renderChatMessages();
+}
+
+// Exported for setActiveSession() to call without a forward declaration.
+function onActiveSessionChangedForChat() {
+  if (!appConfig.multiUser) return;
+  joinChannelForActiveSession();
+}
+
+function handleChatServerMessage(msg) {
+  if (!msg || typeof msg.type !== "string") return;
+  switch (msg.type) {
+    case "hello": {
+      if (msg.username) appConfig.currentUser = msg.username;
+      // Once the socket says hello, sync to whatever channel the UI
+      // currently thinks is active.
+      joinChannelForActiveSession();
+      break;
+    }
+    case "history": {
+      if (!msg.vmUuid) return;
+      const state = chatStateFor(msg.vmUuid);
+      state.messages = (msg.messages || []).map((m) => ({ ...m, kind: "msg" }));
+      if (msg.vmUuid === chatCurrentVmUuid) renderChatMessages();
+      break;
+    }
+    case "presence": {
+      if (!msg.vmUuid) return;
+      const state = chatStateFor(msg.vmUuid);
+      state.presence = Array.isArray(msg.users) ? msg.users.slice() : [];
+      if (msg.vmUuid === chatCurrentVmUuid) renderChatPresence();
+      break;
+    }
+    case "msg": {
+      if (!msg.vmUuid) return;
+      const state = chatStateFor(msg.vmUuid);
+      // Replace any optimistic local row for this id, otherwise append.
+      const existingIdx = state.messages.findIndex((m) => m.id === msg.id);
+      const record = {
+        id: msg.id,
+        vmUuid: msg.vmUuid,
+        username: msg.username,
+        text: msg.text,
+        tsMs: msg.tsMs,
+        kind: "msg"
+      };
+      if (existingIdx >= 0) state.messages[existingIdx] = record;
+      else state.messages.push(record);
+      // Trim to the configured server-side buffer for parity.
+      const limit = appConfig.chatBufferSize;
+      if (state.messages.length > limit) {
+        state.messages.splice(0, state.messages.length - limit);
+      }
+      if (msg.vmUuid === chatCurrentVmUuid) {
+        renderChatMessages();
+        if (chatPanelOpen && msg.username !== appConfig.currentUser) {
+          state.unread = 0;
+          updateChatBadge();
+        }
+      }
+      // Unread accounting: count anyone else's messages in any channel
+      // that isn't currently being viewed in an open panel.
+      const isViewedNow = chatPanelOpen && msg.vmUuid === chatCurrentVmUuid;
+      if (!isViewedNow && msg.username !== appConfig.currentUser) {
+        state.unread += 1;
+        updateChatBadge();
+      }
+      break;
+    }
+    case "system": {
+      if (!msg.vmUuid) return;
+      const state = chatStateFor(msg.vmUuid);
+      state.messages.push({
+        id: `sys-${Date.now()}-${Math.random()}`,
+        vmUuid: msg.vmUuid,
+        text: msg.text,
+        tsMs: msg.tsMs,
+        kind: "system"
+      });
+      if (msg.vmUuid === chatCurrentVmUuid) renderChatMessages();
+      break;
+    }
+    case "error": {
+      setChatStatus(msg.error || "Chat error");
+      setTimeout(() => setChatStatus(""), 4000);
+      break;
+    }
+    case "pong":
+    default:
+      break;
+  }
+}
+
+function clearChatHeartbeat() {
+  if (chatHeartbeatTimer) {
+    clearInterval(chatHeartbeatTimer);
+    chatHeartbeatTimer = null;
+  }
+}
+
+function scheduleChatReconnect() {
+  if (!appConfig.multiUser) return;
+  if (chatReconnectTimer) return;
+  chatReconnectAttempt += 1;
+  // Capped exponential backoff: 1s, 2s, 4s, 8s, ... up to 30s.
+  const delay = Math.min(30000, 1000 * Math.pow(2, Math.min(chatReconnectAttempt - 1, 5)));
+  setChatStatus(`Disconnected. Reconnecting in ${Math.round(delay / 1000)}s...`);
+  chatReconnectTimer = setTimeout(() => {
+    chatReconnectTimer = null;
+    openChatSocket();
+  }, delay);
+}
+
+function openChatSocket() {
+  if (!appConfig.multiUser) return;
+  if (chatSocket && (chatSocket.readyState === WebSocket.CONNECTING || chatSocket.readyState === WebSocket.OPEN)) {
+    return;
+  }
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  const url = `${scheme}://${window.location.host}/ws-chat`;
+  let ws;
+  try { ws = new WebSocket(url); }
+  catch (err) {
+    setChatStatus(`Chat unavailable: ${err.message || err}`);
+    scheduleChatReconnect();
+    return;
+  }
+  chatSocket = ws;
+  ws.addEventListener("open", () => {
+    chatReconnectAttempt = 0;
+    setChatStatus("");
+    renderChatHeader();
+    clearChatHeartbeat();
+    chatHeartbeatTimer = setInterval(() => {
+      chatSocketSend({ type: "ping", tsMs: Date.now() });
+    }, 30 * 1000);
+  });
+  ws.addEventListener("message", (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (_e) { return; }
+    handleChatServerMessage(msg);
+  });
+  ws.addEventListener("close", (event) => {
+    clearChatHeartbeat();
+    chatSocket = null;
+    renderChatHeader();
+    if (event.code === 4401) {
+      setChatStatus("Chat sign-in required. Re-log in to NRCC and reopen the chat.");
+      return;
+    }
+    if (appConfig.multiUser && session.loggedIn) {
+      scheduleChatReconnect();
+    }
+  });
+  ws.addEventListener("error", () => {
+    setChatStatus("Chat connection error.");
+  });
+}
+
+function teardownChat() {
+  if (chatReconnectTimer) {
+    clearTimeout(chatReconnectTimer);
+    chatReconnectTimer = null;
+  }
+  clearChatHeartbeat();
+  if (chatSocket) {
+    try { chatSocket.close(); } catch (_e) { /* ignore */ }
+    chatSocket = null;
+  }
+  chatReconnectAttempt = 0;
+  chatStateByVm.clear();
+  chatCurrentVmUuid = null;
+  chatPanelOpen = false;
+  chatPanel.hidden = true;
+  chatLauncher.classList.remove("is-open");
+  updateChatBadge();
+  renderChatHeader();
+  renderChatPresence();
+  renderChatMessages();
+  setChatStatus("");
+}
+
+function toggleChatPanel(forceState) {
+  const next = typeof forceState === "boolean" ? forceState : chatPanel.hidden;
+  chatPanel.hidden = !next;
+  chatPanelOpen = next;
+  chatLauncher.classList.toggle("is-open", next);
+  if (next) {
+    // Clear unread for the channel we're now actively viewing.
+    if (chatCurrentVmUuid) {
+      chatStateFor(chatCurrentVmUuid).unread = 0;
+      updateChatBadge();
+    }
+    renderChatMessages();
+    renderChatPresence();
+    renderChatHeader();
+    setTimeout(() => { try { chatInput.focus(); } catch (_e) { /* ignore */ } }, 50);
+  }
+}
+
+chatLauncher.addEventListener("click", () => toggleChatPanel());
+chatPanelClose.addEventListener("click", () => toggleChatPanel(false));
+
+chatForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = chatInput.value.trim();
+  if (!text) return;
+  if (!chatCurrentVmUuid) {
+    setChatStatus("Open a console to send a message.");
+    setTimeout(() => setChatStatus(""), 3000);
+    return;
+  }
+  if (!chatSocketSend({ type: "msg", text })) {
+    setChatStatus("Chat is reconnecting; please retry shortly.");
+    return;
+  }
+  chatInput.value = "";
+});
+
+// =====================================================================
 // Wiring
 // =====================================================================
 
@@ -2447,6 +3073,9 @@ loadSavedProfile();
 loadFavoritesStore();
 renderAll();
 refreshPeCredsCache();
+// Probe deployment mode early so the chat surface is gated correctly.
+// Fires-and-forgets; the app behaves as single-user until it resolves.
+loadAppConfig();
 // Reflect the saved guest-keymap preference in the action bar even
 // before any tabs are open, so the user knows what new tabs will inherit.
 pasteKeymapSelect.value = lastUsedKeymap;

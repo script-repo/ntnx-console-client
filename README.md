@@ -22,6 +22,8 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 - **CVM support.** Discovers Controller VMs through the v4 `clustermgmt` API on Prism Central, then redirects the console request to the cluster's Prism Element using the legacy VNC proxy when v4 console-token is unavailable.
 - **Per-PE credentials, server-side only.** Prism Central credentials don't authenticate to Prism Element by default. NRCC prompts once per PE, validates with a real probe, and caches the credentials **in the NRCC server process's memory only** — keyed to an `HttpOnly` session cookie. They are never written to browser `localStorage`, never persisted to disk, and disappear when the NRCC server restarts (or after 8 hours of inactivity).
 - **Pure HTTP/WebSocket.** No agent on the cluster, no plug-in, no special browser extensions. Self-signed TLS toggle for lab environments.
+- **Per-VM screenshots.** A teal **Screenshot** button captures the active console as a PNG and saves it server-side under `screenshots/<vm-uuid>/<ISO-timestamp>.png`. A **Browse...** button opens a thumbnail grid of every saved screenshot for the active VM with download / delete / refresh actions. Per-VM retention (default 100, configurable via `NRCC_SCREENSHOT_MAX_PER_VM`) prunes the oldest captures automatically.
+- **Multi-user deployment (opt-in).** Set `NRCC_MULTI_USER=true` to flip NRCC into a shared HTTPS deployment with a per-VM real-time chat panel and presence list (in-memory ring buffer of the last `NRCC_CHAT_BUFFER` messages per VM, default 200). A self-signed cert is auto-generated into `./certs/` on first start, with the SHA-256 fingerprint logged for pinning. See [Multi-user deployment](#multi-user-deployment) for the trust model and configuration. Default mode is unchanged single-user HTTP.
 
 ---
 
@@ -127,11 +129,44 @@ copy .env.example .env       # Windows
 
 ### Run
 
+NRCC has one start command (`npm start`) and one feature toggle (`NRCC_MULTI_USER`). The same binary serves both modes; the environment decides which.
+
+#### Single-user mode (default — HTTP on `localhost`)
+
 ```bash
 npm start
 ```
 
 Then open <http://localhost:3000>.
+
+#### Multi-user mode (HTTPS, per-VM chat + presence)
+
+Pick whichever shell syntax matches your platform:
+
+```bash
+# macOS / Linux (bash, zsh)
+NRCC_MULTI_USER=true npm start
+```
+
+```powershell
+# Windows PowerShell
+$env:NRCC_MULTI_USER='true'; npm start
+```
+
+```cmd
+:: Windows cmd.exe
+set NRCC_MULTI_USER=true && npm start
+```
+
+Or persist it in `.env` (cross-platform; `dotenv` is loaded at startup):
+
+```env
+NRCC_MULTI_USER=true
+```
+
+Then `npm start` as usual. Open <https://localhost:3000> (note **https**) and accept the self-signed cert warning the first time. The startup log prints the cert's SHA-256 fingerprint so you can pin / verify it from the browser's "view certificate" pane.
+
+See [Multi-user deployment](#multi-user-deployment) for the optional companion env vars (`NRCC_TLS_*`, `NRCC_CHAT_BUFFER`, `NRCC_SCREENSHOTS_DIR`, `NRCC_SCREENSHOT_MAX_PER_VM`) and the trust-model caveats.
 
 ---
 
@@ -231,18 +266,115 @@ Self-signed Prism certificates are normal in lab environments. The **Allow self-
 
 ### No production hardening
 
-NRCC is a workstation tool. It does not implement:
+NRCC is a workstation tool by default. The shipped HTTP/`localhost:3000` mode does not implement:
 
-- HTTPS termination on the local server (HTTP only on `localhost:3000`).
+- HTTPS termination on the local server.
 - Multi-user auth on the NRCC server itself.
 - Role enforcement (Prism's own RBAC still applies to whatever creds you provide).
 - Audit logging of console sessions.
 
-Do not expose NRCC's port to networks beyond your workstation.
+For shared installations, see [Multi-user deployment](#multi-user-deployment) below — it adds HTTPS, a per-VM chat panel, and per-VM screenshots, but does **not** add an extra auth tier in front of NRCC. Do not expose NRCC's port to networks beyond your workstation without also putting a real authenticating reverse proxy in front of it.
 
 ### API version sensitivity
 
 NRCC tries multiple Prism API versions (`v4.0`, `v4.1`, `v4.2`, `v3`, `v2.0`, `v1`) and remembers which combination worked. If your AOS upgrades change which endpoints respond, refresh the VM list to re-detect.
+
+---
+
+## Multi-user deployment
+
+NRCC has a single-binary "multi-user" mode aimed at small operations teams who want to share one NRCC instance over the LAN. It's gated behind one environment variable and is **off by default** — flipping it on changes nothing about how single-user installs behave today.
+
+### Turning it on
+
+Set `NRCC_MULTI_USER=true` (in `.env` or in the launcher's environment) and start NRCC normally:
+
+```bash
+# macOS / Linux (bash, zsh)
+NRCC_MULTI_USER=true npm start
+```
+
+```powershell
+# Windows PowerShell
+$env:NRCC_MULTI_USER='true'; npm start
+```
+
+```cmd
+:: Windows cmd.exe
+set NRCC_MULTI_USER=true && npm start
+```
+
+Or persist `NRCC_MULTI_USER=true` in `.env` and just `npm start`. The default (`NRCC_MULTI_USER` unset or `false`) keeps the original single-user HTTP behaviour byte-for-byte.
+
+On startup you'll see:
+
+```text
+[tls] using cert ./certs/cert.pem (auto-generated)
+[tls] sha256 fingerprint: 5D:37:EC:6F:85:8C:1F:E4:83:4E:00:95:F3:3B:82:D9:2D:37:9E:66:F9:50:B5:9E:A4:06:94:7D:15:AE:2C:41
+Nutanix console launcher running at https://localhost:3000
+[mode] multi-user features enabled: HTTPS, per-VM chat, presence
+```
+
+What changes from default:
+
+- The listener switches from `http://` to `https://` (the port number is unchanged).
+- The browser sees a "VM chat" launcher in the bottom-right corner once a user is signed in.
+- The `/ws-chat` WebSocket is reachable; presence and history per VM UUID are tracked in memory.
+
+What does **not** change:
+
+- Single-user mode (`NRCC_MULTI_USER` unset or `false`) is byte-for-byte identical to before this drop. No HTTPS, no chat UI, no `/ws-chat` listener.
+- Screenshots are available in **both** modes (see below). They were added at the same time but are not gated on the multi-user toggle.
+
+### TLS
+
+NRCC will use TLS material in this priority order:
+
+1. `NRCC_TLS_CERT` + `NRCC_TLS_KEY` — explicit paths to a cert and key you provide.
+2. `cert.pem` + `key.pem` inside `NRCC_TLS_CERT_DIR` (defaults to `./certs/`).
+3. **Auto-generate.** A fresh self-signed RSA-2048 cert, valid 825 days, with SANs for `localhost`, the machine's hostname, and every non-loopback IPv4 address visible on the box. The cert is written into `./certs/`; subsequent restarts reuse it.
+
+Browsers will warn the first time they connect to a self-signed instance. The startup log prints the SHA-256 fingerprint of whichever cert is in use so you can pin/verify it from the browser's "view certificate" pane. To force a regenerate, delete `./certs/` and restart.
+
+For anything more public than a trusted internal LAN, supply your own real cert via `NRCC_TLS_CERT`/`NRCC_TLS_KEY` (or, better, terminate TLS at a real reverse proxy and proxy plain HTTP to NRCC over loopback only).
+
+### Per-VM chat
+
+When multi-user mode is on, the bottom-right chat icon opens a slide-out panel scoped to the **currently active console tab**. Each VM UUID gets its own channel — switching tabs joins the new channel, leaving the old one. Joins, leaves, and message history (most recent `NRCC_CHAT_BUFFER` messages, default 200) are sent to clients that join.
+
+Identity for the chat is the PC username from your NRCC login — there is **no extra password** for chat. When a user logs in, NRCC stashes their PC username server-side, keyed to the same `nrcc_sid` cookie used for PE-cred caching. The `/ws-chat` connection picks up that cookie, looks up the username, and binds it to the socket. Anything the client claims about its own identity is ignored. This means:
+
+- **Trust model.** Chat identity is only as strong as the PC login. A user who can write to the JS bundle (or to your reverse proxy) could spoof another username at the WebSocket layer. This matches NRCC's existing trust model — admin tool on a trusted internal network behind TLS — and is documented; do **not** rely on chat identity for anything security-relevant. If you need stronger identity, deploy NRCC behind an SSO/OIDC proxy and use the proxy's user header.
+- **Persistence.** None. Messages live in the NRCC process's memory only and are lost on restart. The buffer is a per-VM ring of size `NRCC_CHAT_BUFFER`; older messages drop off as new ones arrive.
+- **Heartbeat.** The client pings every 30 s; the server terminates sockets that miss two pings, which keeps presence accurate when a tab is suspended or NAT'd through a stateful proxy.
+
+The badge on the chat icon counts unread messages received while the panel was minimized; opening the panel clears the count for the active VM. There's no DM, no file/image attachments, and no chat surfacing in the Wall of Eyes window — those are all out of scope.
+
+### Per-VM screenshots
+
+Available in both modes. Each console tab grows two action-bar buttons:
+
+- **Screenshot** — captures the noVNC `<canvas>` of the active console as a PNG and `POST`s it to `/api/screenshots/:vmUuid`. The server saves it as `<NRCC_SCREENSHOTS_DIR>/<uuid>/<ISO-timestamp>.png` (colons in the timestamp replaced with `-` for FS portability). After every save the per-VM folder is pruned to the newest `NRCC_SCREENSHOT_MAX_PER_VM` files (default 100). The status bar reports the saved filename and the prune count.
+- **Browse...** — opens a thumbnail-grid modal listing every saved screenshot for the active VM, newest first. Each tile shows timestamp + size and has Download / Delete actions. A Refresh button re-lists the folder.
+
+Layout on disk:
+
+```text
+screenshots/
+  d1e0f4a8-1234-4abc-89de-0123456789ab/
+    2026-05-08T20-14-03.512Z.png
+    2026-05-08T20-15-22.001Z.png
+  e2f1g5b9-2345-4bcd-90ef-1234567890bc/
+    ...
+```
+
+Hard limits enforced server-side:
+
+- Encoded payload capped at 10 MB (~7 MB of decoded PNG); larger captures are rejected with HTTP 413.
+- The PNG magic bytes are checked; non-PNG payloads are rejected with HTTP 400.
+- The UUID and filename in every endpoint path are validated against strict regexes (`^[0-9a-f-]{36}$` and `^[\w.-]+\.png$`), so a malicious path component can't escape the per-VM directory.
+
+The `express.json()` body limit is bumped to `12mb` to accommodate full-resolution console captures.
 
 ---
 
@@ -264,6 +396,13 @@ NRCC tries multiple Prism API versions (`v4.0`, `v4.1`, `v4.2`, `v3`, `v2.0`, `v
 | Validate + cache PE creds (NRCC) | `POST /api/pe-test` — server stores creds under the session cookie          |
 | List cached PE hosts (NRCC)      | `GET /api/pe-creds` — returns `{ peHosts: [...] }`, no creds                |
 | Forget cached PE creds (NRCC)    | `DELETE /api/pe-creds` (all) or `DELETE /api/pe-creds/:peHost` (one)        |
+| Server-side logout (NRCC)        | `POST /api/logout` — clears cached PE creds + the chat identity stash       |
+| Deployment mode probe (NRCC)     | `GET /api/config` — returns `{multiUser, chatBufferSize, screenshotMaxPerVm, currentUser}` |
+| Save screenshot (NRCC)           | `POST /api/screenshots/:vmUuid` — body `{pngBase64}`                        |
+| List screenshots (NRCC)          | `GET /api/screenshots/:vmUuid` — newest first                               |
+| Fetch screenshot (NRCC)          | `GET /api/screenshots/:vmUuid/:filename` — `image/png`                      |
+| Delete screenshot (NRCC)         | `DELETE /api/screenshots/:vmUuid/:filename`                                 |
+| Multi-user chat (NRCC)           | `WS(S) /ws-chat` — protocol: `join`/`msg`/`ping`/`leave` (multi-user mode only) |
 
 All requests carry per-call `NTNX-Request-Id` / `X-Request-Id` headers (UUIDv4) — required by Nutanix v4 APIs.
 

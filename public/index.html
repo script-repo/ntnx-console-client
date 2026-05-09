@@ -1155,6 +1155,356 @@
         margin: auto;
         font-size: 13px;
       }
+
+      /* Action-bar buttons added for screenshots */
+      .screenshot-btn {
+        background: #0f766e;
+        border: 1px solid #0f766e;
+      }
+      .screenshot-btn:hover {
+        background: #0d635c;
+        border-color: #0d635c;
+        color: #fff;
+      }
+      .screenshot-btn:disabled {
+        background: #a7d4cd;
+        border-color: #a7d4cd;
+        cursor: not-allowed;
+      }
+      .screenshot-browse-btn {
+        height: 28px;
+        padding: 0 10px;
+        background: #fff;
+        color: var(--ntx-text);
+        border: 1px solid var(--ntx-border-strong);
+        border-radius: 4px;
+        font-size: 11.5px;
+        font-weight: 500;
+        cursor: pointer;
+        width: 100%;
+        white-space: nowrap;
+      }
+      .screenshot-browse-btn:hover {
+        background: var(--ntx-accent-soft);
+        border-color: var(--ntx-accent);
+        color: var(--ntx-accent-hover);
+      }
+      .screenshot-browse-btn:disabled {
+        background: #eef1f6;
+        color: var(--ntx-text-subtle);
+        border-color: var(--ntx-border);
+        cursor: not-allowed;
+      }
+
+      /* Screenshot browse modal */
+      .screenshot-modal {
+        width: 760px;
+        max-width: calc(100vw - 32px);
+      }
+      .screenshot-modal-body {
+        gap: 10px;
+        max-height: 70vh;
+        overflow: hidden;
+      }
+      .screenshot-modal-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .screenshot-modal-spacer {
+        flex: 1;
+      }
+      .screenshot-thumb-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 12px;
+        overflow: auto;
+        max-height: 60vh;
+        padding-right: 4px;
+      }
+      .screenshot-thumb-grid::-webkit-scrollbar {
+        width: 8px;
+      }
+      .screenshot-thumb-grid::-webkit-scrollbar-thumb {
+        background: var(--ntx-border-strong);
+        border-radius: 4px;
+      }
+      .screenshot-tile {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        background: var(--ntx-surface-2);
+        overflow: hidden;
+      }
+      .screenshot-tile-thumb {
+        background: #000;
+        height: 120px;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+      }
+      .screenshot-tile-thumb img {
+        max-width: 100%;
+        max-height: 100%;
+        display: block;
+      }
+      .screenshot-tile-meta {
+        padding: 6px 8px;
+        font-size: 11.5px;
+        color: var(--ntx-text-muted);
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .screenshot-tile-actions {
+        display: flex;
+        gap: 4px;
+        padding: 0 8px 8px 8px;
+      }
+      .screenshot-tile-actions a,
+      .screenshot-tile-actions button {
+        flex: 1;
+        height: 26px;
+        padding: 0 8px;
+        font-size: 11.5px;
+        text-align: center;
+        text-decoration: none;
+        border-radius: 4px;
+        border: 1px solid var(--ntx-border-strong);
+        background: #fff;
+        color: var(--ntx-text);
+        line-height: 24px;
+        cursor: pointer;
+      }
+      .screenshot-tile-actions a:hover,
+      .screenshot-tile-actions button:hover {
+        background: var(--ntx-accent-soft);
+        border-color: var(--ntx-accent);
+        color: var(--ntx-accent-hover);
+      }
+      .screenshot-tile-actions .screenshot-delete:hover {
+        background: #fdf2f4;
+        border-color: var(--ntx-danger);
+        color: var(--ntx-danger);
+      }
+      .screenshot-modal-empty {
+        text-align: center;
+        padding: 32px 16px;
+        color: var(--ntx-text-subtle);
+        font-size: 13px;
+      }
+
+      /* Multi-user chat */
+      .chat-root[hidden] { display: none; }
+      .chat-launcher {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        height: 52px;
+        width: 52px;
+        padding: 0;
+        border-radius: 50%;
+        border: 0;
+        background: var(--ntx-accent);
+        color: #fff;
+        font-size: 24px;
+        line-height: 52px;
+        text-align: center;
+        cursor: pointer;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.32);
+        z-index: 70;
+        transition: transform 120ms ease, background 120ms ease;
+      }
+      .chat-launcher:hover {
+        background: var(--ntx-accent-hover);
+        transform: translateY(-2px);
+      }
+      .chat-launcher:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(21, 101, 255, 0.35), 0 12px 28px rgba(15, 23, 42, 0.32);
+      }
+      .chat-launcher.is-open {
+        background: var(--ntx-text);
+      }
+      .chat-launcher-icon {
+        font-size: 22px;
+        font-style: normal;
+      }
+      .chat-launcher-badge {
+        position: absolute;
+        top: -4px;
+        right: -4px;
+        min-width: 20px;
+        height: 20px;
+        padding: 0 6px;
+        border-radius: 999px;
+        background: var(--ntx-danger);
+        color: #fff;
+        font-size: 11px;
+        font-weight: 700;
+        line-height: 20px;
+        text-align: center;
+        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.3);
+      }
+      .chat-launcher-badge[hidden] { display: none; }
+      .chat-panel {
+        position: fixed;
+        right: 18px;
+        bottom: 86px;
+        width: 360px;
+        max-width: calc(100vw - 36px);
+        height: min(560px, calc(100vh - 130px));
+        background: var(--ntx-surface);
+        border: 1px solid var(--ntx-border);
+        border-radius: 10px;
+        box-shadow: var(--ntx-shadow-lg);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        z-index: 70;
+      }
+      .chat-panel[hidden] { display: none; }
+      .chat-panel-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        background: linear-gradient(90deg, var(--ntx-brand), var(--ntx-brand-2));
+        color: #fff;
+        font-size: 13px;
+      }
+      .chat-panel-titles {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-width: 0;
+        line-height: 1.2;
+      }
+      .chat-panel-titles #chatPanelTitle {
+        font-weight: 600;
+        font-size: 13.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .chat-panel-subtitle {
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.65);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .chat-panel-close {
+        height: 26px;
+        width: 26px;
+        padding: 0;
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        color: #fff;
+        font-size: 14px;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .chat-panel-close:hover {
+        background: rgba(255, 255, 255, 0.22);
+      }
+      .chat-presence {
+        padding: 6px 12px;
+        font-size: 11.5px;
+        color: var(--ntx-text-muted);
+        background: var(--ntx-surface-2);
+        border-bottom: 1px solid var(--ntx-border);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .chat-messages {
+        list-style: none;
+        margin: 0;
+        padding: 10px 12px;
+        flex: 1;
+        overflow-y: auto;
+        background: #fff;
+        font-size: 12.5px;
+      }
+      .chat-messages::-webkit-scrollbar {
+        width: 8px;
+      }
+      .chat-messages::-webkit-scrollbar-thumb {
+        background: var(--ntx-border-strong);
+        border-radius: 4px;
+      }
+      .chat-msg {
+        padding: 6px 0;
+        border-bottom: 1px dashed transparent;
+      }
+      .chat-msg:last-child { border-bottom: none; }
+      .chat-msg-meta {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin-bottom: 2px;
+      }
+      .chat-msg-user {
+        font-weight: 600;
+        color: var(--ntx-text);
+      }
+      .chat-msg-time {
+        font-size: 10.5px;
+        color: var(--ntx-text-subtle);
+        font-variant-numeric: tabular-nums;
+      }
+      .chat-msg-self .chat-msg-user {
+        color: var(--ntx-accent);
+      }
+      .chat-msg-text {
+        color: var(--ntx-text);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .chat-msg-system {
+        padding: 4px 0;
+        text-align: center;
+        font-size: 11px;
+        font-style: italic;
+        color: var(--ntx-text-subtle);
+      }
+      .chat-msg-pending .chat-msg-text {
+        color: var(--ntx-text-muted);
+        font-style: italic;
+      }
+      .chat-form {
+        display: flex;
+        gap: 6px;
+        padding: 8px 10px;
+        border-top: 1px solid var(--ntx-border);
+        background: var(--ntx-surface-2);
+      }
+      .chat-form input {
+        flex: 1;
+        height: 32px;
+        font-size: 12.5px;
+      }
+      .chat-form button {
+        height: 32px;
+        padding: 0 14px;
+        font-size: 12.5px;
+      }
+      .chat-status {
+        padding: 6px 12px;
+        font-size: 11px;
+        color: var(--ntx-warn);
+        background: #fff7ed;
+        border-top: 1px solid #fde7d3;
+      }
+      .chat-status[hidden] { display: none; }
+      .chat-empty {
+        padding: 24px 16px;
+        text-align: center;
+        color: var(--ntx-text-subtle);
+        font-size: 12px;
+      }
     </style>
   </head>
   <body>
@@ -1298,6 +1648,10 @@
                       <option value="dvorak">US Dvorak</option>
                       <option value="colemak">US Colemak</option>
                     </select>
+                    <button id="screenshotBtn" type="button" class="screenshot-btn" disabled
+                            title="Capture the active console as a PNG and save it server-side under the screenshots folder for this VM (per-VM UUID).">Screenshot</button>
+                    <button id="screenshotBrowseBtn" type="button" class="screenshot-browse-btn" disabled
+                            title="View, download, or delete past screenshots saved for this VM.">Browse...</button>
                     <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
                     <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
                     <button id="wallOfEyesBtn" type="button" class="wall-eyes-btn" disabled title="Open a live wall of every console in a new browser window">Wall of Eyes</button>
@@ -1359,6 +1713,51 @@
         <div class="grid-overlay-hint">Click outside or press Esc to close.</div>
       </div>
       <div id="consoleGrid" class="console-grid"></div>
+    </div>
+
+    <!-- Screenshot browse modal -->
+    <div id="screenshotBrowseModal" class="modal-backdrop" role="dialog" aria-modal="true">
+      <div class="modal screenshot-modal">
+        <div class="modal-header">
+          <span id="screenshotBrowseTitle">Screenshots</span>
+        </div>
+        <div class="modal-body screenshot-modal-body">
+          <div class="screenshot-modal-controls">
+            <span id="screenshotBrowseCount" class="muted"></span>
+            <span class="screenshot-modal-spacer"></span>
+            <button id="screenshotBrowseRefresh" type="button">Refresh</button>
+            <button id="screenshotBrowseClose" type="button">Close</button>
+          </div>
+          <div id="screenshotBrowseGrid" class="screenshot-thumb-grid"></div>
+          <div id="screenshotBrowseEmpty" class="screenshot-modal-empty" hidden>
+            No screenshots yet for this VM.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Multi-user chat (revealed only when /api/config reports multiUser=true) -->
+    <div id="chatRoot" class="chat-root" hidden>
+      <button id="chatLauncher" class="chat-launcher" type="button" title="Open VM chat" aria-label="Open chat">
+        <span class="chat-launcher-icon" aria-hidden="true">&#128488;</span>
+        <span id="chatLauncherBadge" class="chat-launcher-badge" hidden>0</span>
+      </button>
+      <aside id="chatPanel" class="chat-panel" hidden aria-label="VM chat panel">
+        <header class="chat-panel-header">
+          <div class="chat-panel-titles">
+            <span id="chatPanelTitle">VM chat</span>
+            <span id="chatPanelSubtitle" class="chat-panel-subtitle"></span>
+          </div>
+          <button id="chatPanelClose" type="button" class="chat-panel-close" aria-label="Minimize chat">x</button>
+        </header>
+        <div id="chatPanelPresence" class="chat-presence" title="Users viewing this VM"></div>
+        <ol id="chatMessages" class="chat-messages" aria-live="polite"></ol>
+        <form id="chatForm" class="chat-form">
+          <input id="chatInput" type="text" maxlength="2000" placeholder="Send a message" autocomplete="off" disabled />
+          <button id="chatSendBtn" type="submit" class="primary" disabled>Send</button>
+        </form>
+        <div id="chatStatus" class="chat-status" hidden></div>
+      </aside>
     </div>
 
     <!-- Right-click context menu (single global instance) -->
