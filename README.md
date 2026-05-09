@@ -22,7 +22,9 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 - **CVM support.** Discovers Controller VMs through the v4 `clustermgmt` API on Prism Central, then redirects the console request to the cluster's Prism Element using the legacy VNC proxy when v4 console-token is unavailable.
 - **Per-PE credentials, server-side only.** Prism Central credentials don't authenticate to Prism Element by default. NRCC prompts once per PE, validates with a real probe, and caches the credentials **in the NRCC server process's memory only** — keyed to an `HttpOnly` session cookie. They are never written to browser `localStorage`, never persisted to disk, and disappear when the NRCC server restarts (or after 8 hours of inactivity).
 - **Pure HTTP/WebSocket.** No agent on the cluster, no plug-in, no special browser extensions. Self-signed TLS toggle for lab environments.
-- **Per-VM screenshots.** A teal **Screenshot** button captures the active console as a PNG and saves it server-side under `screenshots/<vm-uuid>/<ISO-timestamp>.png`. A **Browse...** button opens a thumbnail grid of every saved screenshot for the active VM with download / delete / refresh actions. Per-VM retention (default 100, configurable via `NRCC_SCREENSHOT_MAX_PER_VM`) prunes the oldest captures automatically.
+- **Per-VM screenshots.** A teal **Screenshot** button captures the active console as a PNG and saves it server-side under `screenshots/<vm-uuid>/[<subfolder>/]<ISO-timestamp>.png`. A **Browse...** button opens a thumbnail grid of every saved screenshot for the active VM with breadcrumb folder navigation, **+ Folder** to organize, per-tile open / download / delete actions, and a viewer modal with a single-line **caption editor** that travels with the file as a `<file>.png.json` sidecar. Per-VM retention (default 100, configurable via `NRCC_SCREENSHOT_MAX_PER_VM`) prunes the oldest captures across the whole tree.
+- **Per-VM session recording.** A red **Record** button captures the active console as a WebM video (10 fps, VP9 with VP8 fallback) at ~600 kbps. Recording is per-tab, so you can record several VMs in parallel. The button shows a pulsing dot + `mm:ss` elapsed timer; the active console tab gets a matching dot. **Recordings...** opens a per-VM library with the same folder navigator and caption support as screenshots; click a tile to play back via `<video>` (Range-streamed) or download. Defaults are tunable via `NRCC_RECORDING_FPS`, `NRCC_RECORDING_BITRATE`, `NRCC_RECORDING_MAX_BYTES` (500 MB per file), `NRCC_RECORDING_MAX_PER_VM` (50).
+- **Global script library.** A round green launcher in the bottom-right corner opens a shared library of plain-text snippets. Organize them into subfolders, **left-click** any script to copy its body to the clipboard (with a legacy `execCommand` fallback for non-secure-context HTTP), **right-click** for **Edit / Rename / Move / Delete**. Per-script size cap defaults to 256 KB (`NRCC_SCRIPT_MAX_BYTES`). Available in both single- and multi-user mode.
 - **Multi-user deployment (opt-in).** Set `NRCC_MULTI_USER=true` to flip NRCC into a shared HTTPS deployment with a per-VM real-time chat panel and presence list (in-memory ring buffer of the last `NRCC_CHAT_BUFFER` messages per VM, default 200). A self-signed cert is auto-generated into `./certs/` on first start, with the SHA-256 fingerprint logged for pinning. See [Multi-user deployment](#multi-user-deployment) for the trust model and configuration. Default mode is unchanged single-user HTTP.
 
 ---
@@ -324,7 +326,7 @@ What changes from default:
 What does **not** change:
 
 - Single-user mode (`NRCC_MULTI_USER` unset or `false`) is byte-for-byte identical to before this drop. No HTTPS, no chat UI, no `/ws-chat` listener.
-- Screenshots are available in **both** modes (see below). They were added at the same time but are not gated on the multi-user toggle.
+- **Screenshots, recordings, and the global script library are available in both modes.** They are not gated on the multi-user toggle. The chat panel and presence list are the only multi-user-only surfaces.
 
 ### TLS
 
@@ -354,16 +356,19 @@ The badge on the chat icon counts unread messages received while the panel was m
 
 Available in both modes. Each console tab grows two action-bar buttons:
 
-- **Screenshot** — captures the noVNC `<canvas>` of the active console as a PNG and `POST`s it to `/api/screenshots/:vmUuid`. The server saves it as `<NRCC_SCREENSHOTS_DIR>/<uuid>/<ISO-timestamp>.png` (colons in the timestamp replaced with `-` for FS portability). After every save the per-VM folder is pruned to the newest `NRCC_SCREENSHOT_MAX_PER_VM` files (default 100). The status bar reports the saved filename and the prune count.
-- **Browse...** — opens a thumbnail-grid modal listing every saved screenshot for the active VM, newest first. Each tile shows timestamp + size and has Download / Delete actions. A Refresh button re-lists the folder.
+- **Screenshot** — captures the noVNC `<canvas>` of the active console as a PNG and `POST`s it to `/api/screenshots/:vmUuid` (with an optional `?folder=` selecting a subfolder you previously created via the browser). The server saves it as `<NRCC_SCREENSHOTS_DIR>/<uuid>/[<subfolder>/]<ISO-timestamp>.png` (colons replaced with `-` for FS portability). After every save the per-VM tree is pruned to the newest `NRCC_SCREENSHOT_MAX_PER_VM` files (default 100). The status bar reports the saved filename, target folder, and prune count.
+- **Browse...** — opens a thumbnail-grid modal listing every saved screenshot for the active VM, newest first. Breadcrumbs at the top let you walk in and out of subfolders, **+ Folder** creates a new one, and each tile shows timestamp + size + caption with Open / Download / Delete actions. The Open viewer renders the full image alongside a single-line **caption editor** that's stored as a `<file>.png.json` sidecar next to the image. A Refresh button re-lists the current folder.
 
-Layout on disk:
+Layout on disk (folders + caption sidecars are optional):
 
 ```text
 screenshots/
   d1e0f4a8-1234-4abc-89de-0123456789ab/
     2026-05-08T20-14-03.512Z.png
-    2026-05-08T20-15-22.001Z.png
+    2026-05-08T20-14-03.512Z.png.json    # { "caption": "BIOS POST hung", "author": "admin", "tsMs": ... }
+    boot-failures/
+      2026-05-08T20-15-22.001Z.png
+      2026-05-08T20-15-22.001Z.png.json
   e2f1g5b9-2345-4bcd-90ef-1234567890bc/
     ...
 ```
@@ -372,9 +377,43 @@ Hard limits enforced server-side:
 
 - Encoded payload capped at 10 MB (~7 MB of decoded PNG); larger captures are rejected with HTTP 413.
 - The PNG magic bytes are checked; non-PNG payloads are rejected with HTTP 400.
-- The UUID and filename in every endpoint path are validated against strict regexes (`^[0-9a-f-]{36}$` and `^[\w.-]+\.png$`), so a malicious path component can't escape the per-VM directory.
+- The UUID, folder path segments, and filename in every endpoint path are validated against strict regexes (`^[0-9a-f-]{36}$`, `^[\w.\- ]{1,64}$` per segment with a max depth of 8, and `^[\w.-]+\.png$`), so a malicious path component can't escape the per-VM directory.
 
 The `express.json()` body limit is bumped to `12mb` to accommodate full-resolution console captures.
+
+### Per-VM session recordings
+
+Available in both modes. The recording controls live next to the screenshot pair:
+
+- **Record** — toggles capture on the active console. The first click pulls a `MediaStream` from `canvas.captureStream(NRCC_RECORDING_FPS)`, picks the best supported WebM codec (VP9, falling back to VP8), then `POST`s `/api/recordings/:vmUuid/start` to allocate a server-side temp file. `MediaRecorder` then emits 2-second `Blob` chunks, each of which is uploaded to `/api/recordings/:vmUuid/chunk?recordingId=...` as a raw `application/octet-stream`. While recording, the button shows a pulsing dot + `mm:ss` elapsed; the active console tab gets the same dot in its title. Click **Stop** (or close the tab) to finalize: the server validates the EBML magic, renames the temp file into `<NRCC_RECORDINGS_DIR>/<uuid>/[<subfolder>/]<ISO-timestamp>.webm`, writes a meta sidecar with duration / fps / dimensions, and prunes oldest beyond `NRCC_RECORDING_MAX_PER_VM`.
+- **Recordings...** — opens a per-VM library mirroring the screenshot browser (folder navigator, breadcrumbs, **+ Folder**, captions, refresh). Each tile shows timestamp + duration + size; Play opens a viewer with a Range-streamed `<video controls>` so seeking is responsive even on long recordings. Caption + Delete behave the same as screenshots.
+
+Per-recording cap is `NRCC_RECORDING_MAX_BYTES` (default 500 MB); abandoned in-flight uploads in `<NRCC_RECORDINGS_DIR>/_tmp/` older than 1 hour are swept by the periodic cleanup. WebM/VP9 plays natively in Chromium and Firefox; Safari users may need to download the `.webm` and play it in VLC.
+
+### Annotations
+
+Both screenshots and recordings carry a single text caption stored as a sidecar JSON (`<file>.png.json` / `<file>.webm.json`). Captions are written via the viewer modal (Open or Play) and are returned in the list payload, so the browser shows them on each tile. Captions are capped at 2 KB and stamped with the author username from the current NRCC session. Deleting an asset also deletes its sidecar.
+
+### Global script library
+
+A round green launcher (bottom-right; slides left of the chat launcher when chat is also enabled) opens a shared library of plain-text snippets:
+
+- **Left-click** a script tile -> the body is copied to the OS clipboard via `navigator.clipboard.writeText`. On non-secure-context HTTP (single-user mode without TLS) the code falls back to a hidden `<textarea>` + `document.execCommand("copy")` so it works there too.
+- **Right-click** a script tile -> `Copy to clipboard`, `Edit`, `Rename`, `Move to root`, `Delete`. Right-click a folder for `Open`, `Rename`, `Delete (must be empty)`.
+- **+ Folder** / **+ Script** buttons in the toolbar. The editor modal takes a label (which becomes the file slug), an optional language hint, an optional one-line description, and the body in a monospaced textarea. The `Save` button enforces the `NRCC_SCRIPT_MAX_BYTES` cap client- and server-side.
+
+Layout on disk:
+
+```text
+scripts/
+  restart-nginx.txt
+  restart-nginx.json     # { "label": "restart-nginx", "language": "bash", "description": "...", "author": "admin", "tsMs": ... }
+  windows/
+    sysprep-quick.txt
+    sysprep-quick.json
+```
+
+The library is **global**: every signed-in user can read, edit, rename, and delete every script. There is no per-user namespacing or role gating — this matches NRCC's existing trust model. If you need stricter access, deploy NRCC behind an SSO/OIDC proxy and gate the `/api/scripts*` paths there.
 
 ---
 
@@ -397,11 +436,21 @@ The `express.json()` body limit is bumped to `12mb` to accommodate full-resoluti
 | List cached PE hosts (NRCC)      | `GET /api/pe-creds` — returns `{ peHosts: [...] }`, no creds                |
 | Forget cached PE creds (NRCC)    | `DELETE /api/pe-creds` (all) or `DELETE /api/pe-creds/:peHost` (one)        |
 | Server-side logout (NRCC)        | `POST /api/logout` — clears cached PE creds + the chat identity stash       |
-| Deployment mode probe (NRCC)     | `GET /api/config` — returns `{multiUser, chatBufferSize, screenshotMaxPerVm, currentUser}` |
-| Save screenshot (NRCC)           | `POST /api/screenshots/:vmUuid` — body `{pngBase64}`                        |
-| List screenshots (NRCC)          | `GET /api/screenshots/:vmUuid` — newest first                               |
-| Fetch screenshot (NRCC)          | `GET /api/screenshots/:vmUuid/:filename` — `image/png`                      |
-| Delete screenshot (NRCC)         | `DELETE /api/screenshots/:vmUuid/:filename`                                 |
+| Deployment mode probe (NRCC)     | `GET /api/config` — returns `{multiUser, chatBufferSize, screenshotMaxPerVm, recording, scripts, currentUser}` |
+| Save screenshot (NRCC)           | `POST /api/screenshots/:vmUuid?folder=<rel>` — body `{pngBase64, caption?}` |
+| List screenshots (NRCC)          | `GET /api/screenshots/:vmUuid?folder=<rel>` — `{folders, items[]}`, newest first |
+| Fetch screenshot (NRCC)          | `GET /api/screenshots/:vmUuid/:filename?folder=<rel>` — `image/png`         |
+| Delete screenshot (NRCC)         | `DELETE /api/screenshots/:vmUuid/:filename?folder=<rel>`                    |
+| Screenshot folder ops (NRCC)     | `POST` / `DELETE /api/screenshots/:vmUuid/folders` body `{path}`; `POST /api/screenshots/:vmUuid/move` body `{fromFolder, toFolder, fromName, toName}` |
+| Set screenshot caption (NRCC)    | `PUT /api/screenshots/:vmUuid/meta` body `{folder, filename, caption}`      |
+| Recording lifecycle (NRCC)       | `POST /api/recordings/:vmUuid/start` -> `{recordingId}`; `POST /api/recordings/:vmUuid/chunk?recordingId=...` (raw octet-stream); `POST /api/recordings/:vmUuid/finish` body `{recordingId, durationMs}`; `POST /api/recordings/:vmUuid/abort` body `{recordingId}` |
+| List recordings (NRCC)           | `GET /api/recordings/:vmUuid?folder=<rel>` — `{folders, items[]}`           |
+| Stream recording (NRCC)          | `GET /api/recordings/:vmUuid/file?folder=<rel>&filename=...` — `video/webm`, Range-aware |
+| Delete recording (NRCC)          | `DELETE /api/recordings/:vmUuid/file?folder=<rel>&filename=...`             |
+| Recording folder ops (NRCC)      | `POST` / `DELETE /api/recordings/:vmUuid/folders`; `POST /api/recordings/:vmUuid/move`; `PUT /api/recordings/:vmUuid/meta` |
+| Script library (NRCC)            | `GET /api/scripts?folder=<rel>` -> `{folders, items[]}`; `GET /api/scripts/file?folder=<rel>&filename=...` -> `{body, label, ...}` |
+| Script CRUD (NRCC)               | `POST /api/scripts` body `{folder, label, body, language?, description?}`; `PUT /api/scripts/file` body `{folder, filename, label?, body?, ...}`; `DELETE /api/scripts/file?folder=<rel>&filename=...` |
+| Script folder ops (NRCC)         | `POST` / `DELETE /api/scripts/folders` body `{path}`; `POST /api/scripts/move` body `{fromFolder, toFolder, fromName, toName}` |
 | Multi-user chat (NRCC)           | `WS(S) /ws-chat` — protocol: `join`/`msg`/`ping`/`leave` (multi-user mode only) |
 
 All requests carry per-call `NTNX-Request-Id` / `X-Request-Id` headers (UUIDv4) — required by Nutanix v4 APIs.

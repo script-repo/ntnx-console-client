@@ -11,8 +11,6 @@ const loginPcHostInput = document.getElementById("loginPcHost");
 const loginUsernameInput = document.getElementById("loginUsername");
 const loginPasswordInput = document.getElementById("loginPassword");
 const loginRememberInput = document.getElementById("loginRemember");
-const loginAllowTlsInput = document.getElementById("loginAllowTls");
-const loginIncludeHiddenInput = document.getElementById("loginIncludeHidden");
 const loginSubmitBtn = document.getElementById("loginSubmit");
 const loginErrorEl = document.getElementById("loginError");
 
@@ -41,12 +39,36 @@ const pasteKeymapSelect = document.getElementById("pasteKeymap");
 const screenshotBtn = document.getElementById("screenshotBtn");
 const screenshotBrowseBtn = document.getElementById("screenshotBrowseBtn");
 const screenshotBrowseModal = document.getElementById("screenshotBrowseModal");
-const screenshotBrowseGrid = document.getElementById("screenshotBrowseGrid");
-const screenshotBrowseEmpty = document.getElementById("screenshotBrowseEmpty");
 const screenshotBrowseTitle = document.getElementById("screenshotBrowseTitle");
-const screenshotBrowseCount = document.getElementById("screenshotBrowseCount");
-const screenshotBrowseRefresh = document.getElementById("screenshotBrowseRefresh");
-const screenshotBrowseCloseBtn = document.getElementById("screenshotBrowseClose");
+
+const recordBtn = document.getElementById("recordBtn");
+const recordBtnTimer = document.getElementById("recordBtnTimer");
+const recordBrowseBtn = document.getElementById("recordBrowseBtn");
+const recordingBrowseModal = document.getElementById("recordingBrowseModal");
+const recordingBrowseTitle = document.getElementById("recordingBrowseTitle");
+
+const scriptLauncher = document.getElementById("scriptLauncher");
+const scriptLibraryModal = document.getElementById("scriptLibraryModal");
+const scriptFolderPane = document.getElementById("scriptFolderPane");
+const scriptGrid = document.getElementById("scriptGrid");
+const scriptEmpty = document.getElementById("scriptEmpty");
+const scriptCount = document.getElementById("scriptCount");
+const scriptBreadcrumbs = document.getElementById("scriptBreadcrumbs");
+const scriptCloseBtn = document.getElementById("scriptCloseBtn");
+const scriptRefreshBtn = document.getElementById("scriptRefreshBtn");
+const scriptNewFolderBtn = document.getElementById("scriptNewFolderBtn");
+const scriptNewBtn = document.getElementById("scriptNewBtn");
+const scriptEditorModal = document.getElementById("scriptEditorModal");
+const scriptEditorTitle = document.getElementById("scriptEditorTitle");
+const scriptEditorLabel = document.getElementById("scriptEditorLabel");
+const scriptEditorLanguage = document.getElementById("scriptEditorLanguage");
+const scriptEditorDescription = document.getElementById("scriptEditorDescription");
+const scriptEditorBody = document.getElementById("scriptEditorBody");
+const scriptEditorError = document.getElementById("scriptEditorError");
+const scriptEditorCancel = document.getElementById("scriptEditorCancel");
+const scriptEditorSave = document.getElementById("scriptEditorSave");
+
+const toastEl = document.getElementById("toast");
 
 const chatRoot = document.getElementById("chatRoot");
 const chatLauncher = document.getElementById("chatLauncher");
@@ -972,8 +994,11 @@ async function login(event) {
   loginSubmitBtn.disabled = true;
   loginSubmitBtn.textContent = "Signing in...";
   try {
-    const tlsSkipVerify = loginAllowTlsInput.checked;
-    const includeHiddenVms = loginIncludeHiddenInput.checked;
+    // Self-signed TLS and hidden / system VMs are always allowed; the
+    // corresponding login-form checkboxes were removed because every
+    // real-world deployment relied on both being on.
+    const tlsSkipVerify = true;
+    const includeHiddenVms = true;
     // Fast credential probe (~1-2 s) instead of the full VM list, so
     // the user gets into the app shell quickly. The actual VM list is
     // fetched in the background once the app is visible.
@@ -1150,6 +1175,11 @@ function updateConsoleControls() {
   pasteKeymapSelect.disabled = !has;
   screenshotBtn.disabled = !has;
   screenshotBrowseBtn.disabled = !has;
+  recordBtn.disabled = !has;
+  recordBrowseBtn.disabled = !has;
+  // Recording UI state follows the active session (each tab can be
+  // recording independently of the others).
+  refreshRecordButtonForActiveSession();
   // Sync the keymap select to whatever the active tab is using, so
   // users can see at a glance which layout will be applied if they
   // hit Paste right now.
@@ -1880,6 +1910,14 @@ function closeSession(sessionId) {
   const idx = consoleSessions.findIndex((item) => item.id === sessionId);
   if (idx < 0) return;
   const s = consoleSessions[idx];
+  // Finalize an in-flight recording for this session before tearing
+  // down the canvas underneath it. We don't await -- the upload runs
+  // in the background and the modal will pick up the saved file on
+  // next refresh.
+  if (s.recording) {
+    try { stopRecordingForSession(s, { reason: "session-closed" }); }
+    catch (_e) { /* best-effort */ }
+  }
   try {
     s.rfb.disconnect();
   } catch (_error) {
@@ -1985,25 +2023,39 @@ async function openConsoleFor(vmUuid, opts = {}) {
     });
     let data = await resp.json();
 
-    if (!resp.ok && snap.peHost && (data?.needPeCredentials || resp.status === 401)) {
-      await dropPeCreds(snap.peHost);
-      if (quiet) {
-        throw new Error(`PE credentials for ${snap.peHost} are no longer valid.`);
+    // PE-fallback handling. Two flavors:
+    //   1) CVMs - snap.peHost is set up-front when the VM list is built.
+    //   2) Regular AHV VMs on a PC build that doesn't ship the v4
+    //      generate-console-token action. The server resolves the PE
+    //      external IP for us and returns it in `data.peHost` along with
+    //      `needPeCredentials: true`. We adopt that peHost into tokenBody
+    //      and retry through the same prompt-and-resubmit flow as CVMs.
+    if (!resp.ok && (data?.needPeCredentials || resp.status === 401)) {
+      const peHostForPrompt = snap.peHost || data?.peHost || "";
+      if (peHostForPrompt) {
+        if (!snap.peHost && data?.peHost) {
+          snap.peHost = data.peHost;
+          tokenBody.peHost = data.peHost;
+        }
+        await dropPeCreds(peHostForPrompt);
+        if (quiet) {
+          throw new Error(`PE credentials for ${peHostForPrompt} are no longer valid.`);
+        }
+        setStatus(`PE credentials needed for ${peHostForPrompt}.`);
+        const ok = await promptForPeCreds(peHostForPrompt);
+        if (!ok) {
+          setStatus("Cancelled. PE credentials are required for this VM.");
+          return;
+        }
+        setStatus(`Retrying console token via PE ${peHostForPrompt}...`, { spinner: true });
+        resp = await fetch("/api/console-token", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(tokenBody)
+        });
+        data = await resp.json();
       }
-      setStatus(`PE credentials needed for ${snap.peHost}.`);
-      const ok = await promptForPeCreds(snap.peHost);
-      if (!ok) {
-        setStatus("Cancelled. PE credentials are required for this CVM.");
-        return;
-      }
-      setStatus(`Retrying console token via PE ${snap.peHost}...`, { spinner: true });
-      resp = await fetch("/api/console-token", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(tokenBody)
-      });
-      data = await resp.json();
     }
 
     if (!resp.ok) {
@@ -2335,6 +2387,19 @@ window.addEventListener("beforeunload", () => {
       /* ignore */
     }
   }
+  // Best-effort abort of any in-flight recordings so the server can
+  // sweep the temp file rather than waiting for the 1h orphan timer.
+  for (const s of consoleSessions) {
+    if (!s.recording) continue;
+    try {
+      const url = `/api/recordings/${encodeURIComponent(s.vmUuid)}/abort`;
+      const blob = new Blob(
+        [JSON.stringify({ recordingId: s.recording.recordingId })],
+        { type: "application/json" }
+      );
+      navigator.sendBeacon(url, blob);
+    } catch (_e) { /* ignore */ }
+  }
 });
 
 // =====================================================================
@@ -2459,6 +2524,8 @@ const appConfig = {
   multiUser: false,
   chatBufferSize: 200,
   screenshotMaxPerVm: 100,
+  recording: { fps: 10, bitrate: 600_000, maxBytes: 524_288_000, maxPerVm: 50 },
+  scripts: { maxBytes: 262_144 },
   currentUser: null
 };
 
@@ -2470,9 +2537,16 @@ async function loadAppConfig() {
     appConfig.multiUser = Boolean(data.multiUser);
     appConfig.chatBufferSize = Number(data.chatBufferSize) || appConfig.chatBufferSize;
     appConfig.screenshotMaxPerVm = Number(data.screenshotMaxPerVm) || appConfig.screenshotMaxPerVm;
+    if (data.recording && typeof data.recording === "object") {
+      appConfig.recording = { ...appConfig.recording, ...data.recording };
+    }
+    if (data.scripts && typeof data.scripts === "object") {
+      appConfig.scripts = { ...appConfig.scripts, ...data.scripts };
+    }
     appConfig.currentUser = data.currentUser || null;
     if (appConfig.multiUser) {
       chatRoot.hidden = false;
+      document.body.classList.add("has-chat");
     }
   } catch (_e) {
     /* probe failures are non-fatal; the app behaves as single-user */
@@ -2528,23 +2602,41 @@ async function captureActiveScreenshot() {
     setStatus(`Capture failed: ${err.message || err}`);
     return;
   }
+  // Drop new screenshots into whatever subfolder the user was last
+  // browsing for this VM, so capture-then-browse stays in the same
+  // mental folder. Falls back to root when the browser is closed.
+  const active = screenshotLibrary.getActive();
+  const folder = (active && active.vmUuid === session.vmUuid)
+    ? (active.folder || "")
+    : "";
+  const folderQuery = folder ? `?folder=${encodeURIComponent(folder)}` : "";
   try {
-    const resp = await fetch(`/api/screenshots/${encodeURIComponent(session.vmUuid)}`, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pngBase64, width: canvas.width, height: canvas.height })
-    });
+    const resp = await fetch(
+      `/api/screenshots/${encodeURIComponent(session.vmUuid)}${folderQuery}`,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pngBase64, width: canvas.width, height: canvas.height })
+      }
+    );
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setStatus(`Save failed: ${data.error || resp.statusText}`);
       return;
     }
     let msg = `Screenshot saved: ${data.filename}`;
+    if (folder) msg += ` (folder: ${folder})`;
     if (data.prunedCount > 0) {
       msg += ` (pruned ${data.prunedCount} older screenshot${data.prunedCount === 1 ? "" : "s"})`;
     }
     setStatus(msg);
+    // Refresh the modal in place so the user sees the new tile
+    // appear without needing to hit Refresh manually.
+    const activeAfter = screenshotLibrary.getActive();
+    if (activeAfter && activeAfter.vmUuid === session.vmUuid) {
+      screenshotLibrary.refresh();
+    }
   } catch (err) {
     setStatus(`Save failed: ${err.message || err}`);
   }
@@ -2564,52 +2656,1110 @@ function fmtTimestamp(tsMs) {
   return d.toLocaleString();
 }
 
-async function refreshScreenshotBrowser(vmUuid, vmName) {
-  screenshotBrowseGrid.innerHTML = "";
-  screenshotBrowseEmpty.hidden = true;
-  screenshotBrowseCount.textContent = "Loading...";
-  let items = [];
-  try {
-    const resp = await fetch(`/api/screenshots/${encodeURIComponent(vmUuid)}`, {
-      credentials: "same-origin"
+// =====================================================================
+// Toast (transient confirmation messages, e.g. "Copied to clipboard")
+// =====================================================================
+let toastTimer = null;
+function showToast(message, opts = {}) {
+  toastEl.textContent = String(message || "");
+  toastEl.classList.add("show");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toastEl.classList.remove("show");
+    toastTimer = null;
+  }, opts.durationMs || 2200);
+}
+
+// =====================================================================
+// Folder navigator (shared helpers used by screenshots + recordings)
+// =====================================================================
+function renderBreadcrumbs(container, folder, onNavigate) {
+  container.innerHTML = "";
+  const crumbs = [{ name: "Root", path: "" }];
+  if (folder) {
+    const parts = folder.split("/");
+    let acc = "";
+    for (const seg of parts) {
+      acc = acc ? `${acc}/${seg}` : seg;
+      crumbs.push({ name: seg, path: acc });
+    }
+  }
+  crumbs.forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "browse-breadcrumb-sep";
+      sep.textContent = "/";
+      container.appendChild(sep);
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "browse-breadcrumb" + (i === crumbs.length - 1 ? " current" : "");
+    btn.textContent = c.name;
+    if (i < crumbs.length - 1) {
+      btn.addEventListener("click", () => onNavigate(c.path));
+    }
+    container.appendChild(btn);
+  });
+}
+
+function joinFolder(parent, child) {
+  if (!parent) return child;
+  if (!child) return parent;
+  return `${parent}/${child}`;
+}
+
+function parentFolder(folder) {
+  if (!folder) return "";
+  const idx = folder.lastIndexOf("/");
+  return idx < 0 ? "" : folder.slice(0, idx);
+}
+
+function isValidFolderName(name) {
+  return /^[\w.\- ]{1,64}$/.test(String(name || ""));
+}
+
+// =====================================================================
+// Finder-style asset library browser. Shared by screenshots and
+// recordings; the only differences are the API base URL, the per-item
+// URL builders, and whether the preview pane shows an <img> or <video>.
+// Drag a tile in the middle list pane onto a folder row in the left
+// tree pane to move the file (the server's assetMove route handles the
+// rename + sidecar move). Right-click a folder row for rename/delete.
+// =====================================================================
+function cssEscapeAttr(s) {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(s);
+  return String(s).replace(/[^a-zA-Z0-9_\-]/g, (c) => "\\" + c);
+}
+
+// Toggles a body class while any .lib-modal (screenshot or recording
+// library) is on screen so the bottom-right floating launchers (chat +
+// script library) can hide themselves and stop covering the preview
+// pane's Download / Delete buttons.
+function syncLibraryBodyClass() {
+  const anyOpen = document.querySelector(".modal-backdrop.open .lib-modal") !== null;
+  document.body.classList.toggle("lib-modal-open", anyOpen);
+}
+
+function createLibraryBrowser(opts) {
+  // opts:
+  //   kind, apiBase, modal, titleEl, labelTitle, labelSingular, media,
+  //   maxPerVm()  -> number, fileUrl(vmUuid, item, folder)  -> URL,
+  //   downloadUrl(vmUuid, item, folder), deleteUrl(vmUuid, item, folder)
+  const refs = {
+    tree: opts.modal.querySelector("[data-lib-tree]"),
+    list: opts.modal.querySelector("[data-lib-list]"),
+    listPath: opts.modal.querySelector("[data-lib-list-path]"),
+    listCount: opts.modal.querySelector("[data-lib-list-count]"),
+    listEmpty: opts.modal.querySelector("[data-lib-list-empty]"),
+    previewName: opts.modal.querySelector("[data-lib-preview-name]"),
+    previewEmpty: opts.modal.querySelector("[data-lib-preview-empty]"),
+    previewContent: opts.modal.querySelector("[data-lib-preview-content]"),
+    previewStage: opts.modal.querySelector("[data-lib-preview-stage]"),
+    previewMeta: opts.modal.querySelector("[data-lib-preview-meta]"),
+    previewCaption: opts.modal.querySelector("[data-lib-preview-caption]"),
+    previewCaptionSave: opts.modal.querySelector("[data-lib-preview-caption-save]"),
+    previewCaptionFlash: opts.modal.querySelector("[data-lib-preview-caption-flash]"),
+    previewDownload: opts.modal.querySelector("[data-lib-preview-download]"),
+    previewDelete: opts.modal.querySelector("[data-lib-preview-delete]"),
+    refresh: opts.modal.querySelector("[data-lib-refresh]"),
+    close: opts.modal.querySelector("[data-lib-close]"),
+    newFolder: opts.modal.querySelector("[data-lib-new-folder]")
+  };
+
+  let vmUuid = null;
+  let vmName = null;
+  let treeRoot = null;             // { name: "", children, fileCount }
+  let expanded = new Set([""]);    // folder paths that are expanded ("" = root)
+  let selectedFolder = "";
+  let items = [];                  // items in selectedFolder
+  let selectedFilename = null;
+  let selectedItem = null;
+
+  function isOpen() { return opts.modal.classList.contains("open"); }
+
+  function show() { opts.modal.classList.add("open"); syncLibraryBodyClass(); }
+  function hide() { opts.modal.classList.remove("open"); syncLibraryBodyClass(); }
+
+  function open(uuid, name) {
+    vmUuid = uuid;
+    vmName = name;
+    expanded = new Set([""]);
+    selectedFolder = "";
+    selectedFilename = null;
+    selectedItem = null;
+    if (opts.titleEl) opts.titleEl.textContent = `${opts.labelTitle} - ${name}`;
+    show();
+    clearPreview();
+    refreshAll();
+  }
+
+  function close() {
+    hide();
+    vmUuid = null;
+    vmName = null;
+    treeRoot = null;
+    items = [];
+    selectedFolder = "";
+    selectedFilename = null;
+    selectedItem = null;
+    refs.tree.innerHTML = "";
+    refs.list.innerHTML = "";
+    clearPreview();
+  }
+
+  async function refreshAll() {
+    await refreshTree();
+    await refreshList();
+  }
+
+  async function refreshTree() {
+    if (!vmUuid) return;
+    refs.tree.innerHTML = '<div class="lib-tree-row root"><span class="lib-tree-toggle placeholder"></span><span class="lib-tree-icon">.</span><span class="lib-tree-name">Loading...</span></div>';
+    try {
+      const resp = await fetch(`${opts.apiBase}/${encodeURIComponent(vmUuid)}/tree`, { credentials: "same-origin" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        refs.tree.innerHTML = `<div class="lib-tree-row"><span class="lib-tree-name">Error: ${escapeHtml(data.error || resp.statusText)}</span></div>`;
+        return;
+      }
+      treeRoot = data.tree || { name: "", children: [], fileCount: 0 };
+      renderTree();
+    } catch (err) {
+      refs.tree.innerHTML = `<div class="lib-tree-row"><span class="lib-tree-name">Error: ${escapeHtml(err.message || err)}</span></div>`;
+    }
+  }
+
+  function renderTree() {
+    refs.tree.innerHTML = "";
+    if (!treeRoot) return;
+    const frag = document.createDocumentFragment();
+    appendTreeRow(frag, treeRoot, "", 0, true);
+    refs.tree.appendChild(frag);
+  }
+
+  function appendTreeRow(parentEl, node, parentPath, depth, isRoot) {
+    const path = isRoot ? "" : (parentPath ? `${parentPath}/${node.name}` : node.name);
+    const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+    const isExpanded = expanded.has(path);
+    const isSelected = path === selectedFolder;
+
+    const row = document.createElement("div");
+    row.className = "lib-tree-row" + (isSelected ? " selected" : "") + (isRoot ? " root" : "");
+    row.style.paddingLeft = `${4 + depth * 14}px`;
+    row.dataset.folder = path;
+    row.innerHTML = `
+      <span class="lib-tree-toggle${hasChildren ? "" : " placeholder"}" title="${hasChildren ? (isExpanded ? "Collapse" : "Expand") : ""}">${hasChildren ? (isExpanded ? "&#9660;" : "&#9654;") : "&#9654;"}</span>
+      <span class="lib-tree-icon" aria-hidden="true">${isRoot ? "&#x1F5C2;" : (isExpanded ? "&#x1F4C2;" : "&#x1F4C1;")}</span>
+      <span class="lib-tree-name">${escapeHtml(isRoot ? "Root" : node.name)}</span>
+      ${node.fileCount > 0 ? `<span class="lib-tree-count">${node.fileCount}</span>` : ""}
+    `;
+
+    row.querySelector(".lib-tree-toggle").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (!hasChildren) return;
+      if (isExpanded) expanded.delete(path);
+      else expanded.add(path);
+      renderTree();
     });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      screenshotBrowseCount.textContent = `Error: ${data.error || resp.statusText}`;
+
+    row.addEventListener("click", () => {
+      if (hasChildren && !expanded.has(path)) expanded.add(path);
+      selectFolder(path);
+    });
+
+    if (!isRoot) {
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        showFolderContextMenu(ev, path, node.name);
+      });
+    }
+
+    row.addEventListener("dragover", (ev) => {
+      const dt = ev.dataTransfer;
+      if (!dt) return;
+      if (![...dt.types].includes("application/x-nrcc-asset")) return;
+      ev.preventDefault();
+      dt.dropEffect = "move";
+      row.classList.add("drop-target");
+    });
+    row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
+    row.addEventListener("drop", (ev) => {
+      row.classList.remove("drop-target");
+      const dt = ev.dataTransfer;
+      if (!dt) return;
+      const payload = dt.getData("application/x-nrcc-asset");
+      if (!payload) return;
+      ev.preventDefault();
+      try {
+        const data = JSON.parse(payload);
+        if (data.kind !== opts.kind || data.vmUuid !== vmUuid) return;
+        if (data.folder === path) return;
+        moveFile(data.folder, data.filename, path);
+      } catch (_e) { /* ignore */ }
+    });
+
+    parentEl.appendChild(row);
+
+    if (hasChildren && isExpanded) {
+      for (const child of node.children) {
+        appendTreeRow(parentEl, child, path, depth + 1, false);
+      }
+    }
+  }
+
+  function selectFolder(path) {
+    selectedFolder = path;
+    selectedFilename = null;
+    selectedItem = null;
+    clearPreview();
+    renderTree();
+    refreshList();
+  }
+
+  async function refreshList() {
+    if (!vmUuid) return;
+    refs.listEmpty.hidden = true;
+    refs.list.innerHTML = "";
+    refs.listPath.textContent = selectedFolder ? `/${selectedFolder}` : "Root";
+    refs.listCount.textContent = "Loading...";
+    const url = `${opts.apiBase}/${encodeURIComponent(vmUuid)}${selectedFolder ? `?folder=${encodeURIComponent(selectedFolder)}` : ""}`;
+    try {
+      const resp = await fetch(url, { credentials: "same-origin" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        refs.listCount.textContent = `Error: ${data.error || resp.statusText}`;
+        return;
+      }
+      items = Array.isArray(data.items) ? data.items : [];
+    } catch (err) {
+      refs.listCount.textContent = `Error: ${err.message || err}`;
       return;
     }
-    items = Array.isArray(data.items) ? data.items : [];
-  } catch (err) {
-    screenshotBrowseCount.textContent = `Error: ${err.message || err}`;
-    return;
+    const cap = (typeof opts.maxPerVm === "function" && opts.maxPerVm()) ? ` (max ${opts.maxPerVm()} kept per VM)` : "";
+    refs.listCount.textContent = items.length === 0
+      ? "Empty"
+      : `${items.length} ${opts.labelSingular}${items.length === 1 ? "" : "s"}${cap}`;
+    if (items.length === 0) {
+      refs.listEmpty.hidden = false;
+    } else {
+      for (const item of items) refs.list.appendChild(buildListTile(item));
+    }
+    if (selectedFilename) {
+      const restored = items.find((it) => it.filename === selectedFilename);
+      if (restored) selectItem(restored);
+      else { selectedFilename = null; selectedItem = null; clearPreview(); }
+    }
   }
-  if (items.length === 0) {
-    screenshotBrowseEmpty.hidden = false;
-    screenshotBrowseCount.textContent = "";
-    return;
-  }
-  screenshotBrowseCount.textContent = `${items.length} screenshot${items.length === 1 ? "" : "s"} (max ${appConfig.screenshotMaxPerVm} kept per VM)`;
-  for (const item of items) {
-    const url = `/api/screenshots/${encodeURIComponent(vmUuid)}/${encodeURIComponent(item.filename)}`;
+
+  function buildListTile(item) {
     const tile = document.createElement("div");
-    tile.className = "screenshot-tile";
+    tile.className = "lib-list-tile" + (item.filename === selectedFilename ? " selected" : "");
+    tile.draggable = true;
+    tile.dataset.filename = item.filename;
+    const thumbHtml = opts.media === "image"
+      ? `<img loading="lazy" alt="" src="${opts.fileUrl(vmUuid, item, selectedFolder)}" />`
+      : `<span aria-hidden="true">&#9658;</span>`;
+    const sub = opts.media === "video"
+      ? `${escapeHtml(Number.isFinite(item.durationMs) && item.durationMs > 0 ? fmtElapsed(item.durationMs) : "--:--")} . ${escapeHtml(fmtBytes(item.sizeBytes))}`
+      : escapeHtml(fmtBytes(item.sizeBytes));
     tile.innerHTML = `
-      <a class="screenshot-tile-thumb" href="${url}" target="_blank" rel="noopener">
-        <img loading="lazy" alt="" src="${url}" />
-      </a>
-      <div class="screenshot-tile-meta">
-        <span title="${item.filename}">${fmtTimestamp(item.tsMs)}</span>
-        <span>${fmtBytes(item.sizeBytes)}</span>
-      </div>
-      <div class="screenshot-tile-actions">
-        <a href="${url}" download="${item.filename}">Download</a>
-        <button type="button" class="screenshot-delete" data-filename="${item.filename}">Delete</button>
+      <div class="lib-list-thumb">${thumbHtml}</div>
+      <div class="lib-list-meta">
+        <span class="lib-list-name" title="${escapeHtml(item.filename)}">${escapeHtml(fmtTimestamp(item.tsMs))}</span>
+        <span class="lib-list-sub">${sub}</span>
+        ${item.caption ? `<span class="lib-list-caption" title="${escapeHtml(item.caption)}">${escapeHtml(item.caption)}</span>` : ""}
       </div>
     `;
-    tile.querySelector(".screenshot-delete").addEventListener("click", async () => {
-      if (!confirm(`Delete ${item.filename}?`)) return;
+    tile.addEventListener("click", () => selectItem(item));
+    tile.addEventListener("dragstart", (ev) => {
+      const dt = ev.dataTransfer;
+      if (!dt) return;
+      const payload = JSON.stringify({ kind: opts.kind, vmUuid, folder: selectedFolder, filename: item.filename });
+      dt.setData("application/x-nrcc-asset", payload);
+      dt.effectAllowed = "move";
+      tile.classList.add("dragging");
+    });
+    tile.addEventListener("dragend", () => tile.classList.remove("dragging"));
+    return tile;
+  }
+
+  function selectItem(item) {
+    selectedFilename = item.filename;
+    selectedItem = item;
+    refs.list.querySelectorAll(".lib-list-tile").forEach((t) => {
+      t.classList.toggle("selected", t.dataset.filename === item.filename);
+    });
+    renderPreview(item);
+  }
+
+  function renderPreview(item) {
+    refs.previewEmpty.hidden = true;
+    refs.previewContent.hidden = false;
+    refs.previewName.textContent = item.filename;
+    refs.previewStage.innerHTML = "";
+    const url = opts.fileUrl(vmUuid, item, selectedFolder);
+    if (opts.media === "image") {
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = item.filename;
+      refs.previewStage.appendChild(img);
+    } else {
+      const video = document.createElement("video");
+      video.src = url;
+      video.controls = true;
+      video.preload = "metadata";
+      refs.previewStage.appendChild(video);
+    }
+    // Append a fullscreen toggle pinned to the stage. The native <video>
+    // controls already include one, but having a dedicated button gives
+    // <img> the same affordance and works regardless of media kind.
+    const fsBtn = document.createElement("button");
+    fsBtn.type = "button";
+    fsBtn.className = "lib-preview-fullscreen";
+    fsBtn.title = "Toggle fullscreen";
+    fsBtn.setAttribute("aria-label", "Toggle fullscreen");
+    fsBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 5V2h3M9 2h3v3M12 9v3h-3M5 12H2v-3"/></svg>';
+    fsBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (document.fullscreenElement === refs.previewStage) {
+        document.exitFullscreen().catch(() => { /* ignore */ });
+      } else if (refs.previewStage.requestFullscreen) {
+        refs.previewStage.requestFullscreen().catch((e) => {
+          setStatus(`Fullscreen failed: ${e.message || e}`);
+        });
+      }
+    });
+    refs.previewStage.appendChild(fsBtn);
+    const metaParts = [];
+    metaParts.push(escapeHtml(fmtTimestamp(item.tsMs)));
+    metaParts.push(escapeHtml(fmtBytes(item.sizeBytes)));
+    if (Number.isFinite(item.durationMs) && item.durationMs > 0) {
+      metaParts.push(escapeHtml(`Duration: ${fmtElapsed(item.durationMs)}`));
+    }
+    if (item.author) metaParts.push(escapeHtml(`By: ${item.author}`));
+    if (selectedFolder) metaParts.push(escapeHtml(`Folder: ${selectedFolder}`));
+    refs.previewMeta.innerHTML = metaParts.map((p) => `<span>${p}</span>`).join("");
+    refs.previewCaption.value = item.caption || "";
+    refs.previewCaptionFlash.classList.remove("show");
+    refs.previewDownload.href = opts.downloadUrl(vmUuid, item, selectedFolder);
+    refs.previewDownload.setAttribute("download", item.filename);
+  }
+
+  function clearPreview() {
+    refs.previewEmpty.hidden = false;
+    refs.previewContent.hidden = true;
+    refs.previewName.textContent = "";
+    refs.previewStage.innerHTML = "";
+    refs.previewMeta.innerHTML = "";
+    refs.previewCaption.value = "";
+  }
+
+  async function moveFile(fromFolder, filename, toFolder) {
+    try {
+      const resp = await fetch(`${opts.apiBase}/${encodeURIComponent(vmUuid)}/move`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fromFolder, toFolder, fromName: filename })
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        setStatus(`Move failed: ${err.error || resp.statusText}`);
+        return;
+      }
+      setStatus(`Moved ${filename} to ${toFolder ? "/" + toFolder : "Root"}.`);
+      if (fromFolder === selectedFolder && filename === selectedFilename) {
+        selectedFilename = null;
+        selectedItem = null;
+        clearPreview();
+      }
+      await refreshTree();
+      await refreshList();
+    } catch (err) { setStatus(`Move failed: ${err.message || err}`); }
+  }
+
+  function showFolderContextMenu(ev, path, name) {
+    showSimpleContextMenu(ev, name, [
+      { label: "Rename...", onClick: async () => {
+        const next = prompt("Rename folder", name);
+        if (!next || next === name) return;
+        if (!isValidFolderName(next)) { setStatus("Invalid folder name."); return; }
+        const parent = parentFolder(path);
+        try {
+          const resp = await fetch(`${opts.apiBase}/${encodeURIComponent(vmUuid)}/move`, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ fromFolder: parent, toFolder: parent, fromName: name, toName: next })
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            setStatus(`Rename failed: ${err.error || resp.statusText}`);
+            return;
+          }
+          const newPath = parent ? `${parent}/${next}` : next;
+          if (expanded.has(path)) { expanded.delete(path); expanded.add(newPath); }
+          if (selectedFolder === path) selectedFolder = newPath;
+          await refreshTree();
+          await refreshList();
+        } catch (err) { setStatus(`Rename failed: ${err.message || err}`); }
+      }},
+      { label: "Delete (must be empty)", danger: true, onClick: async () => {
+        if (!confirm(`Delete folder "${name}"? It must be empty.`)) return;
+        try {
+          const resp = await fetch(`${opts.apiBase}/${encodeURIComponent(vmUuid)}/folders`, {
+            method: "DELETE",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path })
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            setStatus(`Delete failed: ${err.error || resp.statusText}`);
+            return;
+          }
+          if (selectedFolder === path) selectedFolder = parentFolder(path);
+          expanded.delete(path);
+          await refreshTree();
+          await refreshList();
+        } catch (err) { setStatus(`Delete failed: ${err.message || err}`); }
+      }}
+    ]);
+  }
+
+  // Modal-level wiring (registered once per instance)
+  refs.refresh.addEventListener("click", () => refreshAll());
+  refs.close.addEventListener("click", close);
+  opts.modal.addEventListener("click", (event) => {
+    if (event.target === opts.modal) close();
+  });
+  refs.newFolder.addEventListener("click", async () => {
+    if (!vmUuid) return;
+    const name = prompt("New subfolder name (will be created inside the selected folder)");
+    if (!name) return;
+    if (!isValidFolderName(name)) { setStatus("Invalid folder name."); return; }
+    const target = joinFolder(selectedFolder, name);
+    try {
+      const resp = await fetch(`${opts.apiBase}/${encodeURIComponent(vmUuid)}/folders`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: target })
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        setStatus(`Create failed: ${err.error || resp.statusText}`);
+        return;
+      }
+      expanded.add(selectedFolder);
+      await refreshTree();
+    } catch (err) { setStatus(`Create failed: ${err.message || err}`); }
+  });
+  refs.previewCaptionSave.addEventListener("click", async () => {
+    if (!vmUuid || !selectedItem) return;
+    try {
+      const resp = await fetch(`${opts.apiBase}/${encodeURIComponent(vmUuid)}/meta`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          folder: selectedFolder,
+          filename: selectedItem.filename,
+          caption: refs.previewCaption.value
+        })
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) { setStatus(`Save failed: ${data.error || resp.statusText}`); return; }
+      selectedItem.caption = data.caption || "";
+      const inList = items.find((it) => it.filename === selectedItem.filename);
+      if (inList) inList.caption = selectedItem.caption;
+      const tile = refs.list.querySelector(`.lib-list-tile[data-filename="${cssEscapeAttr(selectedItem.filename)}"]`);
+      if (tile) {
+        let captionEl = tile.querySelector(".lib-list-caption");
+        if (selectedItem.caption) {
+          if (!captionEl) {
+            captionEl = document.createElement("span");
+            captionEl.className = "lib-list-caption";
+            tile.querySelector(".lib-list-meta").appendChild(captionEl);
+          }
+          captionEl.textContent = selectedItem.caption;
+          captionEl.title = selectedItem.caption;
+        } else if (captionEl) {
+          captionEl.remove();
+        }
+      }
+      refs.previewCaptionFlash.classList.add("show");
+      setTimeout(() => refs.previewCaptionFlash.classList.remove("show"), 1500);
+    } catch (err) { setStatus(`Save failed: ${err.message || err}`); }
+  });
+  refs.previewDelete.addEventListener("click", async () => {
+    if (!vmUuid || !selectedItem) return;
+    if (!confirm(`Delete ${selectedItem.filename}?`)) return;
+    try {
+      const resp = await fetch(opts.deleteUrl(vmUuid, selectedItem, selectedFolder), {
+        method: "DELETE",
+        credentials: "same-origin"
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        setStatus(`Delete failed: ${err.error || resp.statusText}`);
+        return;
+      }
+      const filename = selectedItem.filename;
+      selectedFilename = null;
+      selectedItem = null;
+      clearPreview();
+      await refreshTree();
+      await refreshList();
+      setStatus(`Deleted ${filename}.`);
+    } catch (err) { setStatus(`Delete failed: ${err.message || err}`); }
+  });
+
+  return {
+    open,
+    close,
+    refresh: refreshAll,
+    isOpen,
+    getActive() { return vmUuid ? { vmUuid, vmName, folder: selectedFolder } : null; }
+  };
+}
+
+// ---- Library instances --------------------------------------------------
+const screenshotLibrary = createLibraryBrowser({
+  kind: "screenshot",
+  apiBase: "/api/screenshots",
+  modal: screenshotBrowseModal,
+  titleEl: screenshotBrowseTitle,
+  labelTitle: "Screenshots",
+  labelSingular: "screenshot",
+  media: "image",
+  maxPerVm: () => appConfig.screenshotMaxPerVm,
+  fileUrl: (uuid, item, folder) =>
+    `/api/screenshots/${encodeURIComponent(uuid)}/${encodeURIComponent(item.filename)}${folder ? `?folder=${encodeURIComponent(folder)}` : ""}`,
+  downloadUrl: (uuid, item, folder) =>
+    `/api/screenshots/${encodeURIComponent(uuid)}/${encodeURIComponent(item.filename)}?download=1${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`,
+  deleteUrl: (uuid, item, folder) =>
+    `/api/screenshots/${encodeURIComponent(uuid)}/${encodeURIComponent(item.filename)}${folder ? `?folder=${encodeURIComponent(folder)}` : ""}`
+});
+
+function openScreenshotBrowser() {
+  const session = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!session) {
+    setStatus("Open a console first to browse screenshots.");
+    return;
+  }
+  screenshotLibrary.open(session.vmUuid, session.vmName);
+}
+
+screenshotBtn.addEventListener("click", () => { captureActiveScreenshot(); });
+screenshotBrowseBtn.addEventListener("click", openScreenshotBrowser);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && screenshotLibrary.isOpen()) screenshotLibrary.close();
+});
+
+// =====================================================================
+// Recording lifecycle (per-session). State lives on each consoleSessions
+// entry as `recording = { recorder, recordingId, startedAt, bytesUploaded,
+// pendingChunks, uploadInFlight, timerHandle }` so multiple VMs can
+// record in parallel without interfering.
+// =====================================================================
+function pickRecordingMimeType() {
+  const candidates = [
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm"
+  ];
+  for (const mt of candidates) {
+    try {
+      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mt)) return mt;
+    } catch (_e) { /* ignore */ }
+  }
+  return "";
+}
+
+function fmtElapsed(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(total / 60).toString().padStart(2, "0");
+  const s = (total % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+function refreshRecordButtonForActiveSession() {
+  const active = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!active || !active.recording) {
+    recordBtn.classList.remove("is-recording");
+    recordBtn.querySelector(".record-btn-label").textContent = "Record";
+    recordBtnTimer.hidden = true;
+    return;
+  }
+  recordBtn.classList.add("is-recording");
+  recordBtn.querySelector(".record-btn-label").textContent = "Stop";
+  recordBtnTimer.hidden = false;
+  recordBtnTimer.textContent = fmtElapsed(Date.now() - active.recording.startedAt);
+}
+
+function refreshTabRecordingDot(session) {
+  if (!session?.tabEl) return;
+  const labelSpan = session.tabEl.querySelector("span:first-child");
+  if (!labelSpan) return;
+  const existing = labelSpan.querySelector(".tab-rec-dot");
+  if (session.recording && !existing) {
+    const dot = document.createElement("span");
+    dot.className = "tab-rec-dot";
+    labelSpan.prepend(dot);
+  } else if (!session.recording && existing) {
+    existing.remove();
+  }
+}
+
+async function startRecordingForSession(session) {
+  if (!session) return;
+  if (session.recording) return;
+  if (typeof MediaRecorder === "undefined") {
+    setStatus("MediaRecorder is not supported in this browser.");
+    return;
+  }
+  const canvas = session.screenEl.querySelector("canvas");
+  if (!canvas) { setStatus(`No canvas to record for ${session.vmName}.`); return; }
+  const mimeType = pickRecordingMimeType();
+  if (!mimeType) { setStatus("Browser does not support WebM recording."); return; }
+  const fps = appConfig.recording.fps || 10;
+
+  let stream;
+  try { stream = canvas.captureStream(fps); }
+  catch (err) { setStatus(`captureStream failed: ${err.message || err}`); return; }
+
+  const recActive = recordingLibrary.getActive();
+  const folder = (recActive && recActive.vmUuid === session.vmUuid)
+    ? (recActive.folder || "")
+    : "";
+
+  let startResp;
+  try {
+    startResp = await fetch(`/api/recordings/${encodeURIComponent(session.vmUuid)}/start`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder, fps, width: canvas.width, height: canvas.height, mimeType })
+    });
+  } catch (err) {
+    setStatus(`Could not start recording: ${err.message || err}`);
+    try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* ignore */ }
+    return;
+  }
+  const startData = await startResp.json().catch(() => ({}));
+  if (!startResp.ok) {
+    setStatus(`Could not start recording: ${startData.error || startResp.statusText}`);
+    try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* ignore */ }
+    return;
+  }
+
+  let recorder;
+  try {
+    recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: appConfig.recording.bitrate || 600_000
+    });
+  } catch (err) {
+    setStatus(`Recorder init failed: ${err.message || err}`);
+    try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* ignore */ }
+    try {
+      await fetch(`/api/recordings/${encodeURIComponent(session.vmUuid)}/abort`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recordingId: startData.recordingId })
+      });
+    } catch (_e) { /* ignore */ }
+    return;
+  }
+
+  const state = {
+    recorder,
+    recordingId: startData.recordingId,
+    startedAt: Date.now(),
+    folder,
+    fps,
+    mimeType,
+    width: canvas.width,
+    height: canvas.height,
+    stream,
+    pendingChunks: [],
+    uploadInFlight: false,
+    failed: false,
+    bytesUploaded: 0,
+    timerHandle: null,
+    aborted: false,
+    finishing: false
+  };
+  session.recording = state;
+
+  state.timerHandle = setInterval(() => {
+    if (consoleSessions.find((s) => s.id === activeSessionId) === session) {
+      recordBtnTimer.textContent = fmtElapsed(Date.now() - state.startedAt);
+    }
+  }, 500);
+
+  recorder.ondataavailable = (ev) => {
+    if (!ev.data || ev.data.size === 0) return;
+    state.pendingChunks.push(ev.data);
+    drainRecordingChunks(session);
+  };
+  recorder.onerror = (ev) => {
+    setStatus(`Recorder error: ${ev?.error?.message || "unknown"}`);
+    state.failed = true;
+    stopRecordingForSession(session, { reason: "error" });
+  };
+  recorder.onstop = () => {
+    drainRecordingChunks(session, { andFinish: true });
+  };
+
+  try { recorder.start(2000); }
+  catch (err) {
+    setStatus(`Recorder start failed: ${err.message || err}`);
+    session.recording = null;
+    try { stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* ignore */ }
+    return;
+  }
+
+  refreshTabRecordingDot(session);
+  refreshRecordButtonForActiveSession();
+  setStatus(`Recording ${session.vmName} (${mimeType}, ${fps} fps).`);
+}
+
+async function drainRecordingChunks(session, opts = {}) {
+  const state = session?.recording;
+  if (!state) return;
+  if (state.uploadInFlight) {
+    if (opts.andFinish) state.finishOnDrain = true;
+    return;
+  }
+  while (state.pendingChunks.length > 0) {
+    state.uploadInFlight = true;
+    const blob = state.pendingChunks.shift();
+    try {
+      const buf = await blob.arrayBuffer();
+      const resp = await fetch(
+        `/api/recordings/${encodeURIComponent(session.vmUuid)}/chunk?recordingId=${encodeURIComponent(state.recordingId)}`,
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: buf
+        }
+      );
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        setStatus(`Recording upload failed: ${err.error || resp.statusText}`);
+        state.failed = true;
+        try { state.recorder.stop(); } catch (_e) { /* ignore */ }
+        state.uploadInFlight = false;
+        return;
+      }
+      const data = await resp.json().catch(() => ({}));
+      if (typeof data.bytesWritten === "number") state.bytesUploaded = data.bytesWritten;
+    } catch (err) {
+      setStatus(`Recording upload failed: ${err.message || err}`);
+      state.failed = true;
+      try { state.recorder.stop(); } catch (_e) { /* ignore */ }
+      state.uploadInFlight = false;
+      return;
+    }
+    state.uploadInFlight = false;
+  }
+  if (opts.andFinish || state.finishOnDrain) {
+    await finalizeRecording(session);
+  }
+}
+
+async function finalizeRecording(session) {
+  const state = session?.recording;
+  if (!state || state.finishing) return;
+  state.finishing = true;
+  try { state.stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* ignore */ }
+  if (state.timerHandle) { clearInterval(state.timerHandle); state.timerHandle = null; }
+  if (state.aborted || state.failed) {
+    try {
+      await fetch(`/api/recordings/${encodeURIComponent(session.vmUuid)}/abort`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recordingId: state.recordingId })
+      });
+    } catch (_e) { /* ignore */ }
+  } else {
+    try {
+      const resp = await fetch(`/api/recordings/${encodeURIComponent(session.vmUuid)}/finish`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recordingId: state.recordingId,
+          durationMs: Date.now() - state.startedAt
+        })
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok) {
+        let msg = `Recording saved: ${data.filename} (${fmtBytes(data.sizeBytes || 0)}, ${fmtElapsed(data.durationMs || 0)})`;
+        if (data.prunedCount > 0) msg += ` (pruned ${data.prunedCount} older)`;
+        setStatus(msg);
+        const recActiveAfter = recordingLibrary.getActive();
+        if (recActiveAfter && recActiveAfter.vmUuid === session.vmUuid) {
+          recordingLibrary.refresh();
+        }
+      } else {
+        setStatus(`Save failed: ${data.error || resp.statusText}`);
+      }
+    } catch (err) {
+      setStatus(`Save failed: ${err.message || err}`);
+    }
+  }
+  session.recording = null;
+  refreshTabRecordingDot(session);
+  refreshRecordButtonForActiveSession();
+}
+
+function stopRecordingForSession(session, opts = {}) {
+  const state = session?.recording;
+  if (!state) return;
+  if (opts.reason === "session-closed" || opts.reason === "logout") state.aborted = true;
+  try { state.recorder.stop(); }
+  catch (_e) {
+    state.aborted = true;
+    finalizeRecording(session);
+  }
+}
+
+function toggleRecordingForActive() {
+  const active = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!active) { setStatus("Open a console first to record."); return; }
+  if (active.recording) stopRecordingForSession(active);
+  else startRecordingForSession(active);
+}
+
+recordBtn.addEventListener("click", toggleRecordingForActive);
+
+// =====================================================================
+// Recording library (Finder-style 3-pane browser, shared factory above)
+// =====================================================================
+const recordingLibrary = createLibraryBrowser({
+  kind: "recording",
+  apiBase: "/api/recordings",
+  modal: recordingBrowseModal,
+  titleEl: recordingBrowseTitle,
+  labelTitle: "Recordings",
+  labelSingular: "recording",
+  media: "video",
+  maxPerVm: () => appConfig.recording && appConfig.recording.maxPerVm,
+  fileUrl: (uuid, item, folder) =>
+    `/api/recordings/${encodeURIComponent(uuid)}/file?filename=${encodeURIComponent(item.filename)}${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`,
+  downloadUrl: (uuid, item, folder) =>
+    `/api/recordings/${encodeURIComponent(uuid)}/file?filename=${encodeURIComponent(item.filename)}&download=1${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`,
+  deleteUrl: (uuid, item, folder) =>
+    `/api/recordings/${encodeURIComponent(uuid)}/file?filename=${encodeURIComponent(item.filename)}${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`
+});
+
+function openRecordingBrowser() {
+  const session = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!session) {
+    setStatus("Open a console first to browse recordings.");
+    return;
+  }
+  recordingLibrary.open(session.vmUuid, session.vmName);
+}
+
+recordBrowseBtn.addEventListener("click", openRecordingBrowser);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && recordingLibrary.isOpen()) recordingLibrary.close();
+});
+
+// =====================================================================
+// Global script library
+// =====================================================================
+let scriptLibState = {
+  folder: "",
+  folders: [],
+  items: [],
+  open: false
+};
+
+async function refreshScriptLibrary(folder = scriptLibState.folder) {
+  scriptLibState.folder = folder;
+  scriptGrid.innerHTML = "";
+  scriptEmpty.hidden = true;
+  scriptCount.textContent = "Loading...";
+  renderBreadcrumbs(scriptBreadcrumbs, folder, (target) => refreshScriptLibrary(target));
+  let folders = [], items = [];
+  try {
+    const url = folder ? `/api/scripts?folder=${encodeURIComponent(folder)}` : "/api/scripts";
+    const resp = await fetch(url, { credentials: "same-origin" });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      scriptCount.textContent = `Error: ${data.error || resp.statusText}`;
+      return;
+    }
+    folders = Array.isArray(data.folders) ? data.folders : [];
+    items = Array.isArray(data.items) ? data.items : [];
+  } catch (err) {
+    scriptCount.textContent = `Error: ${err.message || err}`;
+    return;
+  }
+  scriptLibState.folders = folders;
+  scriptLibState.items = items;
+  if (folders.length === 0 && items.length === 0) {
+    scriptEmpty.hidden = false;
+    scriptCount.textContent = "";
+  } else {
+    scriptCount.textContent = `${items.length} script${items.length === 1 ? "" : "s"} . ${folders.length} subfolder${folders.length === 1 ? "" : "s"}`;
+  }
+  renderScriptFolderPane();
+
+  // Folder tiles first.
+  for (const f of folders) {
+    const tile = document.createElement("div");
+    tile.className = "script-tile is-folder";
+    tile.innerHTML = `
+      <span class="script-tile-icon" aria-hidden="true">[F]</span>
+      <span class="script-tile-label">${escapeHtml(f.name)}</span>
+      <span class="script-tile-meta">Folder</span>
+    `;
+    tile.addEventListener("click", () => refreshScriptLibrary(joinFolder(folder, f.name)));
+    tile.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      // Stop the global "hide-on-contextmenu" handler (registered on
+      // document) from immediately tearing down the menu we're about
+      // to render. The favorites context menu does the same dance.
+      ev.stopPropagation();
+      showScriptFolderContextMenu(ev, folder, f);
+    });
+    scriptGrid.appendChild(tile);
+  }
+  // Script tiles.
+  for (const item of items) {
+    const tile = document.createElement("div");
+    tile.className = "script-tile";
+    tile.innerHTML = `
+      <span class="script-tile-icon" aria-hidden="true">${escapeHtml("</>")}</span>
+      <span class="script-tile-label" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</span>
+      <span class="script-tile-desc">${escapeHtml(item.description || "")}</span>
+      <span class="script-tile-meta">${escapeHtml(item.language || "text")} . ${escapeHtml(fmtBytes(item.sizeBytes))}</span>
+    `;
+    tile.title = "Left-click: copy to clipboard. Right-click: edit / rename / delete.";
+    tile.addEventListener("click", () => copyScriptToClipboard(folder, item));
+    tile.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      showScriptItemContextMenu(ev, folder, item);
+    });
+    scriptGrid.appendChild(tile);
+  }
+}
+
+function renderScriptFolderPane() {
+  scriptFolderPane.innerHTML = "";
+  const header = document.createElement("div");
+  header.className = "script-folder-pane-header";
+  header.innerHTML = `<span>Folders</span>`;
+  scriptFolderPane.appendChild(header);
+
+  const rootRow = document.createElement("div");
+  rootRow.className = "script-folder-row root" + (scriptLibState.folder === "" ? " active" : "");
+  rootRow.innerHTML = `<span class="ico" aria-hidden="true">/</span><span>Root</span>`;
+  rootRow.addEventListener("click", () => refreshScriptLibrary(""));
+  scriptFolderPane.appendChild(rootRow);
+
+  // Show ancestor breadcrumb folders + immediate children of the
+  // current folder. This stays simple without a full lazy tree.
+  if (scriptLibState.folder) {
+    const parts = scriptLibState.folder.split("/");
+    let acc = "";
+    parts.forEach((seg, idx) => {
+      acc = acc ? `${acc}/${seg}` : seg;
+      const row = document.createElement("div");
+      row.className = "script-folder-row" + (acc === scriptLibState.folder ? " active" : "");
+      row.innerHTML = `${"<span class='indent'></span>".repeat(idx + 1)}<span class="ico" aria-hidden="true">[F]</span><span>${escapeHtml(seg)}</span>`;
+      row.addEventListener("click", () => refreshScriptLibrary(acc));
+      scriptFolderPane.appendChild(row);
+    });
+  }
+  for (const f of scriptLibState.folders) {
+    const row = document.createElement("div");
+    const depth = scriptLibState.folder ? scriptLibState.folder.split("/").length + 1 : 1;
+    row.className = "script-folder-row";
+    row.innerHTML = `${"<span class='indent'></span>".repeat(depth)}<span class="ico" aria-hidden="true">[F]</span><span>${escapeHtml(f.name)}</span>`;
+    row.addEventListener("click", () => refreshScriptLibrary(joinFolder(scriptLibState.folder, f.name)));
+    scriptFolderPane.appendChild(row);
+  }
+}
+
+async function copyScriptToClipboard(folder, item) {
+  let body;
+  try {
+    const url = `/api/scripts/file?filename=${encodeURIComponent(item.filename)}${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`;
+    const resp = await fetch(url, { credentials: "same-origin" });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setStatus(`Could not load script: ${data.error || resp.statusText}`);
+      return;
+    }
+    body = String(data.body || "");
+  } catch (err) {
+    setStatus(`Could not load script: ${err.message || err}`);
+    return;
+  }
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(body);
+      copied = true;
+    }
+  } catch (_e) { /* fall through to legacy path */ }
+  if (!copied) {
+    // Legacy fallback for non-secure-context HTTP single-user mode,
+    // where the async Clipboard API is unavailable.
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = body;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      copied = document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch (_e) { /* ignore */ }
+  }
+  if (copied) showToast(`Copied "${item.label}" to clipboard`);
+  else setStatus(`Could not copy to clipboard. Use Edit -> Copy from the editor instead.`);
+}
+
+function showScriptItemContextMenu(ev, folder, item) {
+  showSimpleContextMenu(ev, item.label, [
+    { label: "Copy to clipboard", onClick: () => copyScriptToClipboard(folder, item) },
+    { label: "Edit", onClick: () => openScriptEditor({ mode: "edit", folder, item }) },
+    { label: "Rename", onClick: async () => {
+      const next = prompt("New label", item.label);
+      if (!next || next === item.label) return;
       try {
-        const resp = await fetch(`/api/screenshots/${encodeURIComponent(vmUuid)}/${encodeURIComponent(item.filename)}`, {
+        const resp = await fetch(`/api/scripts/file`, {
+          method: "PUT",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder, filename: item.filename, label: next })
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          setStatus(`Rename failed: ${err.error || resp.statusText}`);
+          return;
+        }
+        refreshScriptLibrary(folder);
+      } catch (err) { setStatus(`Rename failed: ${err.message || err}`); }
+    }},
+    { label: "Move to root", disabled: !folder, onClick: () => moveScript(folder, item.filename, "", item.filename) },
+    { label: "Delete", danger: true, onClick: async () => {
+      if (!confirm(`Delete "${item.label}"?`)) return;
+      try {
+        const resp = await fetch(`/api/scripts/file?filename=${encodeURIComponent(item.filename)}${folder ? `&folder=${encodeURIComponent(folder)}` : ""}`, {
           method: "DELETE",
           credentials: "same-origin"
         });
@@ -2618,52 +3768,256 @@ async function refreshScreenshotBrowser(vmUuid, vmName) {
           setStatus(`Delete failed: ${err.error || resp.statusText}`);
           return;
         }
-        await refreshScreenshotBrowser(vmUuid, vmName);
-        setStatus(`Deleted ${item.filename}.`);
-      } catch (err) {
-        setStatus(`Delete failed: ${err.message || err}`);
-      }
+        refreshScriptLibrary(folder);
+      } catch (err) { setStatus(`Delete failed: ${err.message || err}`); }
+    }}
+  ]);
+}
+
+function showScriptFolderContextMenu(ev, parentFolderRel, folder) {
+  showSimpleContextMenu(ev, folder.name, [
+    { label: "Open", onClick: () => refreshScriptLibrary(joinFolder(parentFolderRel, folder.name)) },
+    { label: "Rename", onClick: async () => {
+      const next = prompt("Rename folder", folder.name);
+      if (!next || next === folder.name) return;
+      if (!isValidFolderName(next)) { setStatus("Invalid folder name."); return; }
+      try {
+        const resp = await fetch(`/api/scripts/move`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fromFolder: parentFolderRel, toFolder: parentFolderRel, fromName: folder.name, toName: next })
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          setStatus(`Rename failed: ${err.error || resp.statusText}`);
+          return;
+        }
+        refreshScriptLibrary(parentFolderRel);
+      } catch (err) { setStatus(`Rename failed: ${err.message || err}`); }
+    }},
+    { label: "Delete (must be empty)", danger: true, onClick: async () => {
+      if (!confirm(`Delete folder "${folder.name}"?`)) return;
+      try {
+        const resp = await fetch(`/api/scripts/folders`, {
+          method: "DELETE",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: joinFolder(parentFolderRel, folder.name) })
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          setStatus(`Delete failed: ${err.error || resp.statusText}`);
+          return;
+        }
+        refreshScriptLibrary(parentFolderRel);
+      } catch (err) { setStatus(`Delete failed: ${err.message || err}`); }
+    }}
+  ]);
+}
+
+async function moveScript(fromFolder, fromName, toFolder, toName) {
+  try {
+    const resp = await fetch(`/api/scripts/move`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromFolder, toFolder, fromName, toName })
     });
-    screenshotBrowseGrid.appendChild(tile);
-  }
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      setStatus(`Move failed: ${err.error || resp.statusText}`);
+      return;
+    }
+    refreshScriptLibrary(scriptLibState.folder);
+  } catch (err) { setStatus(`Move failed: ${err.message || err}`); }
 }
 
-let screenshotBrowserVm = null;
-
-function openScreenshotBrowser() {
-  const session = consoleSessions.find((s) => s.id === activeSessionId);
-  if (!session) {
-    setStatus("Open a console first to browse screenshots.");
-    return;
+// Reuse the existing #ctxMenu node already in the page; render a
+// lightweight, ad-hoc menu without going through the favorites code.
+function showSimpleContextMenu(ev, header, items) {
+  ctxMenu.innerHTML = "";
+  if (header) {
+    const h = document.createElement("div");
+    h.className = "ctx-menu-header";
+    h.textContent = header;
+    ctxMenu.appendChild(h);
   }
-  screenshotBrowserVm = { vmUuid: session.vmUuid, vmName: session.vmName };
-  screenshotBrowseTitle.textContent = `Screenshots - ${session.vmName}`;
-  screenshotBrowseModal.classList.add("open");
-  refreshScreenshotBrowser(session.vmUuid, session.vmName);
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "ctx-menu-item" + (it.disabled ? " disabled" : "") + (it.danger ? " power-off" : "");
+    row.innerHTML = `<span class="ctx-icon"></span><span>${escapeHtml(it.label)}</span>`;
+    if (!it.disabled) {
+      row.addEventListener("click", () => {
+        ctxMenu.classList.remove("open");
+        try { it.onClick(); } catch (_e) { /* ignore */ }
+      });
+    }
+    ctxMenu.appendChild(row);
+  }
+  ctxMenu.style.left = `${ev.clientX}px`;
+  ctxMenu.style.top = `${ev.clientY}px`;
+  ctxMenu.classList.add("open");
 }
 
-function closeScreenshotBrowser() {
-  screenshotBrowseModal.classList.remove("open");
-  screenshotBrowserVm = null;
+function openScriptLibrary() {
+  scriptLibState.open = true;
+  scriptLibraryModal.hidden = false;
+  scriptLauncher.classList.add("is-open");
+  refreshScriptLibrary(scriptLibState.folder);
+}
+function closeScriptLibrary() {
+  scriptLibState.open = false;
+  scriptLibraryModal.hidden = true;
+  scriptLauncher.classList.remove("is-open");
+}
+function toggleScriptLibrary() {
+  if (scriptLibState.open) closeScriptLibrary();
+  else openScriptLibrary();
 }
 
-screenshotBrowseRefresh.addEventListener("click", () => {
-  if (screenshotBrowserVm) {
-    refreshScreenshotBrowser(screenshotBrowserVm.vmUuid, screenshotBrowserVm.vmName);
-  }
+scriptLauncher.addEventListener("click", toggleScriptLibrary);
+scriptCloseBtn.addEventListener("click", closeScriptLibrary);
+scriptRefreshBtn.addEventListener("click", () => refreshScriptLibrary(scriptLibState.folder));
+scriptNewFolderBtn.addEventListener("click", async () => {
+  const name = prompt("New subfolder name");
+  if (!name) return;
+  if (!isValidFolderName(name)) { setStatus("Invalid folder name."); return; }
+  const target = joinFolder(scriptLibState.folder, name);
+  try {
+    const resp = await fetch(`/api/scripts/folders`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: target })
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      setStatus(`Create failed: ${err.error || resp.statusText}`);
+      return;
+    }
+    refreshScriptLibrary(scriptLibState.folder);
+  } catch (err) { setStatus(`Create failed: ${err.message || err}`); }
 });
-screenshotBrowseCloseBtn.addEventListener("click", closeScreenshotBrowser);
-screenshotBrowseModal.addEventListener("click", (event) => {
-  if (event.target === screenshotBrowseModal) closeScreenshotBrowser();
+scriptNewBtn.addEventListener("click", () => {
+  openScriptEditor({ mode: "create", folder: scriptLibState.folder });
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && screenshotBrowseModal.classList.contains("open")) {
-    closeScreenshotBrowser();
+  if (event.key === "Escape" && scriptLibState.open) {
+    closeScriptLibrary();
   }
 });
 
-screenshotBtn.addEventListener("click", () => { captureActiveScreenshot(); });
-screenshotBrowseBtn.addEventListener("click", openScreenshotBrowser);
+// ---- Script editor ------------------------------------------------------
+let scriptEditorCtx = null;
+
+function openScriptEditor(ctx) {
+  scriptEditorCtx = ctx;
+  scriptEditorError.hidden = true;
+  scriptEditorError.textContent = "";
+  if (ctx.mode === "edit" && ctx.item) {
+    scriptEditorTitle.textContent = `Edit script - ${ctx.item.label}`;
+    scriptEditorLabel.value = ctx.item.label || "";
+    scriptEditorLanguage.value = ctx.item.language || "";
+    scriptEditorDescription.value = ctx.item.description || "";
+    scriptEditorBody.value = "Loading...";
+    scriptEditorBody.disabled = true;
+    fetch(`/api/scripts/file?filename=${encodeURIComponent(ctx.item.filename)}${ctx.folder ? `&folder=${encodeURIComponent(ctx.folder)}` : ""}`, {
+      credentials: "same-origin"
+    }).then((r) => r.json()).then((data) => {
+      scriptEditorBody.value = String(data.body || "");
+      scriptEditorBody.disabled = false;
+    }).catch(() => {
+      scriptEditorBody.value = "";
+      scriptEditorBody.disabled = false;
+    });
+  } else {
+    scriptEditorTitle.textContent = "New script";
+    scriptEditorLabel.value = "";
+    scriptEditorLanguage.value = "";
+    scriptEditorDescription.value = "";
+    scriptEditorBody.value = "";
+    scriptEditorBody.disabled = false;
+  }
+  scriptEditorModal.classList.add("open");
+  setTimeout(() => scriptEditorLabel.focus(), 50);
+}
+
+function closeScriptEditor() {
+  scriptEditorModal.classList.remove("open");
+  scriptEditorCtx = null;
+}
+
+scriptEditorCancel.addEventListener("click", closeScriptEditor);
+scriptEditorModal.addEventListener("click", (event) => {
+  if (event.target === scriptEditorModal) closeScriptEditor();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && scriptEditorModal.classList.contains("open")) {
+    closeScriptEditor();
+  }
+});
+scriptEditorSave.addEventListener("click", async () => {
+  if (!scriptEditorCtx) return;
+  const ctx = scriptEditorCtx;
+  const label = scriptEditorLabel.value.trim();
+  if (!label) {
+    scriptEditorError.textContent = "Label is required.";
+    scriptEditorError.hidden = false;
+    return;
+  }
+  const body = scriptEditorBody.value;
+  if (new TextEncoder().encode(body).length > appConfig.scripts.maxBytes) {
+    scriptEditorError.textContent = `Script body exceeds ${fmtBytes(appConfig.scripts.maxBytes)} limit.`;
+    scriptEditorError.hidden = false;
+    return;
+  }
+  const description = scriptEditorDescription.value.trim();
+  const language = scriptEditorLanguage.value.trim();
+  try {
+    let resp;
+    if (ctx.mode === "edit" && ctx.item) {
+      resp = await fetch(`/api/scripts/file`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          folder: ctx.folder || "",
+          filename: ctx.item.filename,
+          label,
+          body,
+          description,
+          language
+        })
+      });
+    } else {
+      resp = await fetch(`/api/scripts`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          folder: ctx.folder || "",
+          label,
+          body,
+          description,
+          language
+        })
+      });
+    }
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      scriptEditorError.textContent = data.error || resp.statusText;
+      scriptEditorError.hidden = false;
+      return;
+    }
+    closeScriptEditor();
+    refreshScriptLibrary(scriptLibState.folder);
+    showToast(ctx.mode === "edit" ? "Script saved" : `Created "${label}"`);
+  } catch (err) {
+    scriptEditorError.textContent = err.message || String(err);
+    scriptEditorError.hidden = false;
+  }
+});
 
 // ---- Multi-user chat ----------------------------------------------------
 
@@ -2978,6 +4332,7 @@ function teardownChat() {
   chatPanelOpen = false;
   chatPanel.hidden = true;
   chatLauncher.classList.remove("is-open");
+  document.body.classList.remove("chat-panel-open");
   updateChatBadge();
   renderChatHeader();
   renderChatPresence();
@@ -2990,6 +4345,9 @@ function toggleChatPanel(forceState) {
   chatPanel.hidden = !next;
   chatPanelOpen = next;
   chatLauncher.classList.toggle("is-open", next);
+  // Lifts the script-library side panel above the chat dialog so the
+  // two right-edge surfaces don't overlap (see .script-side-panel CSS).
+  document.body.classList.toggle("chat-panel-open", next);
   if (next) {
     // Clear unread for the channel we're now actively viewing.
     if (chatCurrentVmUuid) {

@@ -1294,6 +1294,850 @@
         color: var(--ntx-text-subtle);
         font-size: 13px;
       }
+      .screenshot-tile-caption {
+        font-size: 11.5px;
+        color: var(--ntx-text);
+        font-style: italic;
+        margin-top: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .screenshot-tile-caption:empty { display: none; }
+      .screenshot-tile.is-folder .screenshot-tile-thumb {
+        background: linear-gradient(135deg, #f0f3f9, #d9e0ec);
+        font-size: 32px;
+        color: var(--ntx-warn);
+      }
+
+      /* Recording action button (red dot pulse while recording) */
+      .record-btn {
+        height: 32px;
+        padding: 0 12px;
+        background: #b91c1c;
+        border: 1px solid #b91c1c;
+        color: #fff;
+        font-weight: 600;
+        font-size: 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        flex-shrink: 0;
+        white-space: nowrap;
+        width: 100%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+      }
+      .record-btn:hover {
+        background: #991b1b;
+        border-color: #991b1b;
+        color: #fff;
+      }
+      .record-btn:disabled {
+        background: #f0c7c7;
+        border-color: #f0c7c7;
+        color: #fff;
+        cursor: not-allowed;
+      }
+      .record-btn.is-recording {
+        background: #7f1d1d;
+        border-color: #7f1d1d;
+        animation: recPulse 1.5s ease-in-out infinite;
+      }
+      .record-btn.is-recording::before {
+        content: "";
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.35);
+      }
+      .record-btn-timer {
+        font-variant-numeric: tabular-nums;
+        font-size: 11.5px;
+      }
+      @keyframes recPulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(185, 28, 28, 0.45); }
+        50% { box-shadow: 0 0 0 8px rgba(185, 28, 28, 0); }
+      }
+      /* Recording dot in console tab title */
+      .tab-rec-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #b91c1c;
+        margin-right: 6px;
+        animation: recPulse 1.5s ease-in-out infinite;
+      }
+
+      /* Folder navigator (shared by screenshot + recording browsers) */
+      .browse-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .browse-breadcrumbs {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 2px;
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
+        color: var(--ntx-text-muted);
+      }
+      .browse-breadcrumb {
+        background: transparent;
+        border: 0;
+        padding: 2px 6px;
+        height: auto;
+        color: var(--ntx-accent);
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        border-radius: 3px;
+      }
+      .browse-breadcrumb:hover {
+        background: var(--ntx-accent-soft);
+      }
+      .browse-breadcrumb.current {
+        color: var(--ntx-text);
+        font-weight: 600;
+        cursor: default;
+      }
+      .browse-breadcrumb.current:hover {
+        background: transparent;
+      }
+      .browse-breadcrumb-sep {
+        color: var(--ntx-text-subtle);
+        font-size: 11px;
+      }
+      .browse-tile-folder-icon {
+        font-size: 32px;
+      }
+
+      /* =====================================================================
+         Finder-style asset library: tree | list | preview
+         Used by both the screenshot and recording browsers (data-kind on the
+         root node distinguishes them).
+         ===================================================================== */
+      /* Library modal fills the viewport (minus a small frame) so the
+         preview pane on the right gets as much canvas as the live VM
+         console behind it. The 3-pane grid below pins the tree+list
+         widths and lets the preview swallow all the leftover space. */
+      .lib-modal {
+        width: calc(100vw - 24px);
+        max-width: calc(100vw - 24px);
+        display: flex;
+        flex-direction: column;
+        height: calc(100vh - 24px);
+      }
+      .lib-modal-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+      }
+      .lib-modal-title {
+        flex: 1;
+        font-weight: 600;
+      }
+      .lib-modal-refresh,
+      .lib-modal-close {
+        height: 28px;
+        width: 28px;
+        padding: 0;
+        background: rgba(255, 255, 255, 0.16);
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        color: #fff;
+        font-size: 14px;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .lib-modal-refresh:hover,
+      .lib-modal-close:hover { background: rgba(255, 255, 255, 0.26); }
+      .lib-modal-body {
+        flex: 1;
+        min-height: 0;
+        padding: 12px 14px;
+        overflow: hidden;
+        display: flex;
+      }
+      .lib-pane-grid {
+        flex: 1;
+        display: grid;
+        grid-template-columns: 220px 320px 1fr;
+        gap: 10px;
+        min-height: 0;
+      }
+      @media (max-width: 1100px) {
+        .lib-pane-grid { grid-template-columns: 200px 280px 1fr; }
+      }
+      .lib-tree-pane,
+      .lib-list-pane,
+      .lib-preview-pane {
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        background: var(--ntx-surface-2);
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+      }
+      .lib-pane-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        background: var(--ntx-surface);
+        border-bottom: 1px solid var(--ntx-border);
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--ntx-text-subtle);
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
+      .lib-pane-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: none; letter-spacing: 0; font-weight: 600; font-size: 12.5px; color: var(--ntx-text); }
+      .lib-pane-count { font-size: 11px; color: var(--ntx-text-subtle); }
+      .lib-pane-action {
+        height: 22px;
+        min-width: 22px;
+        padding: 0 6px;
+        font-size: 13px;
+        line-height: 1;
+      }
+
+      /* ---- Tree pane --------------------------------------------------- */
+      .lib-tree-body {
+        flex: 1;
+        overflow: auto;
+        padding: 4px 0;
+      }
+      .lib-tree-row {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 3px 8px 3px 4px;
+        cursor: pointer;
+        font-size: 13px;
+        color: var(--ntx-text);
+        user-select: none;
+        white-space: nowrap;
+      }
+      .lib-tree-row:hover { background: var(--ntx-accent-soft); }
+      .lib-tree-row.selected {
+        background: var(--ntx-accent);
+        color: #fff;
+      }
+      .lib-tree-row.selected .lib-tree-toggle,
+      .lib-tree-row.selected .lib-tree-icon,
+      .lib-tree-row.selected .lib-tree-count { color: rgba(255, 255, 255, 0.9); }
+      .lib-tree-row.drop-target {
+        outline: 2px dashed var(--ntx-warn);
+        outline-offset: -2px;
+        background: rgba(229, 137, 14, 0.18);
+      }
+      .lib-tree-toggle {
+        display: inline-block;
+        width: 14px;
+        text-align: center;
+        font-size: 9px;
+        color: var(--ntx-text-subtle);
+        line-height: 1;
+        flex-shrink: 0;
+      }
+      .lib-tree-toggle.placeholder { visibility: hidden; }
+      .lib-tree-icon {
+        width: 16px;
+        text-align: center;
+        font-size: 13px;
+        color: var(--ntx-warn);
+        flex-shrink: 0;
+      }
+      .lib-tree-row.root .lib-tree-icon { color: var(--ntx-text-subtle); }
+      .lib-tree-name {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .lib-tree-count {
+        font-size: 11px;
+        color: var(--ntx-text-subtle);
+        margin-left: 4px;
+      }
+      .lib-tree-children { /* indentation is done via .lib-tree-row padding-left set inline by JS */ }
+
+      /* ---- List pane --------------------------------------------------- */
+      .lib-list-body {
+        flex: 1;
+        overflow: auto;
+        padding: 8px;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+        gap: 10px;
+        align-content: start;
+      }
+      .lib-list-empty {
+        padding: 16px;
+        font-size: 12.5px;
+        color: var(--ntx-text-subtle);
+        text-align: center;
+      }
+      .lib-list-tile {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 8px;
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        background: #fff;
+        cursor: pointer;
+        user-select: none;
+        transition: border-color 100ms ease, box-shadow 100ms ease, transform 100ms ease;
+      }
+      .lib-list-tile:hover { border-color: var(--ntx-accent); transform: translateY(-1px); }
+      .lib-list-tile.selected {
+        border-color: var(--ntx-accent);
+        box-shadow: 0 0 0 2px rgba(21, 101, 255, 0.25);
+      }
+      .lib-list-tile.dragging { opacity: 0.45; }
+      .lib-list-thumb {
+        width: 100%;
+        aspect-ratio: 16 / 10;
+        background: #0d2440;
+        border-radius: 4px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-size: 28px;
+        overflow: hidden;
+      }
+      .lib-list-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .lib-list-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        font-size: 11px;
+        color: var(--ntx-text-subtle);
+        overflow: hidden;
+        min-width: 0;
+      }
+      .lib-list-meta .lib-list-name {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--ntx-text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .lib-list-meta .lib-list-caption {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        color: var(--ntx-text);
+        font-style: italic;
+      }
+      .lib-list-meta .lib-list-sub { color: var(--ntx-text-subtle); }
+
+      /* ---- Preview pane (dark) ---------------------------------------- */
+      .lib-preview-pane {
+        background: #0e1d36;
+        color: #f0f4fa;
+      }
+      .lib-preview-pane .lib-pane-header {
+        background: rgba(0, 0, 0, 0.25);
+        border-bottom-color: rgba(255, 255, 255, 0.08);
+      }
+      .lib-preview-pane .lib-pane-title { color: rgba(255, 255, 255, 0.88); }
+      .lib-preview-pane .lib-pane-count { color: rgba(255, 255, 255, 0.65); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%; }
+      .lib-preview-empty {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 13px;
+        color: rgba(255, 255, 255, 0.5);
+        padding: 24px;
+        text-align: center;
+      }
+      .lib-preview-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      /* Override the browser default [hidden] {display:none} which our
+         display:flex declarations above would otherwise outweigh. Without
+         these rules both the empty state and the populated content render
+         at the same time, splitting the available height in half. */
+      .lib-preview-empty[hidden],
+      .lib-preview-content[hidden] { display: none !important; }
+      .lib-preview-stage {
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #000;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        overflow: hidden;
+      }
+      .lib-preview-stage img,
+      .lib-preview-stage video {
+        width: 100%;
+        height: 100%;
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+        display: block;
+      }
+      /* Fullscreen toggle pinned to the top-right of the stage. The
+         <video> element already has a native fullscreen button in its
+         controls bar; this button is the equivalent affordance for the
+         <img> preview (and harmless to keep on videos). */
+      .lib-preview-fullscreen {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        height: 28px;
+        width: 28px;
+        padding: 0;
+        background: rgba(0, 0, 0, 0.55);
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        color: #fff;
+        font-size: 14px;
+        line-height: 1;
+        border-radius: 4px;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 120ms ease, background 120ms ease;
+        z-index: 2;
+      }
+      .lib-preview-stage:hover .lib-preview-fullscreen,
+      .lib-preview-fullscreen:focus-visible { opacity: 1; }
+      .lib-preview-fullscreen:hover { background: rgba(0, 0, 0, 0.78); }
+      /* When the stage itself is in browser fullscreen, fill the screen. */
+      .lib-preview-stage:fullscreen {
+        background: #000;
+        padding: 0;
+      }
+      .lib-preview-stage:fullscreen img,
+      .lib-preview-stage:fullscreen video {
+        width: 100vw;
+        height: 100vh;
+        object-fit: contain;
+      }
+      .lib-preview-meta {
+        padding: 8px 12px;
+        font-size: 11.5px;
+        color: rgba(255, 255, 255, 0.7);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 12px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .lib-preview-meta span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+      .lib-preview-caption-label {
+        display: block;
+        padding: 8px 12px 0;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+        color: rgba(255, 255, 255, 0.65);
+      }
+      .lib-preview-caption-row {
+        display: flex;
+        gap: 6px;
+        margin-top: 4px;
+      }
+      .lib-preview-caption-row input {
+        flex: 1;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        color: #fff;
+        border-radius: 4px;
+        padding: 6px 8px;
+        font-size: 13px;
+      }
+      .lib-preview-caption-row input::placeholder { color: rgba(255, 255, 255, 0.4); }
+      .lib-preview-caption-row input:focus {
+        outline: none;
+        border-color: var(--ntx-accent);
+        box-shadow: 0 0 0 2px rgba(21, 101, 255, 0.3);
+      }
+      .lib-preview-caption-row .saved-flash {
+        font-size: 11px;
+        color: #6ee7a7;
+        align-self: center;
+        opacity: 0;
+        transition: opacity 200ms ease;
+      }
+      .lib-preview-caption-row .saved-flash.show { opacity: 1; }
+      .lib-preview-actions {
+        padding: 10px 12px;
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .lib-preview-actions a { text-decoration: none; }
+      .lib-preview-actions .danger {
+        background: rgba(220, 53, 69, 0.18);
+        border-color: rgba(220, 53, 69, 0.5);
+        color: #ffb3bb;
+      }
+      .lib-preview-actions .danger:hover {
+        background: rgba(220, 53, 69, 0.32);
+        color: #fff;
+      }
+
+      /* Annotation / playback viewer modal */
+      .viewer-modal {
+        width: 880px;
+        max-width: calc(100vw - 32px);
+      }
+      .viewer-modal-body {
+        max-height: 80vh;
+        overflow: hidden;
+      }
+      .viewer-stage {
+        background: #000;
+        border-radius: 6px;
+        max-height: 60vh;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+      }
+      .viewer-stage img,
+      .viewer-stage video {
+        max-width: 100%;
+        max-height: 60vh;
+        display: block;
+      }
+      .viewer-meta {
+        font-size: 12px;
+        color: var(--ntx-text-muted);
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
+      .viewer-caption-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .viewer-caption-row input {
+        flex: 1;
+      }
+      .viewer-caption-row .saved-flash {
+        font-size: 11.5px;
+        color: var(--ntx-success);
+        opacity: 0;
+        transition: opacity 200ms ease;
+      }
+      .viewer-caption-row .saved-flash.show { opacity: 1; }
+
+      /* Script library launcher (mirrors chat launcher) */
+      .script-launcher {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        height: 52px;
+        width: 52px;
+        padding: 0;
+        border-radius: 50%;
+        border: 0;
+        background: var(--ntx-success);
+        color: #fff;
+        font-size: 22px;
+        line-height: 52px;
+        text-align: center;
+        cursor: pointer;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.32);
+        z-index: 70;
+        transition: transform 120ms ease, background 120ms ease;
+      }
+      .script-launcher:hover {
+        background: var(--ntx-success-hover);
+        transform: translateY(-2px);
+      }
+      .script-launcher:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(31, 157, 85, 0.4), 0 12px 28px rgba(15, 23, 42, 0.32);
+      }
+      .script-launcher.is-open {
+        background: var(--ntx-accent);
+      }
+      .script-launcher.is-open:hover {
+        background: var(--ntx-accent-hover);
+      }
+      /* Slide it left when chat is also visible so they don't overlap */
+      body.has-chat .script-launcher { right: 80px; }
+      /* While a full-viewport library modal is on screen, the chat /
+         script launchers and the chat panel cover the preview pane's
+         Download / Delete buttons. Hide them outright; the user can
+         reopen them after closing the library. */
+      body.lib-modal-open .chat-launcher,
+      body.lib-modal-open .script-launcher,
+      body.lib-modal-open .chat-panel,
+      body.lib-modal-open .script-side-panel { display: none !important; }
+
+      /* Side-panel script library. Pinned to the right edge so the
+         console behind it stays visible (no full-screen modal). When
+         the multi-user chat panel is also open, this panel shrinks
+         from the bottom so it sits visually ABOVE the chat dialog. */
+      .script-side-panel {
+        position: fixed;
+        top: 80px;
+        right: 18px;
+        bottom: 86px;
+        width: 440px;
+        max-width: calc(100vw - 36px);
+        background: var(--ntx-surface);
+        border: 1px solid var(--ntx-border);
+        border-radius: 10px;
+        box-shadow: var(--ntx-shadow-lg);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        z-index: 65;
+      }
+      .script-side-panel[hidden] { display: none; }
+      /* When the chat dialog is open, lift the script panel above it
+         so the two don't overlap. The chat panel is at bottom: 86px
+         with height up to 560px; clear it with a small gap. */
+      body.chat-panel-open .script-side-panel {
+        bottom: 660px;
+        min-height: 220px;
+      }
+      .script-side-panel-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        background: linear-gradient(90deg, var(--ntx-brand), var(--ntx-brand-2));
+        color: #fff;
+        font-size: 13px;
+      }
+      .script-side-panel-title {
+        flex: 1;
+        font-weight: 600;
+        font-size: 13.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .script-side-panel-close {
+        height: 26px;
+        width: 26px;
+        padding: 0;
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        color: #fff;
+        font-size: 14px;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .script-side-panel-close:hover {
+        background: rgba(255, 255, 255, 0.22);
+      }
+      .script-modal-body {
+        flex: 1;
+        min-height: 0;
+        padding: 12px 14px;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      /* In the side-panel layout, stack the folder tree on top of
+         the script grid so both stay usable inside ~440px of width. */
+      .script-layout {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        flex: 1;
+        min-height: 0;
+      }
+      .script-folder-pane {
+        width: auto;
+        flex-shrink: 0;
+        max-height: 140px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        background: var(--ntx-surface-2);
+        padding: 8px;
+        overflow: auto;
+      }
+      .script-folder-pane-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        color: var(--ntx-text-subtle);
+      }
+      .script-folder-pane-header button {
+        height: 22px;
+        padding: 0 8px;
+        font-size: 11.5px;
+      }
+      .script-folder-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 6px;
+        font-size: 12.5px;
+        cursor: pointer;
+        border-radius: 4px;
+        color: var(--ntx-text);
+      }
+      .script-folder-row:hover { background: var(--ntx-accent-soft); }
+      .script-folder-row.active {
+        background: var(--ntx-accent-soft);
+        color: var(--ntx-accent-hover);
+        font-weight: 600;
+      }
+      .script-folder-row .indent {
+        display: inline-block;
+        width: 12px;
+      }
+      .script-folder-row .ico {
+        color: var(--ntx-warn);
+      }
+      .script-folder-row.root .ico { color: var(--ntx-text-subtle); }
+      .script-grid-pane {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .script-grid-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .script-grid-toolbar .breadcrumbs { flex: 1; min-width: 0; }
+      .script-grid {
+        flex: 1;
+        overflow: auto;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 10px;
+        padding-right: 4px;
+      }
+      .script-tile {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 12px;
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        background: #fff;
+        cursor: pointer;
+        transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+        user-select: none;
+      }
+      .script-tile:hover {
+        border-color: var(--ntx-accent);
+        box-shadow: 0 6px 16px rgba(21, 101, 255, 0.15);
+        transform: translateY(-1px);
+      }
+      .script-tile.is-folder {
+        background: linear-gradient(135deg, #fafbfd, #eef1f6);
+      }
+      .script-tile-icon {
+        font-size: 28px;
+        line-height: 1;
+        color: var(--ntx-accent);
+      }
+      .script-tile.is-folder .script-tile-icon { color: var(--ntx-warn); }
+      .script-tile-label {
+        font-weight: 600;
+        font-size: 13px;
+        color: var(--ntx-text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .script-tile-desc {
+        font-size: 11.5px;
+        color: var(--ntx-text-muted);
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .script-tile-meta {
+        font-size: 10.5px;
+        color: var(--ntx-text-subtle);
+      }
+      .script-empty {
+        text-align: center;
+        padding: 32px 16px;
+        color: var(--ntx-text-subtle);
+        font-size: 13px;
+      }
+
+      /* Script editor modal */
+      .script-editor-modal { width: 720px; max-width: calc(100vw - 32px); }
+      .script-editor-modal .modal-body { gap: 10px; }
+      .script-editor-modal label { width: 100%; }
+      .script-editor-modal textarea {
+        width: 100%;
+        min-height: 240px;
+        padding: 10px 12px;
+        font-family: "Menlo", "Consolas", monospace;
+        font-size: 12px;
+        border-radius: 4px;
+        border: 1px solid var(--ntx-border-strong);
+        background: #fafbfd;
+        color: var(--ntx-text);
+        resize: vertical;
+      }
+      .script-editor-modal textarea:focus {
+        outline: none;
+        border-color: var(--ntx-accent);
+        box-shadow: 0 0 0 3px rgba(21, 101, 255, 0.18);
+      }
+
+      /* Toast (script copy confirmation, etc.) */
+      .toast {
+        position: fixed;
+        right: 18px;
+        bottom: 86px;
+        background: var(--ntx-text);
+        color: #fff;
+        padding: 10px 16px;
+        border-radius: 6px;
+        font-size: 13px;
+        z-index: 150;
+        box-shadow: var(--ntx-shadow-lg);
+        opacity: 0;
+        transform: translateY(8px);
+        transition: opacity 160ms ease, transform 160ms ease;
+        pointer-events: none;
+      }
+      .toast.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
 
       /* Multi-user chat */
       .chat-root[hidden] { display: none; }
@@ -1556,14 +2400,6 @@
               <input id="loginRemember" type="checkbox" />
               Remember host and username
             </label>
-            <label>
-              <input id="loginAllowTls" type="checkbox" checked />
-              Allow self-signed TLS (lab)
-            </label>
-            <label>
-              <input id="loginIncludeHidden" type="checkbox" checked />
-              Include hidden / system VMs (CVMs)
-            </label>
           </div>
           <button id="loginSubmit" type="submit" class="login-submit">Sign in</button>
           <div id="loginError" class="login-error" style="display:none"></div>
@@ -1651,7 +2487,14 @@
                     <button id="screenshotBtn" type="button" class="screenshot-btn" disabled
                             title="Capture the active console as a PNG and save it server-side under the screenshots folder for this VM (per-VM UUID).">Screenshot</button>
                     <button id="screenshotBrowseBtn" type="button" class="screenshot-browse-btn" disabled
-                            title="View, download, or delete past screenshots saved for this VM.">Browse...</button>
+                            title="View, download, annotate, or delete past screenshots saved for this VM.">Browse...</button>
+                    <button id="recordBtn" type="button" class="record-btn" disabled
+                            title="Start / stop a video recording of the active console (10 fps WebM, saved per-VM).">
+                      <span class="record-btn-label">Record</span>
+                      <span id="recordBtnTimer" class="record-btn-timer" hidden>00:00</span>
+                    </button>
+                    <button id="recordBrowseBtn" type="button" class="screenshot-browse-btn" disabled
+                            title="View, play back, annotate, or delete past recordings saved for this VM.">Recordings...</button>
                     <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
                     <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
                     <button id="wallOfEyesBtn" type="button" class="wall-eyes-btn" disabled title="Open a live wall of every console in a new browser window">Wall of Eyes</button>
@@ -1715,26 +2558,177 @@
       <div id="consoleGrid" class="console-grid"></div>
     </div>
 
-    <!-- Screenshot browse modal -->
+    <!-- Finder-style screenshot library: tree | list | preview -->
     <div id="screenshotBrowseModal" class="modal-backdrop" role="dialog" aria-modal="true">
-      <div class="modal screenshot-modal">
-        <div class="modal-header">
-          <span id="screenshotBrowseTitle">Screenshots</span>
+      <div class="modal lib-modal" data-kind="screenshot">
+        <div class="modal-header lib-modal-header">
+          <span id="screenshotBrowseTitle" class="lib-modal-title">Screenshots</span>
+          <button class="lib-modal-refresh" type="button" data-lib-refresh title="Refresh">&#x21bb;</button>
+          <button class="lib-modal-close" type="button" data-lib-close title="Close" aria-label="Close">&times;</button>
         </div>
-        <div class="modal-body screenshot-modal-body">
-          <div class="screenshot-modal-controls">
-            <span id="screenshotBrowseCount" class="muted"></span>
-            <span class="screenshot-modal-spacer"></span>
-            <button id="screenshotBrowseRefresh" type="button">Refresh</button>
-            <button id="screenshotBrowseClose" type="button">Close</button>
-          </div>
-          <div id="screenshotBrowseGrid" class="screenshot-thumb-grid"></div>
-          <div id="screenshotBrowseEmpty" class="screenshot-modal-empty" hidden>
-            No screenshots yet for this VM.
+        <div class="modal-body lib-modal-body">
+          <div class="lib-pane-grid">
+            <aside class="lib-tree-pane">
+              <div class="lib-pane-header">
+                <span class="lib-pane-title">Folders</span>
+                <button class="lib-pane-action" type="button" data-lib-new-folder title="New subfolder under selected folder">+</button>
+              </div>
+              <div class="lib-tree-body" data-lib-tree></div>
+            </aside>
+            <section class="lib-list-pane">
+              <div class="lib-pane-header">
+                <span class="lib-pane-title" data-lib-list-path>Root</span>
+                <span class="lib-pane-count" data-lib-list-count></span>
+              </div>
+              <div class="lib-list-body" data-lib-list></div>
+              <div class="lib-list-empty" data-lib-list-empty hidden>This folder is empty.</div>
+            </section>
+            <section class="lib-preview-pane">
+              <div class="lib-pane-header">
+                <span class="lib-pane-title">Preview</span>
+                <span class="lib-pane-count" data-lib-preview-name></span>
+              </div>
+              <div class="lib-preview-empty" data-lib-preview-empty>Select an item on the left to preview.</div>
+              <div class="lib-preview-content" data-lib-preview-content hidden>
+                <div class="lib-preview-stage" data-lib-preview-stage></div>
+                <div class="lib-preview-meta" data-lib-preview-meta></div>
+                <label class="lib-preview-caption-label">
+                  <span>Caption</span>
+                  <div class="lib-preview-caption-row">
+                    <input type="text" maxlength="2000" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="true" data-form-type="other" data-lib-preview-caption placeholder="Optional note saved next to the file" />
+                    <button type="button" class="primary" data-lib-preview-caption-save>Save</button>
+                    <span class="saved-flash" data-lib-preview-caption-flash>Saved</span>
+                  </div>
+                </label>
+                <div class="lib-preview-actions">
+                  <a href="#" download data-lib-preview-download>
+                    <button type="button">Download</button>
+                  </a>
+                  <button type="button" class="danger" data-lib-preview-delete>Delete</button>
+                </div>
+              </div>
+            </section>
           </div>
         </div>
       </div>
     </div>
+
+    <!-- Finder-style recording library: tree | list | preview -->
+    <div id="recordingBrowseModal" class="modal-backdrop" role="dialog" aria-modal="true">
+      <div class="modal lib-modal" data-kind="recording">
+        <div class="modal-header lib-modal-header">
+          <span id="recordingBrowseTitle" class="lib-modal-title">Recordings</span>
+          <button class="lib-modal-refresh" type="button" data-lib-refresh title="Refresh">&#x21bb;</button>
+          <button class="lib-modal-close" type="button" data-lib-close title="Close" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body lib-modal-body">
+          <div class="lib-pane-grid">
+            <aside class="lib-tree-pane">
+              <div class="lib-pane-header">
+                <span class="lib-pane-title">Folders</span>
+                <button class="lib-pane-action" type="button" data-lib-new-folder title="New subfolder under selected folder">+</button>
+              </div>
+              <div class="lib-tree-body" data-lib-tree></div>
+            </aside>
+            <section class="lib-list-pane">
+              <div class="lib-pane-header">
+                <span class="lib-pane-title" data-lib-list-path>Root</span>
+                <span class="lib-pane-count" data-lib-list-count></span>
+              </div>
+              <div class="lib-list-body" data-lib-list></div>
+              <div class="lib-list-empty" data-lib-list-empty hidden>This folder is empty.</div>
+            </section>
+            <section class="lib-preview-pane">
+              <div class="lib-pane-header">
+                <span class="lib-pane-title">Preview</span>
+                <span class="lib-pane-count" data-lib-preview-name></span>
+              </div>
+              <div class="lib-preview-empty" data-lib-preview-empty>Select an item on the left to preview.</div>
+              <div class="lib-preview-content" data-lib-preview-content hidden>
+                <div class="lib-preview-stage" data-lib-preview-stage></div>
+                <div class="lib-preview-meta" data-lib-preview-meta></div>
+                <label class="lib-preview-caption-label">
+                  <span>Caption</span>
+                  <div class="lib-preview-caption-row">
+                    <input type="text" maxlength="2000" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="true" data-form-type="other" data-lib-preview-caption placeholder="Optional note saved next to the file" />
+                    <button type="button" class="primary" data-lib-preview-caption-save>Save</button>
+                    <span class="saved-flash" data-lib-preview-caption-flash>Saved</span>
+                  </div>
+                </label>
+                <div class="lib-preview-actions">
+                  <a href="#" download data-lib-preview-download>
+                    <button type="button">Download</button>
+                  </a>
+                  <button type="button" class="danger" data-lib-preview-delete>Delete</button>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Script library launcher + modal -->
+    <button id="scriptLauncher" class="script-launcher" type="button" title="Open script library" aria-label="Open script library">
+      <span aria-hidden="true">&lt;/&gt;</span>
+    </button>
+    <aside id="scriptLibraryModal" class="script-side-panel" role="complementary" aria-label="Script library" hidden>
+      <div class="script-side-panel-header">
+        <span class="script-side-panel-title">Script library</span>
+        <button id="scriptCloseBtn" class="script-side-panel-close" type="button" aria-label="Close script library" title="Close">&times;</button>
+      </div>
+      <div class="script-modal-body">
+        <div class="script-grid-toolbar">
+          <div id="scriptBreadcrumbs" class="browse-breadcrumbs breadcrumbs"></div>
+          <button id="scriptNewFolderBtn" type="button">+ Folder</button>
+          <button id="scriptNewBtn" type="button" class="primary">+ Script</button>
+          <button id="scriptRefreshBtn" type="button" title="Refresh">&#x21bb;</button>
+        </div>
+        <div class="script-layout">
+          <div id="scriptFolderPane" class="script-folder-pane"></div>
+          <div class="script-grid-pane">
+            <div id="scriptCount" class="muted"></div>
+            <div id="scriptGrid" class="script-grid"></div>
+            <div id="scriptEmpty" class="script-empty" hidden>This folder is empty. Click "+ Script" to add one.</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Script editor modal (create / edit) -->
+    <div id="scriptEditorModal" class="modal-backdrop" role="dialog" aria-modal="true">
+      <div class="modal script-editor-modal">
+        <div class="modal-header">
+          <span id="scriptEditorTitle">New script</span>
+        </div>
+        <div class="modal-body">
+          <label>
+            Label
+            <input id="scriptEditorLabel" type="text" maxlength="200" placeholder="restart-nginx" autocomplete="off" />
+          </label>
+          <label>
+            Language (optional)
+            <input id="scriptEditorLanguage" type="text" maxlength="40" placeholder="bash, powershell, python..." autocomplete="off" />
+          </label>
+          <label>
+            Description (optional)
+            <input id="scriptEditorDescription" type="text" maxlength="280" placeholder="One-line summary" autocomplete="off" />
+          </label>
+          <label>
+            Body
+            <textarea id="scriptEditorBody" spellcheck="false" placeholder="systemctl restart nginx"></textarea>
+          </label>
+          <div id="scriptEditorError" class="modal-error" hidden></div>
+        </div>
+        <div class="modal-footer">
+          <button id="scriptEditorCancel" type="button">Cancel</button>
+          <button id="scriptEditorSave" type="button" class="primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast (transient confirmation messages) -->
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
     <!-- Multi-user chat (revealed only when /api/config reports multiUser=true) -->
     <div id="chatRoot" class="chat-root" hidden>

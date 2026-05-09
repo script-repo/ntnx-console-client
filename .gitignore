@@ -14,3 +14,5 @@ Thumbs.db
 # Multi-user deployment artifacts
 certs/
 screenshots/
+recordings/
+scripts/

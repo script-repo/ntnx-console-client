@@ -28,16 +28,35 @@ const TLS_KEY_PATH_ENV = process.env.NRCC_TLS_KEY || "";
 const CHAT_BUFFER_SIZE = Math.max(10, Number(process.env.NRCC_CHAT_BUFFER || 200));
 const SCREENSHOTS_DIR = path.resolve(process.env.NRCC_SCREENSHOTS_DIR || "./screenshots");
 const SCREENSHOT_MAX_PER_VM = Math.max(1, Number(process.env.NRCC_SCREENSHOT_MAX_PER_VM || 100));
+const RECORDINGS_DIR = path.resolve(process.env.NRCC_RECORDINGS_DIR || "./recordings");
+const RECORDING_FPS = Math.max(1, Math.min(60, Number(process.env.NRCC_RECORDING_FPS || 10)));
+const RECORDING_BITRATE = Math.max(50_000, Number(process.env.NRCC_RECORDING_BITRATE || 600_000));
+const RECORDING_MAX_BYTES = Math.max(
+  1_000_000,
+  Number(process.env.NRCC_RECORDING_MAX_BYTES || 524_288_000)
+);
+const RECORDING_MAX_PER_VM = Math.max(1, Number(process.env.NRCC_RECORDING_MAX_PER_VM || 50));
+const SCRIPTS_DIR = path.resolve(process.env.NRCC_SCRIPTS_DIR || "./scripts");
+const SCRIPT_MAX_BYTES = Math.max(1024, Number(process.env.NRCC_SCRIPT_MAX_BYTES || 262_144));
 
 // Strict UUID match used everywhere we accept a VM UUID from the client.
 // Lowercase and hyphenated, no curly braces, no upper-case (the server
 // side normalises to lowercase before any filesystem use).
 const VM_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Ensure the screenshots directory exists at boot. Doing this once here
-// means individual writes only have to mkdir the per-VM subfolder.
-try { fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true }); }
-catch (err) { console.warn(`[screenshots] could not create ${SCREENSHOTS_DIR}: ${err.message}`); }
+// Ensure the asset directories exist at boot. Doing this once here
+// means individual writes only have to mkdir per-VM / per-folder subdirs.
+for (const [label, dir] of [
+  ["screenshots", SCREENSHOTS_DIR],
+  ["recordings", RECORDINGS_DIR],
+  ["scripts", SCRIPTS_DIR]
+]) {
+  try { fs.mkdirSync(dir, { recursive: true }); }
+  catch (err) { console.warn(`[${label}] could not create ${dir}: ${err.message}`); }
+}
+// Recordings need a temp area for in-flight chunked uploads.
+try { fs.mkdirSync(path.join(RECORDINGS_DIR, "_tmp"), { recursive: true }); }
+catch (err) { console.warn(`[recordings] could not create _tmp: ${err.message}`); }
 
 // Pull every IPv4 address on the box for the self-signed cert's SAN
 // list, so a browser pointed at the LAN IP doesn't trip a CN mismatch
@@ -250,6 +269,15 @@ app.get("/api/config", (req, res) => {
     multiUser: MULTI_USER_MODE,
     chatBufferSize: CHAT_BUFFER_SIZE,
     screenshotMaxPerVm: SCREENSHOT_MAX_PER_VM,
+    recording: {
+      fps: RECORDING_FPS,
+      bitrate: RECORDING_BITRATE,
+      maxBytes: RECORDING_MAX_BYTES,
+      maxPerVm: RECORDING_MAX_PER_VM
+    },
+    scripts: {
+      maxBytes: SCRIPT_MAX_BYTES
+    },
     currentUser: req.nrccSession.currentUser || null
   });
 });
@@ -283,62 +311,254 @@ app.post("/api/logout", (req, res) => {
 });
 
 // =====================================================================
-// Per-VM screenshots. Available in both single- and multi-user modes.
-// Browser captures `canvas.toBlob('image/png')` and POSTs the base64
-// payload here; we write it under <SCREENSHOTS_DIR>/<uuid>/<ts>.png
-// and prune oldest beyond NRCC_SCREENSHOT_MAX_PER_VM. UUID and
-// filename are both validated against strict regexes so a malicious
-// path component can't escape the per-VM directory.
+// Shared asset-library helpers (used by screenshots, recordings, and
+// scripts). These centralise the path-safety pattern that the original
+// per-VM screenshot routes invented:
+//   - validate the UUID and folder path against strict regexes,
+//   - resolve the absolute path,
+//   - re-verify the resolved path is still inside the configured base
+//     directory (defence in depth against any edge-case unicode /
+//     normalisation trick the regex might have missed).
+// Each asset can carry a single text caption stored in a sibling
+// `<file>.json` sidecar; `readMeta` / `writeMeta` / `removeMeta`
+// hide that detail from the route handlers.
 // =====================================================================
-const SAFE_FILENAME_REGEX = /^[\w.-]+\.png$/;
+const SCREENSHOT_FILENAME_REGEX = /^[\w.-]+\.png$/;
+const RECORDING_FILENAME_REGEX = /^[\w.-]+\.webm$/;
+const SCRIPT_FILENAME_REGEX = /^[\w.-]+\.txt$/;
+// Each path segment in a virtual subfolder name. Letters, digits,
+// underscores, dots, hyphens, spaces. Length-capped per segment to keep
+// things sane on Windows (which has stricter total-path limits than
+// POSIX).
+const FOLDER_SEGMENT_REGEX = /^[\w.\- ]{1,64}$/;
+const MAX_FOLDER_DEPTH = 8;
+const MAX_CAPTION_BYTES = 2048;
 
-function safeVmDir(vmUuid) {
-  const lower = String(vmUuid || "").toLowerCase();
-  if (!VM_UUID_REGEX.test(lower)) return null;
-  const dir = path.join(SCREENSHOTS_DIR, lower);
-  // Defence in depth: confirm the resolved path is still under the base dir.
-  if (!dir.startsWith(SCREENSHOTS_DIR + path.sep) && dir !== SCREENSHOTS_DIR) {
-    return null;
+function safeRelFolder(folder) {
+  if (folder === undefined || folder === null) return "";
+  const raw = String(folder).trim();
+  if (!raw || raw === "/" || raw === ".") return "";
+  // Reject backslashes outright; a Windows-style path has no business
+  // arriving from the browser, and accepting them would let a client
+  // smuggle `..\` past the POSIX-only normalisation below.
+  if (raw.includes("\\")) return null;
+  if (raw.startsWith("/")) return null;
+  const segments = raw.split("/").filter(Boolean);
+  if (segments.length > MAX_FOLDER_DEPTH) return null;
+  for (const seg of segments) {
+    if (seg === "." || seg === "..") return null;
+    if (!FOLDER_SEGMENT_REGEX.test(seg)) return null;
   }
-  return dir;
+  return segments.join("/");
 }
 
-function listScreenshotEntries(vmDir) {
+function safeVmUuid(vmUuid) {
+  const lower = String(vmUuid || "").toLowerCase();
+  return VM_UUID_REGEX.test(lower) ? lower : null;
+}
+
+// Resolve `<baseDir>[/<vmUuid>][/<rel folder>]` to an absolute path,
+// re-checking that the resolved path is still under baseDir. Pass
+// `vmUuid = null` for non-VM-scoped libraries (i.e. scripts).
+function safeAssetDir(baseDir, vmUuid, folder) {
+  let root = baseDir;
+  if (vmUuid !== null) {
+    const lower = safeVmUuid(vmUuid);
+    if (!lower) return null;
+    root = path.join(baseDir, lower);
+  }
+  const rel = safeRelFolder(folder);
+  if (rel === null) return null;
+  const abs = rel ? path.join(root, ...rel.split("/")) : root;
+  // Defence in depth: confirm the resolved path is still under baseDir.
+  const baseWithSep = baseDir + path.sep;
+  if (!abs.startsWith(baseWithSep) && abs !== baseDir) return null;
+  return abs;
+}
+
+function metaPathFor(absFile) {
+  return `${absFile}.json`;
+}
+
+function readMeta(absFile) {
+  try {
+    const raw = fs.readFileSync(metaPathFor(absFile), "utf8");
+    const data = JSON.parse(raw);
+    return (data && typeof data === "object") ? data : {};
+  } catch (_e) {
+    return {};
+  }
+}
+
+function writeMeta(absFile, patch) {
+  const current = readMeta(absFile);
+  const merged = { ...current, ...patch };
+  try {
+    fs.writeFileSync(metaPathFor(absFile), JSON.stringify(merged), { mode: 0o644 });
+    return merged;
+  } catch (err) {
+    throw new Error(`Could not write metadata: ${err.message}`);
+  }
+}
+
+function removeMeta(absFile) {
+  try { fs.unlinkSync(metaPathFor(absFile)); }
+  catch (_e) { /* sidecar may not exist; that's fine */ }
+}
+
+// Recursive listing for a single asset folder: returns the immediate
+// child folders and the immediate child files matching `fileRegex`.
+// Each file entry includes its caption sidecar value if present.
+function listAssetEntries(absDir, fileRegex) {
   let names;
-  try { names = fs.readdirSync(vmDir); }
+  try { names = fs.readdirSync(absDir, { withFileTypes: true }); }
   catch (err) {
-    if (err.code === "ENOENT") return [];
+    if (err.code === "ENOENT") return { folders: [], items: [] };
     throw err;
   }
+  const folders = [];
   const items = [];
-  for (const name of names) {
-    if (!SAFE_FILENAME_REGEX.test(name)) continue;
-    try {
-      const stat = fs.statSync(path.join(vmDir, name));
-      if (!stat.isFile()) continue;
-      items.push({ filename: name, sizeBytes: stat.size, tsMs: stat.mtimeMs });
-    } catch (_e) { /* file vanished mid-list, skip */ }
+  for (const dirent of names) {
+    const name = dirent.name;
+    if (dirent.isDirectory()) {
+      // Skip the recordings _tmp staging dir if it ever leaks into a
+      // listing; its contents are not user-facing.
+      if (name === "_tmp") continue;
+      if (!FOLDER_SEGMENT_REGEX.test(name)) continue;
+      folders.push({ name });
+      continue;
+    }
+    if (!dirent.isFile()) continue;
+    if (!fileRegex.test(name)) continue;
+    const abs = path.join(absDir, name);
+    let stat;
+    try { stat = fs.statSync(abs); } catch (_e) { continue; }
+    const meta = readMeta(abs);
+    items.push({
+      filename: name,
+      sizeBytes: stat.size,
+      tsMs: stat.mtimeMs,
+      caption: typeof meta.caption === "string" ? meta.caption : "",
+      author: typeof meta.author === "string" ? meta.author : "",
+      durationMs: Number.isFinite(meta.durationMs) ? meta.durationMs : null,
+      width: Number.isFinite(meta.width) ? meta.width : null,
+      height: Number.isFinite(meta.height) ? meta.height : null,
+      mimeType: typeof meta.mimeType === "string" ? meta.mimeType : null
+    });
   }
-  // Newest first.
+  folders.sort((a, b) => a.name.localeCompare(b.name));
   items.sort((a, b) => b.tsMs - a.tsMs);
-  return items;
+  return { folders, items };
 }
 
-app.post("/api/screenshots/:vmUuid", (req, res) => {
-  const vmDir = safeVmDir(req.params.vmUuid);
-  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+// Walk every file (matching fileRegex) under vmRoot, including nested
+// subfolders. Used by retention enforcement so the cap applies across
+// the entire per-VM tree rather than per-folder.
+function walkAssetFiles(absRoot, fileRegex) {
+  const out = [];
+  const stack = [absRoot];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (_e) { continue; }
+    for (const dirent of entries) {
+      const abs = path.join(dir, dirent.name);
+      if (dirent.isDirectory()) {
+        if (dirent.name === "_tmp") continue;
+        stack.push(abs);
+        continue;
+      }
+      if (!dirent.isFile()) continue;
+      if (!fileRegex.test(dirent.name)) continue;
+      try {
+        const stat = fs.statSync(abs);
+        out.push({ abs, tsMs: stat.mtimeMs });
+      } catch (_e) { /* ignore */ }
+    }
+  }
+  out.sort((a, b) => b.tsMs - a.tsMs);
+  return out;
+}
 
-  let { pngBase64 } = req.body || {};
+// Walks the tree under absRoot and returns a nested folder structure
+// (files are not enumerated, only counted per folder). Used by the
+// 3-pane Finder-style library browser to render the left tree pane in
+// one shot rather than fetching each level on expand.
+function walkAssetTree(absRoot, fileRegex) {
+  function visit(absDir, name) {
+    let entries = [];
+    try { entries = fs.readdirSync(absDir, { withFileTypes: true }); }
+    catch (_e) { return { name, children: [], fileCount: 0 }; }
+    const children = [];
+    let fileCount = 0;
+    for (const dirent of entries) {
+      if (dirent.isDirectory()) {
+        if (dirent.name === "_tmp") continue;
+        if (!FOLDER_SEGMENT_REGEX.test(dirent.name)) continue;
+        children.push(visit(path.join(absDir, dirent.name), dirent.name));
+      } else if (dirent.isFile() && fileRegex.test(dirent.name)) {
+        fileCount++;
+      }
+    }
+    children.sort((a, b) => a.name.localeCompare(b.name));
+    return { name, children, fileCount };
+  }
+  return visit(absRoot, "");
+}
+
+function enforceRetention(absRoot, fileRegex, max) {
+  const all = walkAssetFiles(absRoot, fileRegex);
+  if (all.length <= max) return 0;
+  const overflow = all.slice(max);
+  let pruned = 0;
+  for (const item of overflow) {
+    try { fs.unlinkSync(item.abs); pruned++; }
+    catch (_e) { /* ignore */ }
+    removeMeta(item.abs);
+  }
+  return pruned;
+}
+
+function clampCaption(value) {
+  const s = typeof value === "string" ? value : "";
+  if (Buffer.byteLength(s, "utf8") > MAX_CAPTION_BYTES) {
+    // Truncate by characters; chunkier than byte-truncation but avoids
+    // splitting a multibyte sequence in half.
+    return s.slice(0, MAX_CAPTION_BYTES);
+  }
+  return s;
+}
+
+function isoStamp() {
+  return new Date().toISOString().replace(/:/g, "-");
+}
+
+function relPathFor(baseDir, absFile) {
+  return path.relative(process.cwd(), absFile) || baseDir;
+}
+
+// =====================================================================
+// Per-VM screenshots. Available in both single- and multi-user modes.
+// Browser captures `canvas.toBlob('image/png')` and POSTs the base64
+// payload here; we write it under
+// <SCREENSHOTS_DIR>/<uuid>[/<subfolder>...]/<ts>.png and prune oldest
+// beyond NRCC_SCREENSHOT_MAX_PER_VM (counted across the whole tree).
+// =====================================================================
+app.post("/api/screenshots/:vmUuid", (req, res) => {
+  const vmRoot = safeAssetDir(SCREENSHOTS_DIR, req.params.vmUuid, "");
+  if (!vmRoot) return res.status(400).json({ error: "Invalid vmUuid." });
+  const targetDir = safeAssetDir(SCREENSHOTS_DIR, req.params.vmUuid, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid folder." });
+
+  let { pngBase64, caption } = req.body || {};
   if (typeof pngBase64 !== "string" || !pngBase64) {
     return res.status(400).json({ error: "Missing pngBase64 body." });
   }
-  // Strip an optional data URL prefix.
   const commaIdx = pngBase64.indexOf(",");
   if (pngBase64.startsWith("data:") && commaIdx > 0) {
     pngBase64 = pngBase64.slice(commaIdx + 1);
   }
-  // Hard cap at ~10 MB encoded (~7 MB decoded) so a runaway client
-  // can't fill the disk in one POST.
   if (pngBase64.length > 10 * 1024 * 1024) {
     return res.status(413).json({ error: "Screenshot exceeds 10 MB limit." });
   }
@@ -346,86 +566,758 @@ app.post("/api/screenshots/:vmUuid", (req, res) => {
   let buf;
   try { buf = Buffer.from(pngBase64, "base64"); }
   catch (_e) { return res.status(400).json({ error: "Invalid base64 payload." }); }
-  // PNG magic: 89 50 4E 47 0D 0A 1A 0A.
   if (buf.length < 8 || buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47) {
     return res.status(400).json({ error: "Payload is not a PNG." });
   }
 
-  try { fs.mkdirSync(vmDir, { recursive: true }); }
+  try { fs.mkdirSync(targetDir, { recursive: true }); }
   catch (err) {
-    return res.status(500).json({ error: `Could not create vm folder: ${err.message}` });
+    return res.status(500).json({ error: `Could not create folder: ${err.message}` });
   }
 
-  // ISO 8601 timestamp with colons -> dashes for filesystem portability.
-  const stamp = new Date().toISOString().replace(/:/g, "-");
-  const filename = `${stamp}.png`;
-  const fullPath = path.join(vmDir, filename);
-  try {
-    fs.writeFileSync(fullPath, buf);
-  } catch (err) {
+  const filename = `${isoStamp()}.png`;
+  const fullPath = path.join(targetDir, filename);
+  try { fs.writeFileSync(fullPath, buf); }
+  catch (err) {
     return res.status(500).json({ error: `Could not write screenshot: ${err.message}` });
   }
+  if (typeof caption === "string" && caption.trim()) {
+    try {
+      writeMeta(fullPath, {
+        caption: clampCaption(caption),
+        author: req.nrccSession?.currentUser || "",
+        tsMs: Date.now()
+      });
+    } catch (_e) { /* best-effort */ }
+  }
 
-  // Retention enforcement: keep only the newest SCREENSHOT_MAX_PER_VM.
   let prunedCount = 0;
-  try {
-    const all = listScreenshotEntries(vmDir);
-    if (all.length > SCREENSHOT_MAX_PER_VM) {
-      const overflow = all.slice(SCREENSHOT_MAX_PER_VM);
-      for (const item of overflow) {
-        try { fs.unlinkSync(path.join(vmDir, item.filename)); prunedCount++; }
-        catch (_e) { /* ignore individual failures */ }
-      }
-    }
-  } catch (_e) { /* best-effort pruning */ }
+  try { prunedCount = enforceRetention(vmRoot, SCREENSHOT_FILENAME_REGEX, SCREENSHOT_MAX_PER_VM); }
+  catch (_e) { /* best-effort */ }
 
   res.json({
     filename,
-    savedPath: path.relative(process.cwd(), fullPath),
+    folder: safeRelFolder(req.query.folder || "") || "",
+    savedPath: relPathFor(SCREENSHOTS_DIR, fullPath),
     sizeBytes: buf.length,
     prunedCount
   });
 });
 
 app.get("/api/screenshots/:vmUuid", (req, res) => {
-  const vmDir = safeVmDir(req.params.vmUuid);
-  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+  const targetDir = safeAssetDir(SCREENSHOTS_DIR, req.params.vmUuid, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid vmUuid or folder." });
   try {
-    res.json({ items: listScreenshotEntries(vmDir) });
+    const { folders, items } = listAssetEntries(targetDir, SCREENSHOT_FILENAME_REGEX);
+    res.json({ folder: safeRelFolder(req.query.folder || "") || "", folders, items });
   } catch (err) {
     res.status(500).json({ error: `Could not list screenshots: ${err.message}` });
   }
 });
 
+// More-specific routes MUST be registered before the wildcard /:filename
+// route below; otherwise Express's first-match-wins routing would let
+// requests like DELETE /folders or PUT /meta hit the per-file handler
+// (which would then reject the literal string "folders" / "meta" as a
+// bad filename).
+app.post("/api/screenshots/:vmUuid/folders", (req, res) => {
+  return assetCreateFolder(req, res, SCREENSHOTS_DIR, req.params.vmUuid);
+});
+app.delete("/api/screenshots/:vmUuid/folders", (req, res) => {
+  return assetDeleteFolder(req, res, SCREENSHOTS_DIR, req.params.vmUuid);
+});
+app.post("/api/screenshots/:vmUuid/move", (req, res) => {
+  return assetMove(req, res, SCREENSHOTS_DIR, req.params.vmUuid, SCREENSHOT_FILENAME_REGEX);
+});
+app.put("/api/screenshots/:vmUuid/meta", (req, res) => {
+  return assetSetCaption(req, res, SCREENSHOTS_DIR, req.params.vmUuid, SCREENSHOT_FILENAME_REGEX);
+});
+app.get("/api/screenshots/:vmUuid/tree", (req, res) => {
+  const root = safeAssetDir(SCREENSHOTS_DIR, req.params.vmUuid, "");
+  if (!root) return res.status(400).json({ error: "Invalid vmUuid." });
+  try { res.json({ tree: walkAssetTree(root, SCREENSHOT_FILENAME_REGEX) }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get("/api/screenshots/:vmUuid/:filename", (req, res) => {
-  const vmDir = safeVmDir(req.params.vmUuid);
-  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+  const targetDir = safeAssetDir(SCREENSHOTS_DIR, req.params.vmUuid, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid vmUuid or folder." });
   const filename = String(req.params.filename || "");
-  if (!SAFE_FILENAME_REGEX.test(filename)) {
+  if (!SCREENSHOT_FILENAME_REGEX.test(filename)) {
     return res.status(400).json({ error: "Invalid filename." });
   }
-  const fullPath = path.join(vmDir, filename);
+  const fullPath = path.join(targetDir, filename);
   if (!fs.existsSync(fullPath)) return res.status(404).json({ error: "Not found." });
-  res.set("Cache-Control", "private, max-age=300");
+  // ?download=1 forces an attachment disposition so the browser saves
+  // the PNG rather than opening it inline (matches the recording route).
+  const isDownload = String(req.query.download || "") === "1";
+  if (isDownload) {
+    res.set("Cache-Control", "no-store");
+    res.set("Content-Disposition", `attachment; filename="${filename}"`);
+  } else {
+    res.set("Cache-Control", "private, max-age=300");
+  }
   res.type("image/png");
   res.sendFile(fullPath);
 });
 
 app.delete("/api/screenshots/:vmUuid/:filename", (req, res) => {
-  const vmDir = safeVmDir(req.params.vmUuid);
-  if (!vmDir) return res.status(400).json({ error: "Invalid vmUuid." });
+  const targetDir = safeAssetDir(SCREENSHOTS_DIR, req.params.vmUuid, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid vmUuid or folder." });
   const filename = String(req.params.filename || "");
-  if (!SAFE_FILENAME_REGEX.test(filename)) {
+  if (!SCREENSHOT_FILENAME_REGEX.test(filename)) {
     return res.status(400).json({ error: "Invalid filename." });
   }
-  const fullPath = path.join(vmDir, filename);
+  const fullPath = path.join(targetDir, filename);
   try {
     fs.unlinkSync(fullPath);
+    removeMeta(fullPath);
     res.json({ ok: true });
   } catch (err) {
     if (err.code === "ENOENT") return res.status(404).json({ error: "Not found." });
     res.status(500).json({ error: `Could not delete: ${err.message}` });
   }
+});
+
+// =====================================================================
+// Per-VM session recordings. Browser uses canvas.captureStream(fps) +
+// MediaRecorder (WebM/VP9 with VP8 fallback) and uploads the data in
+// 2-second chunks via /chunk. The server appends to a single temp file
+// per recordingId, then renames it into place on /finish. Anything
+// abandoned in _tmp older than 1h is swept by the periodic cleanup.
+// =====================================================================
+const RECORDING_TMP_DIR = path.join(RECORDINGS_DIR, "_tmp");
+const RECORDING_TMP_TTL_MS = 60 * 60 * 1000;
+// In-memory state keyed by recordingId. Lost on process restart, which
+// also strands the matching _tmp file -- the periodic sweep deletes
+// those.
+const activeRecordings = new Map();
+
+function assetCreateFolder(req, res, baseDir, vmUuid) {
+  const folder = safeRelFolder((req.body || {}).path || "");
+  if (folder === null || !folder) return res.status(400).json({ error: "Invalid folder path." });
+  const target = safeAssetDir(baseDir, vmUuid, folder);
+  if (!target) return res.status(400).json({ error: "Invalid folder path." });
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    res.json({ folder });
+  } catch (err) {
+    res.status(500).json({ error: `Could not create folder: ${err.message}` });
+  }
+}
+
+function assetDeleteFolder(req, res, baseDir, vmUuid) {
+  const folder = safeRelFolder((req.body || {}).path || "");
+  if (folder === null || !folder) return res.status(400).json({ error: "Invalid folder path." });
+  const target = safeAssetDir(baseDir, vmUuid, folder);
+  if (!target) return res.status(400).json({ error: "Invalid folder path." });
+  let entries;
+  try { entries = fs.readdirSync(target); }
+  catch (err) {
+    if (err.code === "ENOENT") return res.status(404).json({ error: "Not found." });
+    return res.status(500).json({ error: `Could not read folder: ${err.message}` });
+  }
+  if (entries.length > 0) {
+    return res.status(409).json({ error: "Folder is not empty." });
+  }
+  try {
+    fs.rmdirSync(target);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: `Could not remove folder: ${err.message}` });
+  }
+}
+
+function assetMove(req, res, baseDir, vmUuid, fileRegex) {
+  const body = req.body || {};
+  const fromFolder = safeRelFolder(body.fromFolder || "");
+  const toFolder = safeRelFolder(body.toFolder || "");
+  if (fromFolder === null || toFolder === null) {
+    return res.status(400).json({ error: "Invalid folder path." });
+  }
+  const fromName = String(body.fromName || "");
+  const toName = String(body.toName || fromName);
+  if (!fromName) return res.status(400).json({ error: "Missing fromName." });
+  // Two operating modes: file move/rename (matches fileRegex) or
+  // folder move/rename (matches FOLDER_SEGMENT_REGEX, single-segment).
+  const isFile = fileRegex.test(fromName);
+  const isFolder = FOLDER_SEGMENT_REGEX.test(fromName) && !fileRegex.test(fromName);
+  if (!isFile && !isFolder) return res.status(400).json({ error: "Invalid fromName." });
+  if (isFile && !fileRegex.test(toName)) {
+    return res.status(400).json({ error: "Invalid toName for file." });
+  }
+  if (isFolder && !FOLDER_SEGMENT_REGEX.test(toName)) {
+    return res.status(400).json({ error: "Invalid toName for folder." });
+  }
+  const fromDir = safeAssetDir(baseDir, vmUuid, fromFolder);
+  const toDir = safeAssetDir(baseDir, vmUuid, toFolder);
+  if (!fromDir || !toDir) return res.status(400).json({ error: "Invalid folder." });
+  const fromAbs = path.join(fromDir, fromName);
+  const toAbs = path.join(toDir, toName);
+  if (!fs.existsSync(fromAbs)) return res.status(404).json({ error: "Source not found." });
+  if (fs.existsSync(toAbs)) return res.status(409).json({ error: "Destination already exists." });
+  try {
+    fs.mkdirSync(toDir, { recursive: true });
+    fs.renameSync(fromAbs, toAbs);
+    if (isFile) {
+      const fromMeta = metaPathFor(fromAbs);
+      if (fs.existsSync(fromMeta)) {
+        try { fs.renameSync(fromMeta, metaPathFor(toAbs)); } catch (_e) { /* ignore */ }
+      }
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: `Could not move: ${err.message}` });
+  }
+}
+
+function assetSetCaption(req, res, baseDir, vmUuid, fileRegex) {
+  const body = req.body || {};
+  const folder = safeRelFolder(body.folder || "");
+  if (folder === null) return res.status(400).json({ error: "Invalid folder." });
+  const filename = String(body.filename || "");
+  if (!fileRegex.test(filename)) return res.status(400).json({ error: "Invalid filename." });
+  const target = safeAssetDir(baseDir, vmUuid, folder);
+  if (!target) return res.status(400).json({ error: "Invalid folder." });
+  const abs = path.join(target, filename);
+  if (!fs.existsSync(abs)) return res.status(404).json({ error: "Not found." });
+  try {
+    if (typeof body.caption !== "string") {
+      return res.status(400).json({ error: "Missing caption." });
+    }
+    const caption = clampCaption(body.caption);
+    if (caption === "") {
+      removeMeta(abs);
+      return res.json({ caption: "" });
+    }
+    const meta = writeMeta(abs, {
+      caption,
+      author: req.nrccSession?.currentUser || "",
+      tsMs: Date.now()
+    });
+    res.json({ caption: meta.caption });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+app.post("/api/recordings/:vmUuid/start", (req, res) => {
+  const vmRoot = safeAssetDir(RECORDINGS_DIR, req.params.vmUuid, "");
+  if (!vmRoot) return res.status(400).json({ error: "Invalid vmUuid." });
+  const folder = safeRelFolder((req.body || {}).folder || "");
+  if (folder === null) return res.status(400).json({ error: "Invalid folder." });
+  const targetDir = safeAssetDir(RECORDINGS_DIR, req.params.vmUuid, folder);
+  if (!targetDir) return res.status(400).json({ error: "Invalid folder." });
+
+  const body = req.body || {};
+  const fps = Math.max(1, Math.min(60, Number(body.fps) || RECORDING_FPS));
+  const width = Math.max(0, Math.min(8192, Number(body.width) || 0));
+  const height = Math.max(0, Math.min(8192, Number(body.height) || 0));
+  const mimeRaw = typeof body.mimeType === "string" ? body.mimeType : "";
+  const mimeType = /^video\/webm/i.test(mimeRaw) ? mimeRaw : "video/webm";
+
+  try { fs.mkdirSync(RECORDING_TMP_DIR, { recursive: true }); }
+  catch (err) {
+    return res.status(500).json({ error: `Could not create temp dir: ${err.message}` });
+  }
+  const recordingId = crypto.randomUUID();
+  const tmpPath = path.join(RECORDING_TMP_DIR, `${recordingId}.webm`);
+  try {
+    fs.writeFileSync(tmpPath, Buffer.alloc(0));
+  } catch (err) {
+    return res.status(500).json({ error: `Could not allocate temp file: ${err.message}` });
+  }
+  activeRecordings.set(recordingId, {
+    vmUuid: safeVmUuid(req.params.vmUuid),
+    folder,
+    fps,
+    width,
+    height,
+    mimeType,
+    tmpPath,
+    bytesWritten: 0,
+    startedAt: Date.now(),
+    author: req.nrccSession?.currentUser || ""
+  });
+  res.json({ recordingId, fps, mimeType, maxBytes: RECORDING_MAX_BYTES });
+});
+
+// Chunks come in as raw octet-stream so we can append them straight to
+// disk without going through JSON or base64. The 8 MB cap matches the
+// per-chunk budget the client uses (2-second slices at the configured
+// bitrate stay well under this).
+app.post(
+  "/api/recordings/:vmUuid/chunk",
+  express.raw({ type: "application/octet-stream", limit: "8mb" }),
+  (req, res) => {
+    if (!safeVmUuid(req.params.vmUuid)) {
+      return res.status(400).json({ error: "Invalid vmUuid." });
+    }
+    const recordingId = String(req.query.recordingId || "");
+    const state = activeRecordings.get(recordingId);
+    if (!state || state.vmUuid !== safeVmUuid(req.params.vmUuid)) {
+      return res.status(404).json({ error: "Recording not found." });
+    }
+    const chunk = req.body;
+    if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
+      return res.status(400).json({ error: "Empty chunk." });
+    }
+    if (state.bytesWritten + chunk.length > RECORDING_MAX_BYTES) {
+      try { fs.unlinkSync(state.tmpPath); } catch (_e) { /* ignore */ }
+      activeRecordings.delete(recordingId);
+      return res.status(413).json({ error: "Recording exceeded max bytes; aborted." });
+    }
+    try {
+      fs.appendFileSync(state.tmpPath, chunk);
+      state.bytesWritten += chunk.length;
+      res.json({ bytesWritten: state.bytesWritten });
+    } catch (err) {
+      res.status(500).json({ error: `Could not append chunk: ${err.message}` });
+    }
+  }
+);
+
+app.post("/api/recordings/:vmUuid/finish", (req, res) => {
+  if (!safeVmUuid(req.params.vmUuid)) {
+    return res.status(400).json({ error: "Invalid vmUuid." });
+  }
+  const body = req.body || {};
+  const recordingId = String(body.recordingId || "");
+  const state = activeRecordings.get(recordingId);
+  if (!state || state.vmUuid !== safeVmUuid(req.params.vmUuid)) {
+    return res.status(404).json({ error: "Recording not found." });
+  }
+  activeRecordings.delete(recordingId);
+  if (state.bytesWritten === 0) {
+    try { fs.unlinkSync(state.tmpPath); } catch (_e) { /* ignore */ }
+    return res.status(400).json({ error: "No data captured." });
+  }
+  // EBML magic for WebM / Matroska is 0x1A 0x45 0xDF 0xA3.
+  let magic;
+  try {
+    const fd = fs.openSync(state.tmpPath, "r");
+    magic = Buffer.alloc(4);
+    fs.readSync(fd, magic, 0, 4, 0);
+    fs.closeSync(fd);
+  } catch (err) {
+    try { fs.unlinkSync(state.tmpPath); } catch (_e) { /* ignore */ }
+    return res.status(500).json({ error: `Could not read temp file: ${err.message}` });
+  }
+  if (magic[0] !== 0x1a || magic[1] !== 0x45 || magic[2] !== 0xdf || magic[3] !== 0xa3) {
+    try { fs.unlinkSync(state.tmpPath); } catch (_e) { /* ignore */ }
+    return res.status(400).json({ error: "Payload is not a WebM file." });
+  }
+
+  const targetDir = safeAssetDir(RECORDINGS_DIR, state.vmUuid, state.folder);
+  if (!targetDir) {
+    try { fs.unlinkSync(state.tmpPath); } catch (_e) { /* ignore */ }
+    return res.status(400).json({ error: "Invalid target folder." });
+  }
+  try { fs.mkdirSync(targetDir, { recursive: true }); }
+  catch (err) {
+    return res.status(500).json({ error: `Could not create folder: ${err.message}` });
+  }
+  const filename = `${isoStamp()}.webm`;
+  const fullPath = path.join(targetDir, filename);
+  try { fs.renameSync(state.tmpPath, fullPath); }
+  catch (err) {
+    return res.status(500).json({ error: `Could not finalize recording: ${err.message}` });
+  }
+  const durationMs = Math.max(0, Number(body.durationMs) || (Date.now() - state.startedAt));
+  try {
+    writeMeta(fullPath, {
+      caption: typeof body.caption === "string" ? clampCaption(body.caption) : "",
+      author: state.author,
+      startedAt: state.startedAt,
+      endedAt: Date.now(),
+      durationMs,
+      sizeBytes: state.bytesWritten,
+      fps: state.fps,
+      width: state.width || null,
+      height: state.height || null,
+      mimeType: state.mimeType
+    });
+  } catch (_e) { /* meta failure is non-fatal */ }
+
+  let prunedCount = 0;
+  const vmRoot = safeAssetDir(RECORDINGS_DIR, state.vmUuid, "");
+  if (vmRoot) {
+    try { prunedCount = enforceRetention(vmRoot, RECORDING_FILENAME_REGEX, RECORDING_MAX_PER_VM); }
+    catch (_e) { /* best-effort */ }
+  }
+  res.json({
+    filename,
+    folder: state.folder,
+    durationMs,
+    sizeBytes: state.bytesWritten,
+    prunedCount
+  });
+});
+
+app.post("/api/recordings/:vmUuid/abort", (req, res) => {
+  if (!safeVmUuid(req.params.vmUuid)) {
+    return res.status(400).json({ error: "Invalid vmUuid." });
+  }
+  const recordingId = String((req.body || {}).recordingId || "");
+  const state = activeRecordings.get(recordingId);
+  if (state && state.vmUuid === safeVmUuid(req.params.vmUuid)) {
+    activeRecordings.delete(recordingId);
+    try { fs.unlinkSync(state.tmpPath); } catch (_e) { /* ignore */ }
+  }
+  res.json({ ok: true });
+});
+
+app.get("/api/recordings/:vmUuid", (req, res) => {
+  const targetDir = safeAssetDir(RECORDINGS_DIR, req.params.vmUuid, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid vmUuid or folder." });
+  try {
+    const { folders, items } = listAssetEntries(targetDir, RECORDING_FILENAME_REGEX);
+    res.json({ folder: safeRelFolder(req.query.folder || "") || "", folders, items });
+  } catch (err) {
+    res.status(500).json({ error: `Could not list recordings: ${err.message}` });
+  }
+});
+
+// Range-aware streaming so the browser <video> element can seek
+// without downloading the whole file first. Express's res.sendFile
+// already speaks Range, but we hand-roll the response to keep
+// Cache-Control + Content-Type tightly controlled.
+app.get("/api/recordings/:vmUuid/file", (req, res) => {
+  const targetDir = safeAssetDir(RECORDINGS_DIR, req.params.vmUuid, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid vmUuid or folder." });
+  const filename = String(req.query.filename || "");
+  if (!RECORDING_FILENAME_REGEX.test(filename)) {
+    return res.status(400).json({ error: "Invalid filename." });
+  }
+  const fullPath = path.join(targetDir, filename);
+  let stat;
+  try { stat = fs.statSync(fullPath); }
+  catch (_e) { return res.status(404).json({ error: "Not found." }); }
+
+  // ?download=1 forces a full 200 response with an attachment disposition.
+  // Without this, the inline <video> element fetches the file with Range
+  // requests (HTTP 206) and the browser's download manager refuses to
+  // save the cached partial content, surfacing "Failed to Download".
+  const isDownload = String(req.query.download || "") === "1";
+  res.set("Content-Type", "video/webm");
+  if (isDownload) {
+    res.set("Cache-Control", "no-store");
+    res.set("Content-Disposition", `attachment; filename="${filename}"`);
+    res.set("Content-Length", String(stat.size));
+    return fs.createReadStream(fullPath).pipe(res);
+  }
+
+  const range = req.headers.range;
+  res.set("Cache-Control", "private, max-age=300");
+  res.set("Accept-Ranges", "bytes");
+  if (!range) {
+    res.set("Content-Length", String(stat.size));
+    return fs.createReadStream(fullPath).pipe(res);
+  }
+  const match = /bytes=(\d*)-(\d*)/.exec(range);
+  if (!match) return res.status(416).end();
+  let start = match[1] ? parseInt(match[1], 10) : 0;
+  let end = match[2] ? parseInt(match[2], 10) : stat.size - 1;
+  if (Number.isNaN(start) || Number.isNaN(end) || start > end || end >= stat.size) {
+    res.status(416).set("Content-Range", `bytes */${stat.size}`).end();
+    return;
+  }
+  res.status(206);
+  res.set("Content-Range", `bytes ${start}-${end}/${stat.size}`);
+  res.set("Content-Length", String(end - start + 1));
+  fs.createReadStream(fullPath, { start, end }).pipe(res);
+});
+
+app.delete("/api/recordings/:vmUuid/file", (req, res) => {
+  const targetDir = safeAssetDir(RECORDINGS_DIR, req.params.vmUuid, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid vmUuid or folder." });
+  const filename = String(req.query.filename || "");
+  if (!RECORDING_FILENAME_REGEX.test(filename)) {
+    return res.status(400).json({ error: "Invalid filename." });
+  }
+  const fullPath = path.join(targetDir, filename);
+  try {
+    fs.unlinkSync(fullPath);
+    removeMeta(fullPath);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === "ENOENT") return res.status(404).json({ error: "Not found." });
+    res.status(500).json({ error: `Could not delete: ${err.message}` });
+  }
+});
+
+app.post("/api/recordings/:vmUuid/folders", (req, res) => {
+  return assetCreateFolder(req, res, RECORDINGS_DIR, req.params.vmUuid);
+});
+app.delete("/api/recordings/:vmUuid/folders", (req, res) => {
+  return assetDeleteFolder(req, res, RECORDINGS_DIR, req.params.vmUuid);
+});
+app.post("/api/recordings/:vmUuid/move", (req, res) => {
+  return assetMove(req, res, RECORDINGS_DIR, req.params.vmUuid, RECORDING_FILENAME_REGEX);
+});
+app.put("/api/recordings/:vmUuid/meta", (req, res) => {
+  return assetSetCaption(req, res, RECORDINGS_DIR, req.params.vmUuid, RECORDING_FILENAME_REGEX);
+});
+app.get("/api/recordings/:vmUuid/tree", (req, res) => {
+  const root = safeAssetDir(RECORDINGS_DIR, req.params.vmUuid, "");
+  if (!root) return res.status(400).json({ error: "Invalid vmUuid." });
+  try { res.json({ tree: walkAssetTree(root, RECORDING_FILENAME_REGEX) }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Sweep abandoned chunked-upload temp files so a crashed browser
+// doesn't leak disk space. Runs once on boot and once per hour.
+function sweepRecordingTmp() {
+  let entries;
+  try { entries = fs.readdirSync(RECORDING_TMP_DIR); }
+  catch (_e) { return; }
+  const now = Date.now();
+  for (const name of entries) {
+    if (!/^[\w-]+\.webm$/.test(name)) continue;
+    const abs = path.join(RECORDING_TMP_DIR, name);
+    try {
+      const stat = fs.statSync(abs);
+      if (now - stat.mtimeMs > RECORDING_TMP_TTL_MS) fs.unlinkSync(abs);
+    } catch (_e) { /* ignore */ }
+  }
+}
+sweepRecordingTmp();
+setInterval(sweepRecordingTmp, 60 * 60 * 1000);
+
+// =====================================================================
+// Global script library. Plain-text snippets the user can copy to the
+// clipboard from the browser. "Global" here is literal: every signed-in
+// user can read, write, edit, and delete every script. There is no
+// per-user namespace and no role gating -- consistent with the rest of
+// NRCC, which already trusts every authenticated session equally.
+// =====================================================================
+function slugifyLabel(label) {
+  const cleaned = String(label || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  if (!cleaned) return null;
+  return cleaned;
+}
+
+function uniqueScriptFilename(targetDir, baseSlug) {
+  let candidate = `${baseSlug}.txt`;
+  let n = 2;
+  while (fs.existsSync(path.join(targetDir, candidate))) {
+    candidate = `${baseSlug}-${n}.txt`;
+    n++;
+    if (n > 9999) {
+      candidate = `${baseSlug}-${crypto.randomUUID().slice(0, 8)}.txt`;
+      break;
+    }
+  }
+  return candidate;
+}
+
+function readScriptMeta(absFile) {
+  const meta = readMeta(absFile);
+  return {
+    label: typeof meta.label === "string" ? meta.label : "",
+    description: typeof meta.description === "string" ? meta.description : "",
+    language: typeof meta.language === "string" ? meta.language : "",
+    author: typeof meta.author === "string" ? meta.author : "",
+    tsMs: Number.isFinite(meta.tsMs) ? meta.tsMs : null
+  };
+}
+
+function listScriptEntries(absDir) {
+  let names;
+  try { names = fs.readdirSync(absDir, { withFileTypes: true }); }
+  catch (err) {
+    if (err.code === "ENOENT") return { folders: [], items: [] };
+    throw err;
+  }
+  const folders = [];
+  const items = [];
+  for (const dirent of names) {
+    const name = dirent.name;
+    if (dirent.isDirectory()) {
+      if (!FOLDER_SEGMENT_REGEX.test(name)) continue;
+      folders.push({ name });
+      continue;
+    }
+    if (!dirent.isFile()) continue;
+    if (!SCRIPT_FILENAME_REGEX.test(name)) continue;
+    const abs = path.join(absDir, name);
+    let stat;
+    try { stat = fs.statSync(abs); } catch (_e) { continue; }
+    const meta = readScriptMeta(abs);
+    items.push({
+      filename: name,
+      label: meta.label || name.replace(/\.txt$/, ""),
+      description: meta.description,
+      language: meta.language,
+      author: meta.author,
+      sizeBytes: stat.size,
+      tsMs: stat.mtimeMs
+    });
+  }
+  folders.sort((a, b) => a.name.localeCompare(b.name));
+  items.sort((a, b) => a.label.localeCompare(b.label));
+  return { folders, items };
+}
+
+app.get("/api/scripts", (req, res) => {
+  const targetDir = safeAssetDir(SCRIPTS_DIR, null, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid folder." });
+  try {
+    const { folders, items } = listScriptEntries(targetDir);
+    res.json({ folder: safeRelFolder(req.query.folder || "") || "", folders, items });
+  } catch (err) {
+    res.status(500).json({ error: `Could not list scripts: ${err.message}` });
+  }
+});
+
+app.get("/api/scripts/file", (req, res) => {
+  const targetDir = safeAssetDir(SCRIPTS_DIR, null, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid folder." });
+  const filename = String(req.query.filename || "");
+  if (!SCRIPT_FILENAME_REGEX.test(filename)) {
+    return res.status(400).json({ error: "Invalid filename." });
+  }
+  const abs = path.join(targetDir, filename);
+  let body;
+  try { body = fs.readFileSync(abs, "utf8"); }
+  catch (err) {
+    if (err.code === "ENOENT") return res.status(404).json({ error: "Not found." });
+    return res.status(500).json({ error: `Could not read script: ${err.message}` });
+  }
+  const meta = readScriptMeta(abs);
+  res.json({
+    filename,
+    folder: safeRelFolder(req.query.folder || "") || "",
+    body,
+    label: meta.label || filename.replace(/\.txt$/, ""),
+    description: meta.description,
+    language: meta.language,
+    author: meta.author,
+    tsMs: meta.tsMs
+  });
+});
+
+app.post("/api/scripts", (req, res) => {
+  const body = req.body || {};
+  const folder = safeRelFolder(body.folder || "");
+  if (folder === null) return res.status(400).json({ error: "Invalid folder." });
+  const targetDir = safeAssetDir(SCRIPTS_DIR, null, folder);
+  if (!targetDir) return res.status(400).json({ error: "Invalid folder." });
+  const label = typeof body.label === "string" ? body.label.trim() : "";
+  const slug = slugifyLabel(label);
+  if (!slug) return res.status(400).json({ error: "Label is required." });
+  const text = typeof body.body === "string" ? body.body : "";
+  if (Buffer.byteLength(text, "utf8") > SCRIPT_MAX_BYTES) {
+    return res.status(413).json({ error: "Script body exceeds size limit." });
+  }
+  try { fs.mkdirSync(targetDir, { recursive: true }); }
+  catch (err) {
+    return res.status(500).json({ error: `Could not create folder: ${err.message}` });
+  }
+  const filename = uniqueScriptFilename(targetDir, slug);
+  const abs = path.join(targetDir, filename);
+  try {
+    fs.writeFileSync(abs, text, { mode: 0o644 });
+    writeMeta(abs, {
+      label,
+      description: typeof body.description === "string" ? body.description : "",
+      language: typeof body.language === "string" ? body.language : "",
+      author: req.nrccSession?.currentUser || "",
+      tsMs: Date.now()
+    });
+    res.json({ folder, filename, label });
+  } catch (err) {
+    res.status(500).json({ error: `Could not write script: ${err.message}` });
+  }
+});
+
+app.put("/api/scripts/file", (req, res) => {
+  const body = req.body || {};
+  const folder = safeRelFolder(body.folder || "");
+  if (folder === null) return res.status(400).json({ error: "Invalid folder." });
+  const targetDir = safeAssetDir(SCRIPTS_DIR, null, folder);
+  if (!targetDir) return res.status(400).json({ error: "Invalid folder." });
+  const filename = String(body.filename || "");
+  if (!SCRIPT_FILENAME_REGEX.test(filename)) {
+    return res.status(400).json({ error: "Invalid filename." });
+  }
+  const abs = path.join(targetDir, filename);
+  if (!fs.existsSync(abs)) return res.status(404).json({ error: "Not found." });
+
+  let finalAbs = abs;
+  let finalFilename = filename;
+  if (typeof body.label === "string" && body.label.trim()) {
+    const slug = slugifyLabel(body.label);
+    const expected = `${slug}.txt`;
+    if (slug && expected !== filename) {
+      const renamed = uniqueScriptFilename(targetDir, slug);
+      const renamedAbs = path.join(targetDir, renamed);
+      try {
+        fs.renameSync(abs, renamedAbs);
+        const fromMeta = metaPathFor(abs);
+        if (fs.existsSync(fromMeta)) {
+          try { fs.renameSync(fromMeta, metaPathFor(renamedAbs)); } catch (_e) { /* ignore */ }
+        }
+        finalAbs = renamedAbs;
+        finalFilename = renamed;
+      } catch (err) {
+        return res.status(500).json({ error: `Could not rename: ${err.message}` });
+      }
+    }
+  }
+
+  if (typeof body.body === "string") {
+    if (Buffer.byteLength(body.body, "utf8") > SCRIPT_MAX_BYTES) {
+      return res.status(413).json({ error: "Script body exceeds size limit." });
+    }
+    try { fs.writeFileSync(finalAbs, body.body, { mode: 0o644 }); }
+    catch (err) {
+      return res.status(500).json({ error: `Could not write script: ${err.message}` });
+    }
+  }
+  const patch = {
+    author: req.nrccSession?.currentUser || "",
+    tsMs: Date.now()
+  };
+  if (typeof body.label === "string") patch.label = body.label;
+  if (typeof body.description === "string") patch.description = body.description;
+  if (typeof body.language === "string") patch.language = body.language;
+  try { writeMeta(finalAbs, patch); }
+  catch (err) { /* meta failure is non-fatal */ }
+  res.json({ folder, filename: finalFilename });
+});
+
+app.delete("/api/scripts/file", (req, res) => {
+  const targetDir = safeAssetDir(SCRIPTS_DIR, null, req.query.folder || "");
+  if (!targetDir) return res.status(400).json({ error: "Invalid folder." });
+  const filename = String(req.query.filename || "");
+  if (!SCRIPT_FILENAME_REGEX.test(filename)) {
+    return res.status(400).json({ error: "Invalid filename." });
+  }
+  const abs = path.join(targetDir, filename);
+  try {
+    fs.unlinkSync(abs);
+    removeMeta(abs);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === "ENOENT") return res.status(404).json({ error: "Not found." });
+    res.status(500).json({ error: `Could not delete: ${err.message}` });
+  }
+});
+
+app.post("/api/scripts/folders", (req, res) => {
+  return assetCreateFolder(req, res, SCRIPTS_DIR, null);
+});
+app.delete("/api/scripts/folders", (req, res) => {
+  return assetDeleteFolder(req, res, SCRIPTS_DIR, null);
+});
+app.post("/api/scripts/move", (req, res) => {
+  return assetMove(req, res, SCRIPTS_DIR, null, SCRIPT_FILENAME_REGEX);
 });
 
 
@@ -1463,7 +2355,37 @@ async function startConsoleTokenTask(client, vmUuid) {
     `/api/vmm/v4.0/ahv/config/vms/${vmUuid}/$actions/generate-vm-console-token`
   ];
 
+  // Different PC builds expose different combinations of these URLs. We
+  // need to walk the whole list whenever the failure is "endpoint not
+  // wired up on this PC", which can surface as:
+  //   - 400 + "no api path found"   (older Prism JSON envelope)
+  //   - 404 + Apache/Prism "The requested URL was not found ..."
+  //   - 404 + "no api path found"
+  //   - 405 method not allowed      (URL exists at a different version)
+  // Anything else (auth failure, 5xx, etc.) is a real error and bubbles
+  // out immediately.
+  function isEndpointMissing(error) {
+    const status = error.response?.status;
+    const raw = error.response?.data ?? error.message ?? "";
+    const text = (typeof raw === "string" ? raw : JSON.stringify(raw)).toLowerCase();
+    if (status === 404 || status === 405) return true;
+    if (status === 400 || status === 501) {
+      if (
+        text.includes("no api path found") ||
+        text.includes("not found on the server") ||
+        text.includes("requested url was not found") ||
+        text.includes("no such api") ||
+        text.includes("unsupported") ||
+        text.includes("not implemented")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   let lastError = null;
+  let lastUrl = null;
   for (const url of candidates) {
     try {
       // Prism expects a POST with no request body for this action.
@@ -1477,22 +2399,63 @@ async function startConsoleTokenTask(client, vmUuid) {
       });
       return { resp, usedUrl: url };
     } catch (error) {
-      const details = error.response?.data || error.message;
-      const messageText =
-        typeof details === "string" ? details : JSON.stringify(details);
-      // Move to next candidate only for path/endpoint compatibility failures.
-      if (
-        error.response?.status === 400 &&
-        messageText.toLowerCase().includes("no api path found")
-      ) {
-        lastError = error;
+      lastError = error;
+      lastUrl = url;
+      if (isEndpointMissing(error)) {
         continue;
       }
       throw error;
     }
   }
 
-  throw lastError || new Error("No supported console-token endpoint found.");
+  if (lastError) {
+    const status = lastError.response?.status;
+    const raw = lastError.response?.data ?? lastError.message ?? "";
+    const text = typeof raw === "string" ? raw : JSON.stringify(raw);
+    const augmented = new Error(
+      `No generate-console-token endpoint accepted the request. ` +
+      `Tried ${candidates.length} URL variant(s); last attempt was ` +
+      `${lastUrl} → HTTP ${status ?? "?"} ${text.slice(0, 240)}`
+    );
+    augmented.response = lastError.response;
+    augmented.endpointMissing = true;
+    throw augmented;
+  }
+  throw new Error("No supported console-token endpoint found.");
+}
+
+// Look up a single VM through PC's v4 vmm and pull out its cluster ext_id.
+// The shape varies a little across PC versions, so try both the canonical
+// `cluster.extId` and the legacy `clusterReference.uuid` / `cluster_uuid`.
+// Returns "" when the VM can't be found or has no cluster reference.
+async function fetchVmClusterExtId(client, vmUuid) {
+  const candidates = [
+    `/api/vmm/v4.0/ahv/config/vms/${vmUuid}`,
+    `/api/vmm/v4.1/ahv/config/vms/${vmUuid}`,
+    `/api/vmm/v4.2/ahv/config/vms/${vmUuid}`
+  ];
+  for (const url of candidates) {
+    try {
+      const resp = await client.get(url, { timeout: PRISM_HTTP_TIMEOUT_MS });
+      const body = resp?.data?.data || resp?.data || {};
+      const id =
+        body?.cluster?.extId ||
+        body?.cluster?.uuid ||
+        body?.clusterReference?.uuid ||
+        body?.cluster_reference?.uuid ||
+        body?.spec?.cluster_reference?.uuid ||
+        body?.spec?.clusterReference?.uuid ||
+        body?.metadata?.cluster_reference?.uuid ||
+        body?.metadata?.clusterReference?.uuid ||
+        "";
+      if (typeof id === "string" && id.trim()) {
+        return id.trim();
+      }
+    } catch (_error) {
+      /* try next */
+    }
+  }
+  return "";
 }
 
 function buildVmListUrl(pageSize, offset, variant = "") {
@@ -2008,6 +2971,62 @@ app.post("/api/pe-test", async (req, res) => {
   });
 });
 
+// Look up a VM via PC (clustermgmt) and return the external IP of its
+// Prism Element so we can route console traffic through the PE legacy
+// VNC proxy when PC's v4 token action is missing. Returns "" when no
+// cluster IP can be determined (e.g., the VM is on a single-node PC
+// self-cluster, or the VM/cluster lookup itself fails).
+async function resolvePePeerForVm(client, vmUuid) {
+  try {
+    const clusterExtId = await fetchVmClusterExtId(client, vmUuid);
+    if (!clusterExtId) return "";
+    const ip = await fetchClusterExternalAddress(client, clusterExtId);
+    return ip || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+// Build the WebSocket-proxy session for the PE legacy /vnc/vm/{uuid}/proxy
+// path and respond with the websocketUrl the client should connect to.
+// Used for the original CVM flow and the new "PC has no v4 token action"
+// fallback for regular AHV VMs.
+async function respondWithPeLegacyProxy({
+  req,
+  res,
+  peHost,
+  peUsername,
+  pePassword,
+  tlsSkipVerify,
+  vmUuid
+}) {
+  const peClient = createPrismClient(peHost, peUsername, pePassword, tlsSkipVerify);
+  const sessionCookie = await createPrismLegacySessionCookie(
+    peClient,
+    peUsername,
+    pePassword
+  );
+  const targetUrl = `wss://${peHost}:9440/vnc/vm/${vmUuid}/proxy`;
+  const proxySessionId = crypto.randomUUID();
+  wsProxySessions.set(proxySessionId, {
+    targetUrl,
+    tlsSkipVerify,
+    sessionCookie,
+    basicAuth: Buffer.from(`${peUsername}:${pePassword}`).toString("base64"),
+    createdAtMs: Date.now()
+  });
+  const wsProtocol = req.protocol === "https" ? "wss" : "ws";
+  const websocketUrl = `${wsProtocol}://${req.get("host")}/ws-proxy/${proxySessionId}`;
+  return res.json({
+    websocketUrl,
+    via: `pe-legacy:${peHost}`,
+    targetUrl,
+    note:
+      "Connecting via Prism Element legacy VNC proxy (/vnc/vm/{uuid}/proxy). " +
+      "Session cookie obtained from PrismGateway loginActions."
+  });
+}
+
 app.post("/api/console-token", async (req, res) => {
   try {
     const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
@@ -2091,35 +3110,64 @@ app.post("/api/console-token", async (req, res) => {
     // PE branch: use legacy /vnc/vm/{uuid}/proxy WebSocket since v4 vmm
     // generate-console-token doesn't exist on this PE.
     if (usingPe) {
-      const sessionCookie = await createPrismLegacySessionCookie(
-        client,
-        apiUsername,
-        apiPassword
-      );
-      const targetUrl = `wss://${apiHost}:9440/vnc/vm/${vmUuid}/proxy`;
-      const proxySessionId = crypto.randomUUID();
-      wsProxySessions.set(proxySessionId, {
-        targetUrl,
+      return await respondWithPeLegacyProxy({
+        req,
+        res,
+        peHost: apiHost,
+        peUsername: apiUsername,
+        pePassword: apiPassword,
         tlsSkipVerify,
-        sessionCookie,
-        basicAuth: Buffer.from(`${apiUsername}:${apiPassword}`).toString(
-          "base64"
-        ),
-        createdAtMs: Date.now()
-      });
-      const wsProtocol = req.protocol === "https" ? "wss" : "ws";
-      const websocketUrl = `${wsProtocol}://${req.get("host")}/ws-proxy/${proxySessionId}`;
-      return res.json({
-        websocketUrl,
-        via: `pe-legacy:${apiHost}`,
-        targetUrl,
-        note:
-          "Connecting via Prism Element legacy VNC proxy (/vnc/vm/{uuid}/proxy). " +
-          "Session cookie obtained from PrismGateway loginActions."
+        vmUuid
       });
     }
 
-    const { resp: postResp, usedUrl } = await startConsoleTokenTask(client, vmUuid);
+    let postResp;
+    let usedUrl;
+    try {
+      ({ resp: postResp, usedUrl } = await startConsoleTokenTask(client, vmUuid));
+    } catch (tokenError) {
+      // PC has no working generate-console-token action (every URL variant
+      // returned a "not implemented" response). Fall back to the same
+      // legacy PE proxy path we already use for CVMs: look up which
+      // cluster owns this VM, resolve its external IP, and either return
+      // needPeCredentials: true so the client can prompt, or — if PE
+      // creds were cached earlier — proxy the console through the PE.
+      if (!tokenError.endpointMissing) {
+        throw tokenError;
+      }
+      const fallbackPeHost = await resolvePePeerForVm(client, vmUuid);
+      if (!fallbackPeHost) {
+        return res.status(502).json({
+          error:
+            "Prism Central does not implement the v4 generate-console-token action, " +
+            "and the VM's cluster external IP could not be resolved for a Prism Element fallback.",
+          details: tokenError.message
+        });
+      }
+      const cached = req.nrccSession.peCreds.get(fallbackPeHost);
+      if (!cached) {
+        return res.status(401).json({
+          error: "PE credentials required.",
+          details:
+            `Prism Central at ${pcHost} does not expose generate-console-token; ` +
+            `NRCC will route through Prism Element ${fallbackPeHost} instead. ` +
+            "Authenticate this PE once via /api/pe-test; NRCC will cache " +
+            "the credentials in server memory for this session only.",
+          needPeCredentials: true,
+          peHost: fallbackPeHost,
+          fallbackReason: "pc-v4-token-action-missing"
+        });
+      }
+      return await respondWithPeLegacyProxy({
+        req,
+        res,
+        peHost: fallbackPeHost,
+        peUsername: cached.peUsername,
+        pePassword: cached.pePassword,
+        tlsSkipVerify,
+        vmUuid
+      });
+    }
     const taskUuid =
       postResp.data?.data?.extId ||
       postResp.data?.data?.id ||
