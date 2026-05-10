@@ -30,6 +30,11 @@ function loadAppVersion() {
   try { return String(require("./package.json").version || "0.0.0"); }
   catch (_e) { return "0.0.0"; }
 }
+// Cached at startup for stable logs / API consistency, but the
+// /api/config handler will refresh from build.info on every call so a
+// `kubectl cp build.info ...` (or any out-of-band file swap) shows
+// up in the UI footer without a node restart. The constant is still
+// used everywhere else so log lines remain stable for a given run.
 const APP_VERSION = loadAppVersion();
 
 const app = express();
@@ -540,7 +545,7 @@ app.get("/api/config", (req, res) => {
     currentUser: req.nrccSession.currentUser || null,
     loggingAvailable: LOGGING_ENABLED,
     featureFlags: FEATURE_FLAGS,
-    appVersion: APP_VERSION,
+    appVersion: loadAppVersion(),
     updateAvailable: UPDATE_ENABLED,
     // RDP-specific bits the client needs at startup. Default
     // dimensions are advisory — the browser sizes the canvas to its
@@ -1267,6 +1272,13 @@ setInterval(() => {
 }, 60_000).unref();
 
 app.post("/api/rdp/start", (req, res) => {
+  // Lightweight request log so we can confirm a hang is in the
+  // browser/network and not in the server. Logged BEFORE any
+  // validation so even rejected requests show up.
+  console.log(
+    `[rdp] /api/rdp/start from ${req.ip || req.socket?.remoteAddress || "?"} ` +
+    `vm=${(req.body && req.body.vmUuid) || "?"} host=${(req.body && req.body.host) || "?"}`
+  );
   if (!RDP_ENABLED) {
     return res.status(503).json({ error: "RDP consoles are disabled (NRCC_RDP_ENABLED=false)." });
   }
@@ -1298,7 +1310,10 @@ app.post("/api/rdp/start", (req, res) => {
   if (!IPV4_REGEX.test(host) || !isProbeAllowedIp(host)) return res.status(400).json({ error: "Invalid or non-private host." });
   if (!Number.isInteger(port) || port < 1 || port > 65535) return res.status(400).json({ error: "Invalid port." });
   if (!username) return res.status(400).json({ error: "Username is required." });
-  if (!password) return res.status(400).json({ error: "Password is required." });
+  // Password is intentionally optional. mstsc / xfreerdp will both
+  // happily connect with an empty password; the RDP server then shows
+  // its own credential prompt on the framebuffer. We let guacd pass an
+  // empty password through so the same flow works in the browser.
   if (!probeKnowsIpForVm(vmUuid, host)) {
     return res.status(400).json({ error: `Host ${host} is not a known address for this VM. Run a port scan first.` });
   }
@@ -5147,13 +5162,55 @@ wsRdpServer.on("connection", (ws, req, requestUrl) => {
 
   tcp.on("data", (chunk) => {
     if (handshakeDone) {
-      // Plain text pump after the handshake. We funnel through the
-      // same StringDecoder so a UTF-8 codepoint split across two
-      // TCP chunks doesn't surface as a replacement character on
-      // the wire. guacamole-common-js's WebSocketTunnel reads text
-      // frames directly as instruction strings.
-      const text = decoder.write(chunk);
-      if (text) safeSendWs(text);
+      // Plain text pump after the handshake. Two things to be careful
+      // about here:
+      //
+      //  1) UTF-8 boundaries: a multi-byte codepoint can be split
+      //     across two TCP chunks. StringDecoder buffers the partial
+      //     bytes so we never emit a replacement character.
+      //
+      //  2) **Instruction boundaries**: guacamole-common-js's
+      //     WebSocketTunnel.onmessage parses each WS message
+      //     INDEPENDENTLY -- it does not buffer partial instructions
+      //     across messages. If we forward a TCP chunk that ends
+      //     mid-instruction (which is normal: a 200KB `img` blob is
+      //     usually fragmented into several TCP chunks), the parser
+      //     desyncs, eventually computes a garbage length, hands a
+      //     truncated base64 blob to `Image.decode()` (which throws
+      //     `InvalidStateError: The source image could not be
+      //     decoded`), and on the next message emits the infamous
+      //     `RangeError: Invalid array length at Array.push` once
+      //     `parseInt` of mid-data returns a wild number. guacd then
+      //     sees the keepalive miss and disconnects with "User is
+      //     not responding."
+      //
+      //  So we accumulate text in `textBuf`, walk it with
+      //  parseGuacInstruction to find the END of the LAST complete
+      //  instruction we have, and only ship that prefix to the
+      //  browser. The partial-instruction tail stays in `textBuf`
+      //  for the next chunk to complete.
+      textBuf += decoder.write(chunk);
+      if (!textBuf) return;
+      let cursor = 0;
+      try {
+        while (cursor < textBuf.length) {
+          const inst = parseGuacInstruction(textBuf, cursor);
+          if (!inst) break; // partial -- wait for more bytes
+          cursor = inst.endIdx;
+        }
+      } catch (err) {
+        // A malformed length / separator from guacd is unrecoverable
+        // (the framing is now ambiguous); surface it to the client
+        // and tear down rather than feeding it junk.
+        try { ws.send(encodeGuacInstruction("error", `guacd framing error: ${err.message}`, "519")); } catch (_e) { /* ignore */ }
+        closeAll(1011, "guacd-framing-error");
+        logRdpClose(`guacd-framing-error:${err.message}`);
+        return;
+      }
+      if (cursor > 0) {
+        safeSendWs(textBuf.slice(0, cursor));
+        textBuf = textBuf.slice(cursor);
+      }
       return;
     }
     textBuf += decoder.write(chunk);
@@ -5165,14 +5222,23 @@ wsRdpServer.on("connection", (ws, req, requestUrl) => {
         textBuf = textBuf.slice(inst.endIdx);
         if (op === "args") {
           // First entry after `args` is the protocol VERSION; the
-          // rest are parameter names. We acknowledge the same
-          // version (echoes it back via the size handshake replies).
-          argNames = inst.args.slice(2); // drop "args" + VERSION
+          // rest are parameter names. The Guacamole 1.5 handshake
+          // requires the client to echo VERSION back as the FIRST
+          // argument of the `connect` instruction (followed by N
+          // values matching the N arg names). Older guacd versions
+          // (pre-1.5) didn't expect the VERSION echo, but they also
+          // never sent a VERSION in `args`, so we mirror what we got:
+          // include the version in `connect` only if guacd announced
+          // one in `args`.
+          const protocolVersion = inst.args[1] || "";
+          const looksLikeVersion = /^\d+\.\d+\.\d+/.test(protocolVersion);
+          argNames = looksLikeVersion ? inst.args.slice(2) : inst.args.slice(1);
           const values = buildRdpConnectValues(sess);
           // Fill the connect instruction with values matching the
           // arg-name order guacd dictated. Unknown names get an
           // empty string, which guacd treats as "use default".
           const connectArgs = ["connect"];
+          if (looksLikeVersion) connectArgs.push(protocolVersion);
           for (const name of argNames) {
             connectArgs.push(values[name] !== undefined ? values[name] : "");
           }
@@ -5183,7 +5249,13 @@ wsRdpServer.on("connection", (ws, req, requestUrl) => {
             tcp.write(encodeGuacInstruction("size", sess.width, sess.height, sess.dpi));
             tcp.write(encodeGuacInstruction("audio")); // no audio playback
             tcp.write(encodeGuacInstruction("video")); // no video decode
-            tcp.write(encodeGuacInstruction("image", "image/png", "image/jpeg", "image/webp"));
+            // Stick to PNG + JPEG. WebP is technically supported by
+            // guacd 1.5.x and modern browsers, but some guacd-encoded
+            // WebP variants surface as `InvalidStateError: The source
+            // image could not be decoded` in Chrome's image decoder,
+            // which silently kills the parser and causes guacd to
+            // emit "User is not responding" once the keepalive misses.
+            tcp.write(encodeGuacInstruction("image", "image/png", "image/jpeg"));
             tcp.write(encodeGuacInstruction("timezone", "UTC"));
             tcp.write(encodeGuacInstruction(...connectArgs));
           } catch (err) {
@@ -5198,10 +5270,24 @@ wsRdpServer.on("connection", (ws, req, requestUrl) => {
             try { tcp.write(queued); } catch (_e) { /* ignore */ }
           }
           wsQueue.length = 0;
-          // And forward whatever guacd has already sent past the args.
+          // Drain anything guacd already sent past the args reply,
+          // but only the COMPLETE-instruction prefix (same reasoning
+          // as the post-handshake pump above; see the long comment
+          // there). Any incomplete tail stays in textBuf and gets
+          // completed by the next tcp 'data' chunk.
           if (textBuf.length) {
-            safeSendWs(textBuf);
-            textBuf = "";
+            let flushCursor = 0;
+            try {
+              while (flushCursor < textBuf.length) {
+                const inst = parseGuacInstruction(textBuf, flushCursor);
+                if (!inst) break;
+                flushCursor = inst.endIdx;
+              }
+            } catch (_err) { /* malformed -- next data tick will surface it */ }
+            if (flushCursor > 0) {
+              safeSendWs(textBuf.slice(0, flushCursor));
+              textBuf = textBuf.slice(flushCursor);
+            }
           }
           return;
         }

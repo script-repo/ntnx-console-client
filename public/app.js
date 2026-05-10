@@ -107,6 +107,7 @@ const settingsBetaEnabledInput = document.getElementById("settingsBetaEnabled");
 const settingsCancelBtn = document.getElementById("settingsCancel");
 const settingsSaveBtn = document.getElementById("settingsSave");
 const settingsVersionLabel = document.getElementById("settingsVersionLabel");
+const loginVersionLabel = document.getElementById("loginVersionLabel");
 const settingsUpdateBtn = document.getElementById("settingsUpdateBtn");
 const settingsUpdateStatus = document.getElementById("settingsUpdateStatus");
 
@@ -2768,7 +2769,8 @@ const appConfig = {
   loggingAvailable: false,
   featureFlags: {},
   appVersion: "",
-  updateAvailable: false
+  updateAvailable: false,
+  rdp: { enabled: false, defaultWidth: 1280, defaultHeight: 800, defaultDpi: 96 }
 };
 
 async function loadAppConfig() {
@@ -2792,6 +2794,9 @@ async function loadAppConfig() {
       : {};
     appConfig.appVersion = typeof data.appVersion === "string" ? data.appVersion : "";
     appConfig.updateAvailable = Boolean(data.updateAvailable);
+    if (data.rdp && typeof data.rdp === "object") {
+      appConfig.rdp = { ...appConfig.rdp, ...data.rdp };
+    }
     if (appConfig.multiUser) {
       chatRoot.hidden = false;
       document.body.classList.add("has-chat");
@@ -2981,9 +2986,18 @@ function refreshSettingsServerHints() {
 }
 
 function refreshSettingsVersionLabel() {
-  if (!settingsVersionLabel) return;
   const v = (appConfig.appVersion || "").trim();
-  settingsVersionLabel.textContent = v || "unknown";
+  if (settingsVersionLabel) {
+    settingsVersionLabel.textContent = v || "unknown";
+  }
+  // Mirror the build to the login screen footer so the operator can
+  // confirm which NRCC version they're about to authenticate against
+  // (useful when validating a self-update or rolling between
+  // environments). Falls back to a placeholder if /api/config hasn't
+  // resolved yet.
+  if (loginVersionLabel) {
+    loginVersionLabel.textContent = v ? `build ${v}` : "build —";
+  }
 }
 
 // =====================================================================
@@ -3651,8 +3665,7 @@ async function openSshFor(vmUuid) {
   // Reserve the session id with the server. The server validates
   // host against the probe cache (SSRF guard) and will only accept
   // the WS upgrade with this id once.
-  let startData;
-  try {
+  const postSshStart = async () => {
     const resp = await fetch("/api/ssh/start", {
       method: "POST",
       credentials: "same-origin",
@@ -3667,8 +3680,36 @@ async function openSshFor(vmUuid) {
         passphrase: creds.passphrase || ""
       })
     });
-    startData = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(startData.error || `HTTP ${resp.status}`);
+    const data = await resp.json().catch(() => ({}));
+    return { resp, data };
+  };
+
+  let startData;
+  try {
+    let { resp, data } = await postSshStart();
+    // Same probe-cache miss recovery as the RDP path: re-probe and
+    // retry once if the SSRF guard rejects an IP that the client
+    // believed was good (server probe TTL elapsed or pod restarted).
+    if (!resp.ok && resp.status === 400 && /not a known address|Run a port scan/i.test(data?.error || "")) {
+      console.log("[ssh] probe cache miss, re-probing and retrying once");
+      setStatus(`Re-probing ${vmName} for SSH...`, { spinner: true });
+      const probeVmInput = liveVm || { uuid: vmUuid, ipAddresses: ips };
+      try { await vmPortScanner.probeNow(probeVmInput); } catch (_e) { /* fall through */ }
+      ({ resp, data } = await postSshStart());
+    }
+    startData = data;
+    if (!resp.ok) {
+      // Same as RDP: 401 here means the server-side session was wiped
+      // (typically by a server restart) while the cookie still looks
+      // valid in the browser. Force a re-login instead of leaving the
+      // cryptic "Login required" string on screen.
+      if (resp.status === 401) {
+        setStatus("Your session has expired. Please log in again.");
+        try { logout(); } catch (_e) { /* ignore */ }
+        return;
+      }
+      throw new Error(startData?.error || `HTTP ${resp.status}`);
+    }
   } catch (err) {
     setStatus(`SSH start failed: ${err.message || err}`);
     // Wipe potentially-bad cached creds so the next click re-prompts.
@@ -3844,12 +3885,19 @@ let _guacamolePromise = null;
 function loadGuacamoleModule() {
   if (window.Guacamole) return Promise.resolve(window.Guacamole);
   if (_guacamolePromise) return _guacamolePromise;
-  // Different guacamole-common-js npm releases ship their browser
-  // bundle at slightly different paths (dist/ vs lib/, hyphen vs
-  // dot in the filename). Try them in order until one loads, so we
-  // don't break on a future package layout change. The bundle drops
-  // the Guacamole namespace onto window when it executes.
-  const candidatePaths = [
+  // The 1.x release of `guacamole-common-js` ships only ESM and CJS
+  // bundles, neither of which works as a classic `<script>` global
+  // (the ESM ends in `export default Guacamole`, the CJS in
+  // `module.exports = Guacamole`, and `Guacamole` is module-scoped
+  // either way). So we try a dynamic ESM import first and lift the
+  // default export onto `window.Guacamole`. We fall back to the old
+  // classic-script paths for any older package layouts that still
+  // dump Guacamole as a UMD global.
+  const esmCandidates = [
+    "/vendor/guacamole-common-js/dist/esm/guacamole-common.min.js",
+    "/vendor/guacamole-common-js/dist/esm/guacamole-common.js"
+  ];
+  const scriptCandidates = [
     "/vendor/guacamole-common-js/dist/guacamole-common-js.min.js",
     "/vendor/guacamole-common-js/dist/guacamole-common.min.js",
     "/vendor/guacamole-common-js/dist/guacamole-common-js.js",
@@ -3859,24 +3907,41 @@ function loadGuacamoleModule() {
     "/vendor/guacamole-common-js/lib/all.min.js",
     "/vendor/guacamole-common-js/lib/all.js"
   ];
-  function tryLoad(idx) {
+
+  async function tryEsm() {
+    let lastErr = null;
+    for (const path of esmCandidates) {
+      try {
+        const mod = await import(path);
+        const G = mod && (mod.default || mod.Guacamole);
+        if (G) {
+          window.Guacamole = G;
+          return G;
+        }
+      } catch (err) { lastErr = err; }
+    }
+    throw lastErr || new Error("ESM guacamole-common-js bundle not loadable");
+  }
+  function tryScript(idx) {
     return new Promise((resolve, reject) => {
-      if (idx >= candidatePaths.length) {
-        reject(new Error("Could not locate the guacamole-common-js browser bundle. Check that `npm install` has been run."));
+      if (idx >= scriptCandidates.length) {
+        reject(new Error("Could not locate the guacamole-common-js browser bundle. Check that `npm install` has been run and the version is supported."));
         return;
       }
       const script = document.createElement("script");
-      script.src = candidatePaths[idx];
+      script.src = scriptCandidates[idx];
       script.async = true;
       script.onload = () => {
         if (window.Guacamole) resolve(window.Guacamole);
-        else tryLoad(idx + 1).then(resolve, reject);
+        else tryScript(idx + 1).then(resolve, reject);
       };
-      script.onerror = () => { tryLoad(idx + 1).then(resolve, reject); };
+      script.onerror = () => { tryScript(idx + 1).then(resolve, reject); };
       document.head.appendChild(script);
     });
   }
-  _guacamolePromise = tryLoad(0).catch((err) => { _guacamolePromise = null; throw err; });
+  _guacamolePromise = tryEsm()
+    .catch(() => tryScript(0))
+    .catch((err) => { _guacamolePromise = null; throw err; });
   return _guacamolePromise;
 }
 
@@ -3914,11 +3979,9 @@ function promptForRdpCreds(vmUuid, host, port, prefill) {
         rdpCredsErrorEl.style.display = "block";
         return;
       }
-      if (!password) {
-        rdpCredsErrorEl.textContent = "Password is required.";
-        rdpCredsErrorEl.style.display = "block";
-        return;
-      }
+      // Password is intentionally optional. Empty password is forwarded
+      // to the RDP server which then shows its own login screen, the
+      // same way mstsc / xfreerdp behave.
       const creds = {
         username,
         password,
@@ -4066,30 +4129,81 @@ async function openRdpFor(vmUuid) {
 
   setStatus(`Authorising RDP session to ${vmName} (${host})...`, { spinner: true });
 
+  // Single attempt at POST /api/rdp/start. Wrapped in a helper so we
+  // can transparently re-probe and retry once when the server's
+  // probe cache TTL has lapsed (or the server was restarted) and
+  // the request comes back 400 "not a known address".
+  const postRdpStart = async () => {
+    const ctl = new AbortController();
+    const timeoutHandle = setTimeout(() => ctl.abort(), 30_000);
+    const t0 = performance.now();
+    try {
+      console.log("[rdp] POST /api/rdp/start ->", { vmUuid, host, port, build: appConfig.appVersion });
+      const resp = await fetch("/api/rdp/start", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        signal: ctl.signal,
+        cache: "no-store",
+        body: JSON.stringify({
+          vmUuid,
+          host,
+          port,
+          username: creds.username,
+          password: creds.password || "",
+          domain: creds.domain || "",
+          width: desiredWidth,
+          height: desiredHeight,
+          dpi: desiredDpi,
+          security: creds.security || "any",
+          ignoreCert: !!creds.ignoreCert
+        })
+      });
+      const elapsed = Math.round(performance.now() - t0);
+      console.log(`[rdp] /api/rdp/start status=${resp.status} after ${elapsed}ms`);
+      const data = await resp.json().catch(() => ({}));
+      return { resp, data };
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  };
+
   let startData;
   try {
-    const resp = await fetch("/api/rdp/start", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        vmUuid,
-        host,
-        port,
-        username: creds.username,
-        password: creds.password || "",
-        domain: creds.domain || "",
-        width: desiredWidth,
-        height: desiredHeight,
-        dpi: desiredDpi,
-        security: creds.security || "any",
-        ignoreCert: !!creds.ignoreCert
-      })
-    });
-    startData = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(startData.error || `HTTP ${resp.status}`);
+    let { resp, data } = await postRdpStart();
+    // Cache-miss recovery: the SSRF guard returns 400 with one of
+    // these messages when the per-VM probe entry has expired (TTL
+    // default 2 min) or the server pod restarted between probe and
+    // connect. Re-probe and try the connect once more before giving
+    // up so the user doesn't have to manually click anything.
+    if (!resp.ok && resp.status === 400 && /not a known address|Run a port scan/i.test(data?.error || "")) {
+      console.log("[rdp] probe cache miss, re-probing and retrying once");
+      setStatus(`Re-probing ${vmName} for RDP...`, { spinner: true });
+      const probeVmInput = liveVm || { uuid: vmUuid, ipAddresses: ips };
+      try { await vmPortScanner.probeNow(probeVmInput); } catch (_e) { /* fall through */ }
+      ({ resp, data } = await postRdpStart());
+    }
+    startData = data;
+    if (!resp.ok) {
+      // 401 means the server-side session was wiped out from under us
+      // (most commonly a server restart that cleared the in-memory
+      // serverSessions map). The browser still has the cookie so this
+      // looks like everything is fine until an authed endpoint is
+      // hit. Tell the user clearly and bounce them back to login so
+      // re-authentication produces a fresh server-side session.
+      if (resp.status === 401) {
+        setStatus("Your session has expired. Please log in again.");
+        try { logout(); } catch (_e) { /* ignore */ }
+        return;
+      }
+      throw new Error(startData?.error || `HTTP ${resp.status}`);
+    }
   } catch (err) {
-    setStatus(`RDP start failed: ${err.message || err}`);
+    const msg = err && err.name === "AbortError"
+      ? "RDP start timed out after 30s. Check that the server (and guacd, if used) are reachable."
+      : `RDP start failed: ${err.message || err}`;
+    console.warn("[rdp]", msg, err);
+    setStatus(msg);
     if (creds && creds.remember) rdpCredsCache.delete(vmUuid);
     return;
   }
@@ -4161,12 +4275,20 @@ async function openRdpFor(vmUuid) {
   // batch of drawing instructions). Idempotent if nothing changed.
   display.onflush = () => paintCapture();
 
+  // Track the most recent guacd-reported error so the disconnect
+  // handler can preserve it -- otherwise a fast onerror -> onstatechange(5)
+  // sequence (which is exactly what happens when guacd is unreachable
+  // or RDP auth fails) ends up wiping the real cause and the user just
+  // sees a useless "RDP disconnected" message.
+  let lastRdpErrorMsg = null;
+
   client.onstatechange = (state) => {
     // Guacamole client states:
     //   0 IDLE, 1 CONNECTING, 2 WAITING, 3 CONNECTED,
     //   4 DISCONNECTING, 5 DISCONNECTED
     if (state === 3) {
       overlay.hidden = true;
+      lastRdpErrorMsg = null;
       setStatus(`RDP connected: ${vmName}`);
       // First capture frame so the screenshot button works
       // immediately after connect.
@@ -4175,14 +4297,16 @@ async function openRdpFor(vmUuid) {
       sendRdpSize();
     } else if (state === 5) {
       overlay.hidden = false;
-      overlay.textContent = `RDP disconnected: ${vmName}`;
-      setStatus(`RDP disconnected: ${vmName}`);
-      logEvent("console.rdp.close", vmUuid, {});
+      const tail = lastRdpErrorMsg ? ` -- ${lastRdpErrorMsg}` : "";
+      overlay.textContent = `RDP disconnected: ${vmName}${tail}`;
+      setStatus(`RDP disconnected: ${vmName}${tail}`);
+      logEvent("console.rdp.close", vmUuid, lastRdpErrorMsg ? { error: lastRdpErrorMsg } : {});
     }
   };
 
   client.onerror = (status) => {
     const msg = status && status.message ? status.message : `code ${status?.code}`;
+    lastRdpErrorMsg = msg;
     overlay.hidden = false;
     overlay.textContent = `RDP error: ${msg}`;
     setStatus(`RDP error (${vmName}): ${msg}`);
@@ -4225,16 +4349,33 @@ async function openRdpFor(vmUuid) {
   mouse.onmouseup = sendMouseState;
   mouse.onmousemove = sendMouseState;
 
-  const keyboard = new Guacamole.Keyboard(displayElement);
-  keyboard.onkeydown = (keysym) => { client.sendKeyEvent(1, keysym); };
-  keyboard.onkeyup = (keysym) => { client.sendKeyEvent(0, keysym); };
-
-  // Forward focus into the keyboard listener as soon as the user
-  // clicks anywhere on the display, so RDP keystrokes work without
-  // an extra Tab to focus.
-  displayElement.addEventListener("mousedown", () => {
-    try { displayHost.focus(); } catch (_e) { /* ignore */ }
-  });
+  // Attach the Guacamole.Keyboard listener to the DOCUMENT, not the
+  // display element. Two reasons:
+  //   * `<canvas>` is not natively focusable, so keydown/keyup never
+  //     fire on it -- they bubble to the document. Wiring the listener
+  //     to the canvas (or even the focusable displayHost wrapper)
+  //     means the user has to actively click the display before each
+  //     key, otherwise nothing happens. That was exactly the symptom
+  //     the user hit: mouse worked (events come from the element) but
+  //     keyboard didn't (events come from document).
+  //   * The standard Apache Guacamole web-app uses the same pattern.
+  // We then gate forwarding on `activeSessionId === sessionId` so
+  // keystrokes never leak between RDP tabs when the user has more
+  // than one open. Inputs in chat / modal text fields are also let
+  // through to the browser by checking event.target inside the
+  // Guacamole.Keyboard internals (it ignores keys typed inside
+  // contenteditable / input / textarea elements by default).
+  const keyboard = new Guacamole.Keyboard(document);
+  keyboard.onkeydown = (keysym) => {
+    if (activeSessionId !== sessionId) return true; // let the browser handle it
+    client.sendKeyEvent(1, keysym);
+    return false; // prevent default browser shortcut (Ctrl+R, Tab, etc.)
+  };
+  keyboard.onkeyup = (keysym) => {
+    if (activeSessionId !== sessionId) return true;
+    client.sendKeyEvent(0, keysym);
+    return false;
+  };
 
   // Resize: call client.sendSize when the screen pane changes size.
   // Guacamole lets us request a new framebuffer size mid-session if
