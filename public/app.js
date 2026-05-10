@@ -36,6 +36,10 @@ const wallOfEyesBtn = document.getElementById("wallOfEyesBtn");
 const ctrlAltDelBtn = document.getElementById("ctrlAltDelBtn");
 const pasteBtn = document.getElementById("pasteBtn");
 const pasteKeymapSelect = document.getElementById("pasteKeymap");
+const keymapMenuBtn = document.getElementById("keymapMenuBtn");
+const keymapMenuValue = document.getElementById("keymapMenuValue");
+const keymapPopover = document.getElementById("keymapPopover");
+const keymapPopoverList = document.getElementById("keymapPopoverList");
 const screenshotBtn = document.getElementById("screenshotBtn");
 const screenshotBrowseBtn = document.getElementById("screenshotBrowseBtn");
 const screenshotBrowseModal = document.getElementById("screenshotBrowseModal");
@@ -7040,6 +7044,162 @@ closeAllBtn.addEventListener("click", () => {
 });
 
 // =====================================================================
+// Action menu: Keyboard Layout submenu + dynamic Show-All highlight.
+// =====================================================================
+//
+// The action card replaced a stack of native controls with a clean
+// menu UI. The keymap <select> is still in the DOM (offscreen) so
+// every existing read of pasteKeymapSelect.value keeps working --
+// the popover writes there and dispatches a "change" event so the
+// existing change listener fires.
+
+function syncKeymapMenuLabel() {
+  if (!keymapMenuValue) return;
+  const id = pasteKeymapSelect.value || lastUsedKeymap || DEFAULT_KEYMAP_ID;
+  const km = KEYMAPS.find((k) => k.id === id);
+  keymapMenuValue.textContent = km ? km.label : id;
+}
+
+// Mirror the disabled state of the underlying <select> to the
+// Keyboard Layout menu row, so it greys out and stops responding to
+// clicks at exactly the same time as the rest of the action menu.
+const _keymapDisabledObserver = new MutationObserver(() => {
+  if (!keymapMenuBtn) return;
+  keymapMenuBtn.disabled = pasteKeymapSelect.disabled;
+});
+_keymapDisabledObserver.observe(pasteKeymapSelect, {
+  attributes: true,
+  attributeFilter: ["disabled"]
+});
+// Sync once after each programmatic value write so the row's meta
+// label stays in step with the active tab's layout. The "change"
+// event isn't emitted for direct .value writes, so we wrap it.
+const _origValueDescriptor = Object.getOwnPropertyDescriptor(
+  HTMLSelectElement.prototype,
+  "value"
+);
+if (_origValueDescriptor && _origValueDescriptor.set) {
+  Object.defineProperty(pasteKeymapSelect, "value", {
+    configurable: true,
+    enumerable: true,
+    get() { return _origValueDescriptor.get.call(this); },
+    set(v) {
+      _origValueDescriptor.set.call(this, v);
+      syncKeymapMenuLabel();
+    }
+  });
+}
+pasteKeymapSelect.addEventListener("change", syncKeymapMenuLabel);
+
+function renderKeymapPopover() {
+  if (!keymapPopoverList) return;
+  keymapPopoverList.innerHTML = "";
+  const current = pasteKeymapSelect.value || lastUsedKeymap || DEFAULT_KEYMAP_ID;
+  for (const km of KEYMAPS) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "keymap-popover-item";
+    item.dataset.keymap = km.id;
+    if (km.id === current) item.classList.add("is-selected");
+    const check = document.createElement("span");
+    check.className = "keymap-popover-item-check";
+    check.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+    const label = document.createElement("span");
+    label.textContent = km.label;
+    item.appendChild(check);
+    item.appendChild(label);
+    item.addEventListener("click", () => {
+      pasteKeymapSelect.value = km.id;
+      pasteKeymapSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      closeKeymapPopover();
+    });
+    keymapPopoverList.appendChild(item);
+  }
+}
+
+function openKeymapPopover() {
+  if (!keymapPopover || !keymapMenuBtn) return;
+  if (keymapMenuBtn.disabled) return;
+  renderKeymapPopover();
+  // Position to the LEFT of the action menu (the menu sits on the
+  // right of the screen, so the popover flies out toward the canvas
+  // to avoid clipping). Fallback to right-of-row if not enough room.
+  const rect = keymapMenuBtn.getBoundingClientRect();
+  keymapPopover.hidden = false;
+  // Render hidden first so we can measure.
+  keymapPopover.style.visibility = "hidden";
+  keymapPopover.style.top = "0px";
+  keymapPopover.style.left = "0px";
+  const popRect = keymapPopover.getBoundingClientRect();
+  const margin = 6;
+  const wantLeft = rect.left - popRect.width - margin;
+  const useLeft = wantLeft >= 8 ? wantLeft : rect.right + margin;
+  let top = rect.top;
+  if (top + popRect.height > window.innerHeight - 8) {
+    top = Math.max(8, window.innerHeight - popRect.height - 8);
+  }
+  keymapPopover.style.top = `${top + window.scrollY}px`;
+  keymapPopover.style.left = `${useLeft + window.scrollX}px`;
+  keymapPopover.style.visibility = "visible";
+  keymapMenuBtn.setAttribute("aria-expanded", "true");
+  // Defer global click bind so the opening click doesn't immediately close.
+  setTimeout(() => document.addEventListener("click", _keymapDocClick, true), 0);
+}
+
+function closeKeymapPopover() {
+  if (!keymapPopover) return;
+  keymapPopover.hidden = true;
+  keymapPopover.style.visibility = "";
+  if (keymapMenuBtn) keymapMenuBtn.setAttribute("aria-expanded", "false");
+  document.removeEventListener("click", _keymapDocClick, true);
+}
+
+function _keymapDocClick(event) {
+  if (!keymapPopover || keymapPopover.hidden) return;
+  if (keymapPopover.contains(event.target)) return;
+  if (keymapMenuBtn && keymapMenuBtn.contains(event.target)) return;
+  closeKeymapPopover();
+}
+
+if (keymapMenuBtn) {
+  keymapMenuBtn.addEventListener("click", () => {
+    if (keymapPopover && !keymapPopover.hidden) {
+      closeKeymapPopover();
+    } else {
+      openKeymapPopover();
+    }
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && keymapPopover && !keymapPopover.hidden) {
+    closeKeymapPopover();
+    keymapMenuBtn?.focus();
+  }
+});
+window.addEventListener("resize", () => {
+  if (keymapPopover && !keymapPopover.hidden) closeKeymapPopover();
+});
+
+// "Show All" picks up an active highlight while the grid overlay
+// is open, mirroring the screenshot behaviour where the selected
+// row is tinted blue. We watch the overlay's class list so the
+// highlight clears as soon as the user closes the grid by any path
+// (button, backdrop click, Escape, tile click).
+const _showAllActiveObserver = new MutationObserver(() => {
+  if (!showAllBtn || !consoleGridOverlay) return;
+  showAllBtn.classList.toggle(
+    "is-active",
+    consoleGridOverlay.classList.contains("open")
+  );
+});
+if (consoleGridOverlay) {
+  _showAllActiveObserver.observe(consoleGridOverlay, {
+    attributes: true,
+    attributeFilter: ["class"]
+  });
+}
+
+// =====================================================================
 // Boot
 // =====================================================================
 
@@ -7055,6 +7215,7 @@ loadAppConfig();
 // Reflect the saved guest-keymap preference in the action bar even
 // before any tabs are open, so the user knows what new tabs will inherit.
 pasteKeymapSelect.value = lastUsedKeymap;
+syncKeymapMenuLabel();
 showLoginScreen();
 setTimeout(() => {
   if (loginPcHostInput.value && loginUsernameInput.value) {

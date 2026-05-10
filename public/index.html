@@ -691,137 +691,230 @@
         color: var(--ntx-danger);
         background: rgba(190, 18, 60, 0.08);
       }
+      /* =========================================================
+         Console action menu.
+         A vertical card grouped into labelled sections. Replaces
+         the older stack of brightly-coloured pill buttons; each
+         row is a flat icon + label, with hover/active/disabled
+         states harmonised across the whole card. The destructive
+         "Close All" row is the only one that uses red as a base
+         colour, which keeps the visual signal clean.
+         IDs on the underlying <button>s are unchanged so all the
+         existing app.js wiring (enable/disable, click handlers,
+         is-recording state) keeps working.
+         ========================================================= */
       .tabs-actions {
         display: flex;
         flex-direction: column;
-        gap: 8px;
-        align-items: stretch;
         flex-shrink: 0;
-        width: 140px;
-        padding: 8px;
-        background: var(--ntx-surface-2);
-        border: 1px solid var(--ntx-border);
-        border-radius: var(--ntx-radius);
-        box-shadow: var(--ntx-shadow-sm);
+        width: 220px;
         align-self: stretch;
       }
+      .action-menu {
+        background: var(--ntx-surface);
+        border: 1px solid var(--ntx-border);
+        border-radius: 12px;
+        box-shadow: var(--ntx-shadow-sm);
+        overflow: hidden;
+        padding: 4px 0;
+      }
+      .action-section {
+        padding: 4px 0;
+      }
+      .action-section + .action-section {
+        border-top: 1px solid var(--ntx-border-soft, var(--ntx-border));
+        margin-top: 2px;
+        padding-top: 6px;
+      }
+      .action-section-title {
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.7px;
+        text-transform: uppercase;
+        color: var(--ntx-text-subtle);
+        padding: 6px 16px 4px;
+      }
+      .action-row {
+        all: unset;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        width: 100%;
+        padding: 8px 16px;
+        font-size: 13.5px;
+        font-weight: 500;
+        color: var(--ntx-text);
+        cursor: pointer;
+        transition: background 120ms ease, color 120ms ease;
+      }
+      .action-row:hover {
+        background: var(--ntx-accent-soft, rgba(21, 101, 255, 0.08));
+        color: var(--ntx-accent, #1565ff);
+      }
+      .action-row:focus-visible {
+        outline: 2px solid var(--ntx-accent, #1565ff);
+        outline-offset: -2px;
+      }
+      .action-row:disabled,
+      .action-row[disabled] {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .action-row:disabled:hover,
+      .action-row[disabled]:hover {
+        background: transparent;
+        color: var(--ntx-text);
+      }
+      .action-row.is-active {
+        background: var(--ntx-accent-soft, rgba(21, 101, 255, 0.10));
+        color: var(--ntx-accent, #1565ff);
+      }
+      /* Destructive row: red text (and red icon via currentColor). */
+      .action-row.action-row-danger {
+        color: var(--ntx-danger, #c0392b);
+      }
+      .action-row.action-row-danger:hover {
+        background: var(--ntx-danger-soft, rgba(220, 53, 69, 0.08));
+        color: var(--ntx-danger, #c0392b);
+      }
+      /* Record row: red dot icon stays red even when not hovered. */
+      .action-row-icon-rec { color: var(--ntx-danger, #c0392b); }
+      .action-row:hover .action-row-icon-rec { color: var(--ntx-danger, #c0392b); }
+      .action-row-icon {
+        flex: 0 0 22px;
+        width: 22px;
+        height: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: inherit;
+      }
+      .action-row-icon svg { width: 22px; height: 22px; display: block; }
+      .action-row-label {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: inline-flex;
+        align-items: baseline;
+        gap: 8px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .action-row-meta {
+        font-size: 11px;
+        color: var(--ntx-text-subtle);
+        font-weight: 500;
+        text-transform: none;
+        letter-spacing: 0;
+      }
+      .action-row-chevron {
+        flex: 0 0 16px;
+        color: var(--ntx-text-subtle);
+        display: inline-flex;
+      }
+      .action-row-chevron svg { width: 16px; height: 16px; }
+      .action-row.action-row-record .record-btn-timer {
+        font-variant-numeric: tabular-nums;
+        font-size: 11.5px;
+        color: var(--ntx-text-subtle);
+        font-weight: 600;
+      }
+      /* Recording-active state: row stays red, dot pulses, timer red. */
+      .action-row.action-row-record.is-recording {
+        color: var(--ntx-danger, #c0392b);
+      }
+      .action-row.action-row-record.is-recording .action-row-icon-rec {
+        animation: recPulse 1.5s ease-in-out infinite;
+      }
+      .action-row.action-row-record.is-recording .record-btn-timer {
+        color: var(--ntx-danger, #c0392b);
+      }
+      /* Hide the underlying <select> we keep around for state.
+         Still focusable=false / aria-hidden so AT users see the
+         popover-driven "Keyboard Layout" row instead. */
+      .paste-keymap-select-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        border: 0;
+      }
+      /* Keymap popover — small floating menu rendered next to the
+         Keyboard Layout row when the user clicks it. Position is
+         set in JS (top/left absolute on the document). */
+      .keymap-popover {
+        position: absolute;
+        z-index: 60;
+        min-width: 220px;
+        background: var(--ntx-surface);
+        border: 1px solid var(--ntx-border);
+        border-radius: 10px;
+        box-shadow: var(--ntx-shadow-lg);
+        padding: 6px 0;
+      }
+      .keymap-popover[hidden] { display: none; }
+      .keymap-popover-title {
+        padding: 6px 14px 4px;
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.7px;
+        text-transform: uppercase;
+        color: var(--ntx-text-subtle);
+      }
+      .keymap-popover-list {
+        display: flex;
+        flex-direction: column;
+        max-height: 280px;
+        overflow-y: auto;
+      }
+      .keymap-popover-item {
+        all: unset;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 14px;
+        font-size: 13px;
+        color: var(--ntx-text);
+        cursor: pointer;
+      }
+      .keymap-popover-item:hover {
+        background: var(--ntx-accent-soft, rgba(21, 101, 255, 0.08));
+        color: var(--ntx-accent, #1565ff);
+      }
+      .keymap-popover-item.is-selected {
+        color: var(--ntx-accent, #1565ff);
+        font-weight: 600;
+      }
+      .keymap-popover-item-check {
+        width: 14px;
+        height: 14px;
+        flex: 0 0 14px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--ntx-accent, #1565ff);
+      }
+      .keymap-popover-item-check svg { width: 14px; height: 14px; }
+      .keymap-popover-item:not(.is-selected) .keymap-popover-item-check { visibility: hidden; }
+
+      /* Legacy class names kept ONLY so any third-party CSS that
+         hooks into them still resolves; the new .action-row
+         styling fully overrides any visual state for the menu. */
       .show-all-btn,
       .close-all-btn,
       .wall-eyes-btn,
       .ctrl-alt-del-btn,
       .paste-btn {
-        height: 32px;
-        padding: 0 12px;
-        color: #fff;
-        font-weight: 600;
-        font-size: 12px;
-        border-radius: 6px;
         cursor: pointer;
-        flex-shrink: 0;
-        transition: background 120ms ease, border-color 120ms ease;
-        white-space: nowrap;
-        width: 100%;
       }
-      .paste-keymap-label {
-        font-size: 10.5px;
-        font-weight: 700;
-        letter-spacing: 0.4px;
-        text-transform: uppercase;
-        color: var(--ntx-text-subtle);
-        margin-top: 2px;
-        padding: 0 2px;
-      }
+      .paste-keymap-label,
       .paste-keymap-select {
-        height: 28px;
-        width: 100%;
-        padding: 0 6px;
-        font-size: 11.5px;
-        color: var(--ntx-text);
-        background: #fff;
-        border: 1px solid var(--ntx-border-strong);
-        border-radius: 4px;
-        cursor: pointer;
-      }
-      .paste-keymap-select:focus {
-        outline: none;
-        border-color: var(--ntx-accent);
-        box-shadow: 0 0 0 2px rgba(21, 101, 255, 0.18);
-      }
-      .paste-keymap-select:disabled {
-        background: #eef1f6;
-        color: var(--ntx-text-subtle);
-        cursor: not-allowed;
-      }
-      .show-all-btn {
-        background: var(--ntx-success);
-        border: 1px solid var(--ntx-success);
-      }
-      .show-all-btn:hover {
-        background: var(--ntx-success-hover);
-        border-color: var(--ntx-success-hover);
-        color: #fff;
-      }
-      .show-all-btn:disabled {
-        background: #b8d4c2;
-        border-color: #b8d4c2;
-        cursor: not-allowed;
-      }
-      .close-all-btn {
-        background: var(--ntx-danger);
-        border: 1px solid var(--ntx-danger);
-      }
-      .close-all-btn:hover {
-        background: #9c0e31;
-        border-color: #9c0e31;
-        color: #fff;
-      }
-      .close-all-btn:disabled {
-        background: #d9b3bf;
-        border-color: #d9b3bf;
-        cursor: not-allowed;
-      }
-      .wall-eyes-btn {
-        background: #5dade2;
-        border: 1px solid #5dade2;
-        color: #fff;
-      }
-      .wall-eyes-btn:hover {
-        background: #3498db;
-        border-color: #3498db;
-        color: #fff;
-      }
-      .wall-eyes-btn:disabled {
-        background: #b8d6e5;
-        border-color: #b8d6e5;
-        cursor: not-allowed;
-      }
-      .ctrl-alt-del-btn {
-        background: #d97706;
-        border: 1px solid #d97706;
-      }
-      .ctrl-alt-del-btn:hover {
-        background: #b45309;
-        border-color: #b45309;
-        color: #fff;
-      }
-      .ctrl-alt-del-btn:disabled {
-        background: #e5c89a;
-        border-color: #e5c89a;
-        cursor: not-allowed;
-      }
-      .paste-btn {
-        background: #7c3aed;
-        border: 1px solid #7c3aed;
-      }
-      .paste-btn:hover {
-        background: #6d28d9;
-        border-color: #6d28d9;
-        color: #fff;
-      }
-      .paste-btn:disabled {
-        background: #c4b5fd;
-        border-color: #c4b5fd;
-        cursor: not-allowed;
+        display: none;
       }
 
       /* Right-click context menu */
@@ -3044,37 +3137,167 @@
                       </div>
                     </div>
                   </div>
-                  <div class="tabs-actions">
-                    <button id="ctrlAltDelBtn" type="button" class="ctrl-alt-del-btn" disabled title="Send Ctrl+Alt+Del to the active console (unlock Windows)">Ctrl+Alt+Del</button>
-                    <button id="pasteBtn" type="button" class="paste-btn" disabled title="Type the clipboard contents into the active console one keystroke at a time. Works on any guest OS (Windows, Linux GUI, Linux terminal, BIOS) — no clipboard-sync agent required.">Paste</button>
-                    <label class="paste-keymap-label" for="pasteKeymap">Guest keymap</label>
-                    <select id="pasteKeymap" class="paste-keymap-select" disabled
-                            title="Keyboard layout the guest VM is configured for. Determines which physical keys Paste sends for each character. Choice is per console tab; new tabs inherit your most recent selection.">
-                      <option value="us">US QWERTY</option>
-                      <option value="uk">UK QWERTY</option>
-                      <option value="fr">French (AZERTY)</option>
-                      <option value="de">German (QWERTZ)</option>
-                      <option value="es">Spanish</option>
-                      <option value="it">Italian</option>
-                      <option value="pt-br">Brazilian (ABNT2)</option>
-                      <option value="nordic">Swedish / Finnish</option>
-                      <option value="dvorak">US Dvorak</option>
-                      <option value="colemak">US Colemak</option>
-                    </select>
-                    <button id="screenshotBtn" type="button" class="screenshot-btn" disabled
-                            title="Capture the active console as a PNG and save it server-side under the screenshots folder for this VM (per-VM UUID).">Screenshot</button>
-                    <button id="screenshotBrowseBtn" type="button" class="screenshot-browse-btn" disabled
-                            title="View, download, annotate, or delete past screenshots saved for this VM.">Browse...</button>
-                    <button id="recordBtn" type="button" class="record-btn" disabled
-                            title="Start / stop a video recording of the active console (10 fps WebM, saved per-VM).">
-                      <span class="record-btn-label">Record</span>
-                      <span id="recordBtnTimer" class="record-btn-timer" hidden>00:00</span>
-                    </button>
-                    <button id="recordBrowseBtn" type="button" class="screenshot-browse-btn" disabled
-                            title="View, play back, annotate, or delete past recordings saved for this VM.">Recordings...</button>
-                    <button id="closeAllBtn" type="button" class="close-all-btn" disabled title="Close every open console tab">Close All</button>
-                    <button id="showAllBtn" type="button" class="show-all-btn" disabled title="Show every open console at once">Show All</button>
-                    <button id="wallOfEyesBtn" type="button" class="wall-eyes-btn" disabled title="Open a live wall of every console in a new browser window">Wall of Eyes</button>
+                  <!--
+                    Action menu (was a stack of coloured buttons).
+                    Now a single white "card" of icon+label rows
+                    grouped by purpose, modelled on the screenshot
+                    the user supplied. Each <button>'s id is preserved
+                    so app.js's enable/disable wiring keeps working.
+                  -->
+                  <div class="tabs-actions action-menu">
+                    <div class="action-section">
+                      <div class="action-section-title">Input</div>
+                      <button id="ctrlAltDelBtn" type="button" class="action-row" disabled
+                              title="Send Ctrl+Alt+Del to the active console (unlock Windows)">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2.5" y="6" width="19" height="12" rx="2"/>
+                            <path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M6 14h.01M9 14h.01M12 14h.01M15 14h.01M18 14h.01"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Ctrl+Alt+Del</span>
+                      </button>
+                      <button id="pasteBtn" type="button" class="action-row" disabled
+                              title="Type the clipboard contents into the active console one keystroke at a time. Works on any guest OS (Windows, Linux GUI, Linux terminal, BIOS) — no clipboard-sync agent required.">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="6" y="4" width="12" height="17" rx="2"/>
+                            <rect x="9" y="2.5" width="6" height="3.5" rx="1"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Paste Clipboard</span>
+                      </button>
+                      <button id="keymapMenuBtn" type="button" class="action-row action-row-submenu" disabled
+                              aria-haspopup="menu" aria-expanded="false"
+                              title="Choose the keyboard layout the guest VM is configured for. Affects which physical keys Paste sends for each character.">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2.5" y="6" width="19" height="12" rx="2"/>
+                            <path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M6.5 14h11"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">
+                          Keyboard Layout
+                          <span id="keymapMenuValue" class="action-row-meta">US QWERTY</span>
+                        </span>
+                        <span class="action-row-chevron" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="9 6 15 12 9 18"/>
+                          </svg>
+                        </span>
+                      </button>
+                      <!-- Hidden but functional select; the keymap popover writes to .value
+                           so all existing app.js paste/keymap code continues to read it. -->
+                      <select id="pasteKeymap" class="paste-keymap-select-hidden" disabled aria-hidden="true" tabindex="-1">
+                        <option value="us">US QWERTY</option>
+                        <option value="uk">UK QWERTY</option>
+                        <option value="fr">French (AZERTY)</option>
+                        <option value="de">German (QWERTZ)</option>
+                        <option value="es">Spanish</option>
+                        <option value="it">Italian</option>
+                        <option value="pt-br">Brazilian (ABNT2)</option>
+                        <option value="nordic">Swedish / Finnish</option>
+                        <option value="dvorak">US Dvorak</option>
+                        <option value="colemak">US Colemak</option>
+                      </select>
+                    </div>
+
+                    <div class="action-section">
+                      <div class="action-section-title">Session</div>
+                      <button id="screenshotBtn" type="button" class="action-row" disabled
+                              title="Capture the active console as a PNG and save it server-side under the screenshots folder for this VM (per-VM UUID).">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 8h3l1.6-2.4A1 1 0 0 1 8.4 5h7.2a1 1 0 0 1 .8.6L18 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/>
+                            <circle cx="12" cy="13" r="3.5"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Screenshot</span>
+                      </button>
+                      <button id="screenshotBrowseBtn" type="button" class="action-row" disabled
+                              title="View, download, annotate, or delete past screenshots saved for this VM.">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Browse Files</span>
+                      </button>
+                      <button id="recordBtn" type="button" class="action-row action-row-record" disabled
+                              title="Start / stop a video recording of the active console (10 fps WebM, saved per-VM).">
+                        <span class="action-row-icon action-row-icon-rec" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                            <circle cx="12" cy="12" r="9"/>
+                            <circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">
+                          <span class="record-btn-label">Record</span>
+                          <span id="recordBtnTimer" class="record-btn-timer" hidden>00:00</span>
+                        </span>
+                      </button>
+                    </div>
+
+                    <div class="action-section">
+                      <div class="action-section-title">Recordings</div>
+                      <button id="recordBrowseBtn" type="button" class="action-row" disabled
+                              title="View, play back, annotate, or delete past recordings saved for this VM.">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <polygon points="7 4.5 19 12 7 19.5 7 4.5"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Recordings</span>
+                      </button>
+                    </div>
+
+                    <div class="action-section">
+                      <div class="action-section-title">Manage</div>
+                      <button id="closeAllBtn" type="button" class="action-row action-row-danger" disabled
+                              title="Close every open console tab">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="6" y1="6" x2="18" y2="18"/>
+                            <line x1="18" y1="6" x2="6" y2="18"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Close All</span>
+                      </button>
+                      <button id="showAllBtn" type="button" class="action-row" disabled
+                              title="Show every open console at once">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M2.5 12s3.5-7 9.5-7 9.5 7 9.5 7-3.5 7-9.5 7S2.5 12 2.5 12z"/>
+                            <circle cx="12" cy="12" r="3"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Show All</span>
+                      </button>
+                    </div>
+
+                    <div class="action-section">
+                      <div class="action-section-title">View</div>
+                      <button id="wallOfEyesBtn" type="button" class="action-row" disabled
+                              title="Open a live wall of every console in a new browser window">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/>
+                            <rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/>
+                            <rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/>
+                            <rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Wall View</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <!-- Keyboard layout submenu popover. Anchored to the
+                       Keyboard Layout row by JS; the row writes the
+                       chosen value back to #pasteKeymap. -->
+                  <div id="keymapPopover" class="keymap-popover" role="menu" hidden>
+                    <div class="keymap-popover-title">Guest keymap</div>
+                    <div id="keymapPopoverList" class="keymap-popover-list"></div>
                   </div>
                 </div>
                 <p class="muted">Click a VM to open its console. Multiple sessions stay open in tabs — use <strong>Show All</strong> to see them at once.</p>
