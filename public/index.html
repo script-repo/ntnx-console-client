@@ -662,6 +662,21 @@
       .tab.is-ssh.active::before {
         background: var(--ntx-success);
       }
+      /* RDP tabs are purple so the user can tell at a glance which
+         protocol each tab speaks (VNC=blue, SSH=green, RDP=purple). */
+      .tab.is-rdp {
+        color: #7e22ce;
+      }
+      .tab.is-rdp:hover {
+        color: #7e22ce;
+      }
+      .tab.is-rdp.active {
+        color: #7e22ce;
+        border-color: #7e22ce;
+      }
+      .tab.is-rdp.active::before {
+        background: #7e22ce;
+      }
       .tab-close {
         border: 0;
         background: transparent;
@@ -916,6 +931,45 @@
         pointer-events: none;
       }
       .console-pane.is-ssh .ssh-status-overlay[hidden] { display: none; }
+      /* RDP (Guacamole HTML5) panes. Black background; the Guacamole
+         display element is centered with overflow scroll if the
+         framebuffer is bigger than the pane. The overlay pattern
+         mirrors the SSH pane. */
+      .console-pane.is-rdp {
+        background: #000;
+        overflow: auto;
+      }
+      .console-pane.is-rdp .rdp-display-wrap {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .console-pane.is-rdp .rdp-display {
+        position: relative;
+        line-height: 0;
+        cursor: default;
+      }
+      .console-pane.is-rdp .rdp-display canvas {
+        display: block;
+      }
+      .console-pane.is-rdp .rdp-status-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0,0,0,0.7);
+        color: #fff;
+        font-size: 13px;
+        font-family: var(--font-mono, monospace);
+        text-align: center;
+        padding: 20px;
+        z-index: 5;
+        pointer-events: none;
+      }
+      .console-pane.is-rdp .rdp-status-overlay[hidden] { display: none; }
       .ssh-ip-picker-list {
         display: flex;
         flex-direction: column;
@@ -2915,6 +2969,80 @@
         </div>
         <div class="modal-footer">
           <button id="sshIpPickerCancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- RDP credentials modal (beta: rdpConsole). Hidden until the
+         user enables Beta in Settings AND the right-click "Open RDP"
+         item is clicked. -->
+    <div id="rdpCredsModal" class="modal-backdrop" role="dialog" aria-modal="true" data-feature="rdpConsole">
+      <div class="modal">
+        <div class="modal-header">
+          RDP credentials
+        </div>
+        <div class="modal-body">
+          <p style="margin:0;color:var(--ntx-text-muted)">
+            Connecting to
+            <span id="rdpCredsTarget" style="font-weight:600"></span>.
+            Credentials are kept in <strong>browser memory only</strong>
+            for the duration of the browser session, and forwarded to
+            the NRCC server only for the lifetime of this single RDP
+            connection. The server hands them to a locally-installed
+            <code>guacd</code>; nothing leaves the host.
+          </p>
+          <label>
+            Username
+            <input id="rdpCredsUsername" placeholder="Administrator" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+          </label>
+          <label>
+            Domain (optional)
+            <input id="rdpCredsDomain" placeholder="WORKGROUP" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+          </label>
+          <label>
+            Password
+            <input id="rdpCredsPassword" type="password" autocomplete="off" />
+          </label>
+          <label>
+            Security mode
+            <select id="rdpCredsSecurity">
+              <option value="any">Any (let guacd negotiate)</option>
+              <option value="nla">NLA (Network Level Authentication)</option>
+              <option value="tls">TLS</option>
+              <option value="rdp">Standard RDP</option>
+              <option value="vmconnect">Hyper-V VMConnect</option>
+            </select>
+          </label>
+          <label>
+            <input id="rdpCredsIgnoreCert" type="checkbox" checked />
+            Ignore TLS certificate errors (typical for lab hosts)
+          </label>
+          <label>
+            <input id="rdpCredsRemember" type="checkbox" />
+            Remember for this browser session
+          </label>
+          <div id="rdpCredsError" class="modal-error" style="display:none"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="rdpCredsCancel">Cancel</button>
+          <button id="rdpCredsSubmit" class="primary">Connect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- RDP IP picker (beta: rdpConsole). Reuses the SSH IP picker
+         layout but shows port 3389 status per IP instead of 22. -->
+    <div id="rdpIpPickerModal" class="modal-backdrop" role="dialog" aria-modal="true" data-feature="rdpConsole">
+      <div class="modal">
+        <div class="modal-header">
+          Choose RDP target
+        </div>
+        <div class="modal-body">
+          <p id="rdpIpPickerMsg" style="margin:0;color:var(--ntx-text-muted)"></p>
+          <div id="rdpIpPickerList" class="ssh-ip-picker-list"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="rdpIpPickerCancel">Cancel</button>
         </div>
       </div>
     </div>

@@ -102,6 +102,7 @@ Vanilla JS + noVNC, no build step:
 - **Network access** from the machine running NRCC to the Prism Central host on port 9440 and, optionally, to each Prism Element on port 9440 (for CVM consoles).
 - A **Prism Central account** with `Generate_VM_Console_Token` permission (typically `Cluster Admin` or `Super Admin`).
 - A **Prism Element account** if you intend to open CVM consoles. PE has its own user database; PC credentials do not federate.
+- **Optional, for the RDP browser console (beta):** the `guacd` daemon installed natively (no container required). Ubuntu/Debian `apt install guacd`, RHEL family `dnf install guacd`, macOS `brew install guacamole-server`. See **Beta: VM port scan + SSH / RDP consoles** below.
 
 ### Install
 
@@ -316,9 +317,9 @@ Conventions:
 - Code paths that aren't tied to a single DOM element can call `featureFlags.isEnabled("<id>")` to gate themselves.
 - Promote a feature to GA by changing `stage` to `"ga"` in the registry. Beta-only `data-feature` markers can stay; `featureFlags.refresh()` will simply leave them visible.
 
-### Beta: VM port scan + SSH consoles
+### Beta: VM port scan + SSH / RDP consoles
 
-Two beta features (`vmPortScan` and `sshConsole`) work together so a user can open an SSH session straight from the VM list, in a tab that behaves like any other console tab (screenshots and recordings included). Both surfaces are hidden by default and only render after the user toggles **Show beta features** in Settings AND the operator has left the corresponding `NRCC_*_ENABLED` env var on.
+Three beta features (`vmPortScan`, `sshConsole`, and `rdpConsole`) work together so a user can open an SSH or RDP session straight from the VM list, in a tab that behaves like any other console tab (screenshots and recordings included). All surfaces are hidden by default and only render after the user toggles **Show beta features** in Settings AND the operator has left the corresponding `NRCC_*_ENABLED` env var on.
 
 **vmPortScan** — after the VM list arrives the client batches the IPs to `POST /api/probe/ports`, in groups of 50, debounced 500 ms. The server TCP-dials each `(vm, ip, port)` tuple (default `22` and `3389`) under a global semaphore (`NRCC_PROBE_CONCURRENCY`, default 20) and caches the result for `NRCC_PROBE_CACHE_TTL_MS` (default 2 min). Open ports surface as small **SSH** / **RDP** pills next to the existing power-state pill in each VM row.
 
@@ -329,14 +330,45 @@ Two beta features (`vmPortScan` and `sshConsole`) work together so a user can op
 3. The browser renders the stream with [`xterm.js`](https://github.com/xtermjs/xterm.js) and its WebGL renderer, which publishes a single `<canvas>` into the same console pane noVNC would otherwise own. The existing screenshot and recording pipelines pick that canvas up automatically.
 4. Resize is debounced 80 ms (`ResizeObserver` on the pane → `fitAddon.fit()` → `{type:"resize", cols, rows}` text frame → `stream.setWindow()`).
 
+**rdpConsole** — when the probe saw `3389/tcp` open AND `rdpConsole` is enabled, an **Open RDP** entry appears in the right-click menu (purple icon, alongside the green SSH one). The first time it's used per VM the user is prompted for credentials (username + password, optional domain, security mode, ignore-cert checkbox) and may tick **Remember for this browser session**. The RDP session itself flows through:
+
+1. `POST /api/rdp/start` validates the host against the per-VM probe cache (the same SSRF guard SSH uses) and allocates a single-use session id. The browser also reports its actual screen-pane size so guacd produces a correctly-sized framebuffer from the very first frame.
+2. The browser opens `/ws-rdp/<id>`; the server accepts the upgrade exactly once, deletes the session entry, and TCP-connects to a locally-installed `guacd` on `NRCC_GUACD_HOST:NRCC_GUACD_PORT` (default `127.0.0.1:4822`).
+3. The server runs the Guacamole protocol handshake: `select,rdp;` → reads `args,VERSION_X_Y_Z,...;` → replies with `size`, `audio`, `video`, `image`, `timezone`, then `connect,...` filling each parameter slot from the cached credentials in the order guacd dictated. From that point it is a byte pump between the WebSocket and the TCP socket.
+4. The browser uses [`guacamole-common-js`](https://www.npmjs.com/package/guacamole-common-js) to render the protocol stream onto a stack of `<canvas>` elements. A parallel 2D capture canvas is updated from `display.flatten()` so the existing screenshot and recording pipelines work transparently.
+5. Resize is debounced 120 ms (`ResizeObserver` on the pane → `client.sendSize(w, h)` + `display.scale(...)`); the negotiated `resize-method` is `display-update` so guests that support it produce a fresh framebuffer at the new size.
+6. RDP tabs are coloured **purple** in the tab strip, alongside the **green** SSH tabs and the default **blue** VNC tabs, so the protocol is obvious at a glance.
+
+**Installing `guacd` natively (no container required)**
+
+`guacd` is the Apache Guacamole proxy daemon. NRCC does **not** bundle it and does **not** require a container — you install it the same way you'd install any other system service:
+
+```bash
+# Ubuntu / Debian
+sudo apt install guacd
+
+# RHEL / Rocky / Alma / Fedora
+sudo dnf install guacd
+
+# macOS (Homebrew)
+brew install guacamole-server
+brew services start guacamole-server
+
+# Verify it's listening on 127.0.0.1:4822
+ss -ltn | grep 4822    # or: lsof -iTCP:4822 -sTCP:LISTEN
+```
+
+If `guacd` lives on a different host or port, point NRCC at it with `NRCC_GUACD_HOST` / `NRCC_GUACD_PORT`. Connection failures surface in the browser as a Guacamole `error` instruction (status `519` / `UPSTREAM_NOT_FOUND`) so an operator who forgets to start the daemon gets a clear message instead of a silent hang.
+
 **Caveats**
 
 - **No SSH host-key pinning yet.** v1 accepts any host key; the IP allow-list (RFC1918 + probe cache) is the primary defence. Host-key TOFU prompts will land in a follow-up.
-- **RDP is not implemented.** The plan covers SSH only; RDP is deferred until the `guacd`-or-equivalent backend is picked.
-- **L3 reachability required.** The NRCC server (or pod) must be able to TCP-dial the VM IPs directly. In Kubernetes deployments this means the pod needs network policy that permits egress to the VM subnet.
-- **Probe noise.** 2 ports × 4 IPs × N VMs is bounded by `NRCC_PROBE_CONCURRENCY` and cached for `NRCC_PROBE_CACHE_TTL_MS`. Disable per env var (`NRCC_PROBE_ENABLED=false`) if a SOC complains; the SSH endpoint refuses to start a session without a fresh probe entry, so disabling the probe also disables SSH.
-- **Process-memory state.** SSH session metadata and the probe cache live in process memory only. A self-update restart wipes both — same caveat as the chat history.
-- **xterm renderer only paints on activity** so `canvas.captureStream(10)` produces a sparse video. MediaRecorder still encodes it correctly; recorded SSH files are tiny relative to a busy VNC tab.
+- **RDP TLS verification defaults off.** `NRCC_RDP_IGNORE_CERT=true` (the lab default) tells `guacd` to accept any certificate the RDP host presents. Set it to `false` once you have a real PKI in place.
+- **L3 reachability required.** The NRCC server (or pod) must be able to TCP-dial the VM IPs directly. In Kubernetes deployments this means the pod needs network policy that permits egress to the VM subnet. RDP additionally needs `guacd` reachable on the same host or the network in between.
+- **Probe noise.** 2 ports × 4 IPs × N VMs is bounded by `NRCC_PROBE_CONCURRENCY` and cached for `NRCC_PROBE_CACHE_TTL_MS`. Disable per env var (`NRCC_PROBE_ENABLED=false`) if a SOC complains; the SSH and RDP endpoints both refuse to start a session without a fresh probe entry, so disabling the probe also disables both.
+- **Process-memory state.** SSH / RDP session metadata and the probe cache live in process memory only. A self-update restart wipes both — same caveat as the chat history.
+- **xterm renderer only paints on activity** so `canvas.captureStream(10)` produces a sparse video. MediaRecorder still encodes it correctly; recorded SSH files are tiny relative to a busy VNC tab. The RDP recording path uses the same per-fps capture tick so a static guest desktop still produces a smooth playback file.
+- **Audio / printer / drive redirection are off.** The `audio`/`video` capability arrays we send to guacd are empty, and the connect parameters explicitly disable printer / drive sharing. The browser console is rendering-only.
 
 ---
 

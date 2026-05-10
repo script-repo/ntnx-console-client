@@ -130,6 +130,23 @@ const sshIpPickerMsg = document.getElementById("sshIpPickerMsg");
 const sshIpPickerListEl = document.getElementById("sshIpPickerList");
 const sshIpPickerCancelBtn = document.getElementById("sshIpPickerCancel");
 
+const rdpCredsModal = document.getElementById("rdpCredsModal");
+const rdpCredsTargetLabel = document.getElementById("rdpCredsTarget");
+const rdpCredsUsernameInput = document.getElementById("rdpCredsUsername");
+const rdpCredsDomainInput = document.getElementById("rdpCredsDomain");
+const rdpCredsPasswordInput = document.getElementById("rdpCredsPassword");
+const rdpCredsSecuritySelect = document.getElementById("rdpCredsSecurity");
+const rdpCredsIgnoreCertInput = document.getElementById("rdpCredsIgnoreCert");
+const rdpCredsRememberInput = document.getElementById("rdpCredsRemember");
+const rdpCredsErrorEl = document.getElementById("rdpCredsError");
+const rdpCredsCancelBtn = document.getElementById("rdpCredsCancel");
+const rdpCredsSubmitBtn = document.getElementById("rdpCredsSubmit");
+
+const rdpIpPickerModal = document.getElementById("rdpIpPickerModal");
+const rdpIpPickerMsg = document.getElementById("rdpIpPickerMsg");
+const rdpIpPickerListEl = document.getElementById("rdpIpPickerList");
+const rdpIpPickerCancelBtn = document.getElementById("rdpIpPickerCancel");
+
 // =====================================================================
 // Storage keys
 // =====================================================================
@@ -1129,8 +1146,10 @@ function logout() {
   // Stop the update-availability poll and clear the gear-icon badge
   // so the login screen doesn't show a stale dot.
   stopUpdateBadgePoll();
-  // Beta: drop any cached SSH credentials and stop the port scanner.
+  // Beta: drop any cached SSH / RDP credentials and stop the port
+  // scanner.
   if (typeof sshCredsCache !== "undefined") sshCredsCache.clear();
+  if (typeof rdpCredsCache !== "undefined") rdpCredsCache.clear();
   if (typeof vmPortScanner !== "undefined") vmPortScanner.clear();
   showLoginScreen();
   setStatus("Idle");
@@ -1255,7 +1274,22 @@ function updateConsoleControls() {
 
 function sendCtrlAltDel() {
   const session = consoleSessions.find((s) => s.id === activeSessionId);
-  if (!session?.rfb) return; // No-op for SSH tabs (xterm.js doesn't have a sendKey API)
+  if (!session) return;
+  // RDP path: Guacamole speaks X keysyms directly, same wire-level
+  // values noVNC uses so the constants below work for either client.
+  if (session.kind === "rdp" && session.rdp && session.rdp.client) {
+    const c = session.rdp.client;
+    c.sendKeyEvent(1, 0xffe3); // Ctrl down
+    c.sendKeyEvent(1, 0xffe9); // Alt down
+    c.sendKeyEvent(1, 0xffff); // Delete down
+    c.sendKeyEvent(0, 0xffff); // Delete up
+    c.sendKeyEvent(0, 0xffe9); // Alt up
+    c.sendKeyEvent(0, 0xffe3); // Ctrl up
+    setStatus(`Sent Ctrl+Alt+Del to ${session.vmName}.`);
+    logEvent("console.ctrl-alt-del", session.vmUuid);
+    return;
+  }
+  if (!session.rfb) return; // No-op for SSH tabs (xterm.js doesn't have a sendKey API)
   const rfb = session.rfb;
   rfb.sendKey(0xffe3, "ControlLeft", true);
   rfb.sendKey(0xffe9, "AltLeft", true);
@@ -1973,6 +2007,30 @@ async function pasteClipboardToConsole() {
     }
     return;
   }
+  if (session.kind === "rdp") {
+    if (!session.rdp || !session.rdp.client) {
+      setStatus(`RDP session for ${session.vmName} is not connected.`);
+      return;
+    }
+    // Guacamole's recommended path for clipboard paste: open an
+    // outbound stream tagged with the text mimetype, write the
+    // payload, then end. The remote (RDP guest) sees a clipboard
+    // update. We do NOT type the text key-by-key because RDP carries
+    // a real clipboard channel.
+    setStatus(`Pasting ${text.length} chars into ${session.vmName}...`);
+    try {
+      const Guacamole = window.Guacamole;
+      const stream = session.rdp.client.createClipboardStream("text/plain");
+      const writer = new Guacamole.StringWriter(stream);
+      writer.sendText(text);
+      writer.sendEnd();
+      logEvent("console.paste", session.vmUuid, { length: text.length, transport: "rdp" });
+      setStatus(`Pasted into ${session.vmName}.`);
+    } catch (err) {
+      setStatus(`Paste failed: ${err.message || err}`);
+    }
+    return;
+  }
   if (!session.rfb) return;
   setStatus(`Typing clipboard into ${session.vmName}...`, { spinner: true });
   // Use a small per-keystroke delay (and a slightly longer pause after
@@ -2008,6 +2066,10 @@ function closeSession(sessionId) {
     // terminal, and disconnects the resize observer.
     try { teardownSshSession(s); } catch (_error) { /* ignore */ }
     logEvent("console.ssh.close", s.vmUuid, { reason: "session-closed" });
+  } else if (s.kind === "rdp") {
+    // RDP tabs use guacamole-common-js + a WS bridge to guacd.
+    try { teardownRdpSession(s); } catch (_error) { /* ignore */ }
+    logEvent("console.rdp.close", s.vmUuid, { reason: "session-closed" });
   } else {
     try {
       s.rfb.disconnect();
@@ -2320,8 +2382,46 @@ function showVmContextMenu(x, y, vmUuid) {
       ctxMenu.appendChild(sshItem);
     }
   }
-  // TODO(rdp): when the RDP guacd backend lands, mirror the SSH
-  // block above and gate on featureFlags.isEnabled("rdpConsole").
+  // Beta: RDP menu item. Mirrors the SSH block above but consults
+  // the rdp pillar of the probe cache (port 3389) and routes through
+  // openRdpFor / guacd. Hidden unless rdpConsole is enabled.
+  if (featureFlags.isEnabled("rdpConsole")) {
+    const liveVmForMenu = getVmByUuid(vmUuid);
+    const snapForMenu = liveVmForMenu || (favStore.vmMeta && favStore.vmMeta[vmUuid]) || null;
+    const ipsForMenu = liveVmForMenu
+      ? (Array.isArray(liveVmForMenu.ipAddresses) ? liveVmForMenu.ipAddresses : (liveVmForMenu.ipAddress ? [liveVmForMenu.ipAddress] : []))
+      : (snapForMenu && snapForMenu.ipAddress ? [snapForMenu.ipAddress] : []);
+    if (ipsForMenu.length) {
+      // Only add a separator if the SSH block above didn't already
+      // add one (i.e. sshConsole is off, or the VM has no IPs known
+      // to that path).
+      if (!ctxMenu.lastChild || !ctxMenu.lastChild.classList || !ctxMenu.lastChild.classList.contains("ctx-menu-sep")) {
+        if (!featureFlags.isEnabled("sshConsole")) {
+          const sep = document.createElement("div");
+          sep.className = "ctx-menu-sep";
+          ctxMenu.appendChild(sep);
+        }
+      }
+      const rdpItem = document.createElement("div");
+      rdpItem.className = "ctx-menu-item";
+      rdpItem.dataset.feature = "rdpConsole";
+      const portStatus = vmPortStatus.get(vmUuid);
+      let label;
+      if (portStatus && portStatus.rdp && portStatus.preferredIp && portStatus.preferredIp.rdp) {
+        label = `Open RDP (${portStatus.preferredIp.rdp})`;
+      } else if (portStatus && !portStatus.rdp) {
+        label = "Open RDP (try anyway)";
+      } else {
+        label = "Open RDP (probe...)";
+      }
+      rdpItem.innerHTML = `<span class="ctx-icon">▢</span><span>${escapeHtml(label)}</span>`;
+      rdpItem.addEventListener("click", () => {
+        hideContextMenu();
+        openRdpFor(vmUuid);
+      });
+      ctxMenu.appendChild(rdpItem);
+    }
+  }
 
   // Position, then clamp to viewport
   ctxMenu.style.left = `${x}px`;
@@ -2396,8 +2496,12 @@ async function requestVmPower(vmUuid, action) {
 // =====================================================================
 
 function captureSessionThumbnail(s) {
-  // noVNC renders its frames into a <canvas> inside the screen pane.
-  const canvas = s.screenEl.querySelector("canvas");
+  // Route through getSessionCanvas so SSH (xterm capture) and RDP
+  // (Guacamole flatten) tabs produce thumbnails too, not just the
+  // VNC <canvas>.
+  const canvas = (typeof getSessionCanvas === "function")
+    ? getSessionCanvas(s)
+    : s.screenEl.querySelector("canvas");
   if (!canvas) return null;
   try {
     return canvas.toDataURL("image/png");
@@ -3719,6 +3823,503 @@ async function openSshFor(vmUuid) {
 }
 
 // =====================================================================
+// RDP browser console (beta: rdpConsole)
+// =====================================================================
+//
+// Mirrors openSshFor: resolve target IP via probe cache (or run an
+// on-demand probe / IP picker), prompt for credentials, POST to
+// /api/rdp/start to authorise the session, then open the WebSocket
+// to /ws-rdp/<id>. The browser side uses guacamole-common-js to
+// render the Guacamole protocol stream the server proxies from
+// guacd. Display element gets injected into a console pane like
+// noVNC's <canvas>; the existing screenshot + recording pipelines
+// read from a parallel 2D capture canvas (display.flatten() result
+// painted on each frame), the same trick we use for SSH.
+
+// vmUuid -> { username, password, domain, security, ignoreCert,
+//             remember }. Cleared on logout.
+const rdpCredsCache = new Map();
+
+let _guacamolePromise = null;
+function loadGuacamoleModule() {
+  if (window.Guacamole) return Promise.resolve(window.Guacamole);
+  if (_guacamolePromise) return _guacamolePromise;
+  // Different guacamole-common-js npm releases ship their browser
+  // bundle at slightly different paths (dist/ vs lib/, hyphen vs
+  // dot in the filename). Try them in order until one loads, so we
+  // don't break on a future package layout change. The bundle drops
+  // the Guacamole namespace onto window when it executes.
+  const candidatePaths = [
+    "/vendor/guacamole-common-js/dist/guacamole-common-js.min.js",
+    "/vendor/guacamole-common-js/dist/guacamole-common.min.js",
+    "/vendor/guacamole-common-js/dist/guacamole-common-js.js",
+    "/vendor/guacamole-common-js/dist/guacamole-common.js",
+    "/vendor/guacamole-common-js/dist/all.min.js",
+    "/vendor/guacamole-common-js/dist/all.js",
+    "/vendor/guacamole-common-js/lib/all.min.js",
+    "/vendor/guacamole-common-js/lib/all.js"
+  ];
+  function tryLoad(idx) {
+    return new Promise((resolve, reject) => {
+      if (idx >= candidatePaths.length) {
+        reject(new Error("Could not locate the guacamole-common-js browser bundle. Check that `npm install` has been run."));
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = candidatePaths[idx];
+      script.async = true;
+      script.onload = () => {
+        if (window.Guacamole) resolve(window.Guacamole);
+        else tryLoad(idx + 1).then(resolve, reject);
+      };
+      script.onerror = () => { tryLoad(idx + 1).then(resolve, reject); };
+      document.head.appendChild(script);
+    });
+  }
+  _guacamolePromise = tryLoad(0).catch((err) => { _guacamolePromise = null; throw err; });
+  return _guacamolePromise;
+}
+
+function promptForRdpCreds(vmUuid, host, port, prefill) {
+  return new Promise((resolve) => {
+    if (!rdpCredsModal) { resolve(null); return; }
+    const seed = prefill || rdpCredsCache.get(vmUuid) || {};
+    rdpCredsTargetLabel.textContent = `${host}:${port}`;
+    rdpCredsUsernameInput.value = seed.username || "Administrator";
+    rdpCredsDomainInput.value = seed.domain || "";
+    rdpCredsPasswordInput.value = "";
+    rdpCredsSecuritySelect.value = seed.security || "any";
+    rdpCredsIgnoreCertInput.checked = (typeof seed.ignoreCert === "boolean") ? seed.ignoreCert : true;
+    rdpCredsRememberInput.checked = !!seed.remember;
+    rdpCredsErrorEl.style.display = "none";
+    rdpCredsErrorEl.textContent = "";
+
+    rdpCredsModal.classList.add("open");
+    setTimeout(() => rdpCredsUsernameInput.focus(), 50);
+
+    const cleanup = () => {
+      rdpCredsModal.classList.remove("open");
+      rdpCredsCancelBtn.removeEventListener("click", onCancel);
+      rdpCredsSubmitBtn.removeEventListener("click", onSubmit);
+      rdpCredsModal.removeEventListener("keydown", onKey);
+      // Wipe the password field so it doesn't linger in the DOM.
+      rdpCredsPasswordInput.value = "";
+    };
+    const onCancel = () => { cleanup(); resolve(null); };
+    const onSubmit = () => {
+      const username = rdpCredsUsernameInput.value.trim();
+      const password = rdpCredsPasswordInput.value;
+      if (!username) {
+        rdpCredsErrorEl.textContent = "Username is required.";
+        rdpCredsErrorEl.style.display = "block";
+        return;
+      }
+      if (!password) {
+        rdpCredsErrorEl.textContent = "Password is required.";
+        rdpCredsErrorEl.style.display = "block";
+        return;
+      }
+      const creds = {
+        username,
+        password,
+        domain: rdpCredsDomainInput.value.trim(),
+        security: rdpCredsSecuritySelect.value || "any",
+        ignoreCert: rdpCredsIgnoreCertInput.checked,
+        remember: rdpCredsRememberInput.checked
+      };
+      cleanup();
+      resolve(creds);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") { event.preventDefault(); onCancel(); }
+    };
+    rdpCredsCancelBtn.addEventListener("click", onCancel);
+    rdpCredsSubmitBtn.addEventListener("click", onSubmit);
+    rdpCredsModal.addEventListener("keydown", onKey);
+  });
+}
+
+function promptForRdpIp(vmName, ips, statusEntry, message) {
+  return new Promise((resolve) => {
+    if (!rdpIpPickerModal) { resolve(null); return; }
+    rdpIpPickerMsg.textContent = message || `Choose an IP to RDP into ${vmName}.`;
+    rdpIpPickerListEl.innerHTML = "";
+    const ipsObj = (statusEntry && statusEntry.ips) || {};
+    ips.forEach((ip) => {
+      const row = document.createElement("div");
+      row.className = "ssh-ip-picker-row";
+      const portStatus = (ipsObj[ip] && ipsObj[ip]["3389"]) || "unknown";
+      row.innerHTML = `
+        <span class="ssh-ip-addr">${escapeHtml(ip)}</span>
+        <span class="ssh-ip-status" data-status="${escapeHtml(portStatus)}">${escapeHtml(portStatus)}</span>
+      `;
+      row.addEventListener("click", () => {
+        cleanup();
+        resolve(ip);
+      });
+      rdpIpPickerListEl.appendChild(row);
+    });
+    rdpIpPickerModal.classList.add("open");
+
+    const cleanup = () => {
+      rdpIpPickerModal.classList.remove("open");
+      rdpIpPickerCancelBtn.removeEventListener("click", onCancel);
+      rdpIpPickerModal.removeEventListener("keydown", onKey);
+    };
+    const onCancel = () => { cleanup(); resolve(null); };
+    const onKey = (event) => {
+      if (event.key === "Escape") { event.preventDefault(); onCancel(); }
+    };
+    rdpIpPickerCancelBtn.addEventListener("click", onCancel);
+    rdpIpPickerModal.addEventListener("keydown", onKey);
+  });
+}
+
+function teardownRdpSession(s) {
+  const rdp = s.rdp;
+  if (!rdp) return;
+  if (rdp.resizeObserver) {
+    try { rdp.resizeObserver.disconnect(); } catch (_e) { /* ignore */ }
+  }
+  if (rdp.captureTickHandle) {
+    try { clearInterval(rdp.captureTickHandle); } catch (_e) { /* ignore */ }
+  }
+  if (rdp.client) {
+    try { rdp.client.disconnect(); } catch (_e) { /* ignore */ }
+  }
+  if (rdp.keyboard) {
+    try { rdp.keyboard.onkeydown = null; rdp.keyboard.onkeyup = null; } catch (_e) { /* ignore */ }
+  }
+  if (rdp.mouse) {
+    try {
+      rdp.mouse.onmousedown = null;
+      rdp.mouse.onmouseup = null;
+      rdp.mouse.onmousemove = null;
+    } catch (_e) { /* ignore */ }
+  }
+  s.rdp = null;
+}
+
+async function openRdpFor(vmUuid) {
+  if (!session.loggedIn) return;
+  if (!featureFlags.isEnabled("rdpConsole")) return;
+  if (!appConfig.rdp || !appConfig.rdp.enabled) {
+    setStatus("RDP is disabled on this server (NRCC_RDP_ENABLED=false).");
+    return;
+  }
+
+  const liveVm = getVmByUuid(vmUuid);
+  const snap = liveVm || favStore.vmMeta[vmUuid];
+  const vmName = (liveVm?.name) || (snap && snap.name) || vmUuid;
+  const port = 3389;
+  const ips = liveVm
+    ? (Array.isArray(liveVm.ipAddresses) ? liveVm.ipAddresses : (liveVm.ipAddress ? [liveVm.ipAddress] : []))
+    : (snap && snap.ipAddress ? [snap.ipAddress] : []);
+  if (!ips.length) {
+    setStatus(`No known IPs for ${vmName}; cannot RDP.`);
+    return;
+  }
+
+  // IP resolution mirrors the SSH path but consults the rdp pillar
+  // of the probe cache (port 3389 instead of 22).
+  let host = null;
+  let statusEntry = vmPortStatus.get(vmUuid);
+  if (statusEntry && statusEntry.preferredIp && statusEntry.preferredIp.rdp) {
+    host = statusEntry.preferredIp.rdp;
+  } else {
+    if (!statusEntry || (Date.now() - statusEntry.scannedAt) > 60_000) {
+      setStatus(`Probing ${vmName} for RDP...`, { spinner: true });
+      const probeVmInput = liveVm || { uuid: vmUuid, ipAddresses: ips };
+      const fresh = await vmPortScanner.probeNow(probeVmInput);
+      statusEntry = fresh || vmPortStatus.get(vmUuid) || null;
+    }
+    if (statusEntry && statusEntry.preferredIp && statusEntry.preferredIp.rdp) {
+      host = statusEntry.preferredIp.rdp;
+    } else {
+      const message = ips.length === 1
+        ? `RDP port 3389 was not detected on ${ips[0]}. Try anyway?`
+        : `RDP port 3389 was not detected on any of ${vmName}'s IPs. Pick one to try anyway:`;
+      const picked = await promptForRdpIp(vmName, ips, statusEntry, message);
+      if (!picked) { setStatus("RDP cancelled."); return; }
+      host = picked;
+    }
+  }
+  if (!host) { setStatus("RDP cancelled."); return; }
+
+  let creds = rdpCredsCache.get(vmUuid) || null;
+  if (!creds) {
+    creds = await promptForRdpCreds(vmUuid, host, port, null);
+    if (!creds) { setStatus("RDP cancelled."); return; }
+  }
+
+  // Compute display dimensions from the actual screen-stage size so
+  // guacd produces correctly-sized framebuffers from the first frame.
+  // Falls back to /api/config defaults if the stage hasn't laid out
+  // yet (rare; happens if the user hits "Open RDP" before showing
+  // the console area).
+  const stageRect = screenStageEl.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const defaults = appConfig.rdp || { defaultWidth: 1280, defaultHeight: 800, defaultDpi: 96 };
+  const desiredWidth = Math.max(640, Math.floor((stageRect.width || defaults.defaultWidth) * dpr));
+  const desiredHeight = Math.max(480, Math.floor((stageRect.height || defaults.defaultHeight) * dpr));
+  const desiredDpi = Math.round((defaults.defaultDpi || 96) * dpr);
+
+  setStatus(`Authorising RDP session to ${vmName} (${host})...`, { spinner: true });
+
+  let startData;
+  try {
+    const resp = await fetch("/api/rdp/start", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        vmUuid,
+        host,
+        port,
+        username: creds.username,
+        password: creds.password || "",
+        domain: creds.domain || "",
+        width: desiredWidth,
+        height: desiredHeight,
+        dpi: desiredDpi,
+        security: creds.security || "any",
+        ignoreCert: !!creds.ignoreCert
+      })
+    });
+    startData = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(startData.error || `HTTP ${resp.status}`);
+  } catch (err) {
+    setStatus(`RDP start failed: ${err.message || err}`);
+    if (creds && creds.remember) rdpCredsCache.delete(vmUuid);
+    return;
+  }
+  if (creds.remember) rdpCredsCache.set(vmUuid, creds);
+
+  let Guacamole;
+  try {
+    Guacamole = await loadGuacamoleModule();
+  } catch (err) {
+    setStatus(`Failed to load Guacamole bundle: ${err.message || err}`);
+    return;
+  }
+
+  const sessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const screenEl = document.createElement("div");
+  screenEl.className = "console-pane is-rdp";
+  const wrap = document.createElement("div");
+  wrap.className = "rdp-display-wrap";
+  const displayHost = document.createElement("div");
+  displayHost.className = "rdp-display";
+  // Tabbable so keyboard focus actually routes through the
+  // Guacamole.Keyboard listener.
+  displayHost.tabIndex = 0;
+  wrap.appendChild(displayHost);
+  screenEl.appendChild(wrap);
+  const overlay = document.createElement("div");
+  overlay.className = "rdp-status-overlay";
+  overlay.textContent = `Connecting to ${vmName} (${host}:${port})...`;
+  screenEl.appendChild(overlay);
+  screenStageEl.appendChild(screenEl);
+
+  const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${wsScheme}//${location.host}${startData.websocketUrl}`;
+  // WebSocketTunnel wraps a WS in the Guacamole.Tunnel interface
+  // and emits text-frame instructions; our server proxies those
+  // straight to guacd after the handshake.
+  const tunnel = new Guacamole.WebSocketTunnel(wsUrl);
+  const client = new Guacamole.Client(tunnel);
+
+  const display = client.getDisplay();
+  const displayElement = display.getElement();
+  displayHost.appendChild(displayElement);
+
+  // Capture canvas for screenshot + recording. display.flatten()
+  // returns a single composited canvas snapshot; we mirror it onto
+  // a 2D canvas that the existing capture pipeline reads from. Same
+  // approach as SSH (createSshCaptureCanvas), just reading from a
+  // different source.
+  const captureCanvas = document.createElement("canvas");
+  const captureCtx = captureCanvas.getContext("2d", { alpha: false });
+  function paintCapture() {
+    try {
+      const w = display.getWidth();
+      const h = display.getHeight();
+      if (!w || !h) return;
+      if (captureCanvas.width !== w || captureCanvas.height !== h) {
+        captureCanvas.width = w;
+        captureCanvas.height = h;
+      }
+      const flat = display.flatten();
+      if (flat) {
+        captureCtx.fillStyle = "#000";
+        captureCtx.fillRect(0, 0, w, h);
+        captureCtx.drawImage(flat, 0, 0);
+      }
+    } catch (_e) { /* ignore */ }
+  }
+  // Repaint on every flush from the display (which fires after each
+  // batch of drawing instructions). Idempotent if nothing changed.
+  display.onflush = () => paintCapture();
+
+  client.onstatechange = (state) => {
+    // Guacamole client states:
+    //   0 IDLE, 1 CONNECTING, 2 WAITING, 3 CONNECTED,
+    //   4 DISCONNECTING, 5 DISCONNECTED
+    if (state === 3) {
+      overlay.hidden = true;
+      setStatus(`RDP connected: ${vmName}`);
+      // First capture frame so the screenshot button works
+      // immediately after connect.
+      paintCapture();
+      // Resize to current pane size now we have a display.
+      sendRdpSize();
+    } else if (state === 5) {
+      overlay.hidden = false;
+      overlay.textContent = `RDP disconnected: ${vmName}`;
+      setStatus(`RDP disconnected: ${vmName}`);
+      logEvent("console.rdp.close", vmUuid, {});
+    }
+  };
+
+  client.onerror = (status) => {
+    const msg = status && status.message ? status.message : `code ${status?.code}`;
+    overlay.hidden = false;
+    overlay.textContent = `RDP error: ${msg}`;
+    setStatus(`RDP error (${vmName}): ${msg}`);
+  };
+
+  // Server -> client clipboard relay. RDP guests that use Ctrl+C
+  // produce a `clipboard` instruction; mirror it into the browser
+  // clipboard so the user can paste outside the console.
+  client.onclipboard = (stream, mimetype) => {
+    if (!mimetype || !mimetype.startsWith("text/")) return;
+    const reader = new Guacamole.StringReader(stream);
+    let text = "";
+    reader.ontext = (t) => { text += t; };
+    reader.onend = () => {
+      if (text && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => { /* user denied perm */ });
+      }
+    };
+  };
+
+  // Mouse + keyboard wiring. Guacamole ships its own helpers that
+  // translate browser events into protocol instructions.
+  const mouse = new Guacamole.Mouse(displayElement);
+  const sendMouseState = (mouseState) => {
+    // Display.scale() can shrink the display to fit the pane; the
+    // mouse must report coordinates in display pixels, so we
+    // unscale before forwarding.
+    const scale = display.getScale() || 1;
+    client.sendMouseState({
+      x: mouseState.x / scale,
+      y: mouseState.y / scale,
+      left: mouseState.left,
+      middle: mouseState.middle,
+      right: mouseState.right,
+      up: mouseState.up,
+      down: mouseState.down
+    });
+  };
+  mouse.onmousedown = sendMouseState;
+  mouse.onmouseup = sendMouseState;
+  mouse.onmousemove = sendMouseState;
+
+  const keyboard = new Guacamole.Keyboard(displayElement);
+  keyboard.onkeydown = (keysym) => { client.sendKeyEvent(1, keysym); };
+  keyboard.onkeyup = (keysym) => { client.sendKeyEvent(0, keysym); };
+
+  // Forward focus into the keyboard listener as soon as the user
+  // clicks anywhere on the display, so RDP keystrokes work without
+  // an extra Tab to focus.
+  displayElement.addEventListener("mousedown", () => {
+    try { displayHost.focus(); } catch (_e) { /* ignore */ }
+  });
+
+  // Resize: call client.sendSize when the screen pane changes size.
+  // Guacamole lets us request a new framebuffer size mid-session if
+  // the negotiated `resize-method` is "display-update" (which it is,
+  // see buildRdpConnectValues on the server).
+  let resizeObserver = null;
+  let pendingResize = null;
+  const sendRdpSize = () => {
+    if (client.currentState === 5) return; // disconnected
+    const rect = screenEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const w = Math.max(640, Math.floor(rect.width * (window.devicePixelRatio || 1)));
+    const h = Math.max(480, Math.floor(rect.height * (window.devicePixelRatio || 1)));
+    try { client.sendSize(w, h); } catch (_e) { /* ignore */ }
+    // Also rescale the display to fit the pane (so a 1920x1080
+    // framebuffer in a 1280x720 pane shrinks to fit).
+    try {
+      const ds = Math.min(rect.width / display.getWidth(), rect.height / display.getHeight());
+      if (Number.isFinite(ds) && ds > 0) display.scale(ds);
+    } catch (_e) { /* ignore */ }
+  };
+  const debouncedResize = () => {
+    if (pendingResize) clearTimeout(pendingResize);
+    pendingResize = setTimeout(sendRdpSize, 120);
+  };
+  resizeObserver = new ResizeObserver(debouncedResize);
+  resizeObserver.observe(screenEl);
+
+  // Fallback capture tick: even without a flush event we keep the
+  // capture canvas warm at ~5 fps, so screenshots always reflect
+  // recent frames. The recording pipeline pumps this faster.
+  const captureTickHandle = setInterval(paintCapture, 200);
+
+  try {
+    // Optional connect data is appended to the WS URL as a query
+    // string. We don't need to send anything (the server already
+    // has our credentials), but Guacamole.Client.connect requires a
+    // truthy argument on some versions.
+    client.connect("");
+  } catch (err) {
+    setStatus(`RDP connect failed: ${err.message || err}`);
+    return;
+  }
+
+  const newSession = {
+    id: sessionId,
+    vmUuid,
+    vmName,
+    kind: "rdp",
+    rfb: null,
+    screenEl,
+    tabEl: null,
+    keymap: lastUsedKeymap || DEFAULT_KEYMAP_ID,
+    rdp: {
+      client,
+      tunnel,
+      display,
+      keyboard,
+      mouse,
+      host,
+      port,
+      username: creds.username,
+      overlay,
+      captureCanvas,
+      captureTickHandle,
+      resizeObserver,
+      paintCapture
+    }
+  };
+  const tabEl = createSessionTab(newSession);
+  // Distinguish RDP tabs visually (purple) from VNC (blue) and SSH
+  // (green) so the protocol is obvious at a glance.
+  tabEl.classList.add("is-rdp");
+  const tabLabelSpan = tabEl.querySelector("span:first-child");
+  if (tabLabelSpan) tabLabelSpan.textContent = `rdp: ${vmName}`;
+  newSession.tabEl = tabEl;
+  consoleSessions.push(newSession);
+  consoleTabsEl.appendChild(tabEl);
+  setActiveSession(sessionId);
+
+  setTimeout(() => { try { displayHost.focus(); } catch (_e) { /* ignore */ } }, 50);
+  logEvent("console.rdp.open", vmUuid, { host, port });
+}
+
+// =====================================================================
 // Activity logging (per-user opt-in -> POST /api/log)
 // =====================================================================
 //
@@ -3950,6 +4551,13 @@ function getSessionCanvas(s) {
   if (s.kind === "ssh" && s.ssh && s.ssh.capture) {
     try { s.ssh.capture.paint(); } catch (_e) { /* ignore */ }
     return s.ssh.capture.canvas;
+  }
+  if (s.kind === "rdp" && s.rdp && s.rdp.captureCanvas) {
+    // Repaint right before reading so the screenshot reflects the
+    // most recent display state. The recording pipeline keeps the
+    // capture warm via its own tick (see startRecordingForSession).
+    try { s.rdp.paintCapture(); } catch (_e) { /* ignore */ }
+    return s.rdp.captureCanvas;
   }
   return s.screenEl.querySelector("canvas");
 }
@@ -4805,6 +5413,16 @@ async function startRecordingForSession(session) {
     const tickMs = Math.max(50, Math.floor(1000 / Math.max(1, fps)));
     state.refreshTickHandle = setInterval(() => {
       try { session.ssh.capture.paint(); } catch (_e) { /* ignore */ }
+    }, tickMs);
+  }
+  // RDP: same rationale -- the Guacamole display only repaints on
+  // protocol updates, so a static guest desktop would produce a
+  // stale captureStream. Drive the capture canvas at the recording
+  // frame rate too.
+  if (session.kind === "rdp" && session.rdp && session.rdp.paintCapture) {
+    const tickMs = Math.max(50, Math.floor(1000 / Math.max(1, fps)));
+    state.refreshTickHandle = setInterval(() => {
+      try { session.rdp.paintCapture(); } catch (_e) { /* ignore */ }
     }, tickMs);
   }
 
