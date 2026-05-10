@@ -104,7 +104,9 @@ const CLIENT_LOG_EVENT_TYPES = new Set([
   "settings.saved",
   "chat.send",
   "console.ssh.open",
-  "console.ssh.close"
+  "console.ssh.close",
+  "console.rdp.open",
+  "console.rdp.close"
 ]);
 
 // =====================================================================
@@ -139,6 +141,45 @@ const SSH_MAX_SESSIONS = Math.max(1, Number(process.env.NRCC_SSH_MAX_SESSIONS ||
 const SSH_READY_TIMEOUT_MS = Math.max(5_000, Number(process.env.NRCC_SSH_READY_TIMEOUT_MS || 15_000));
 
 // =====================================================================
+// RDP browser console (beta feature: rdpConsole)
+// =====================================================================
+//
+// POST /api/rdp/start authorises a session (validates host against the
+// probe cache, same SSRF guard as SSH) and stores credentials in
+// memory. The WS upgrade at /ws-rdp/<id> opens a TCP connection to a
+// locally-installed `guacd` (the Apache Guacamole proxy daemon),
+// performs the Guacamole protocol handshake using the stored creds,
+// and then pipes raw Guacamole protocol bytes between the daemon and
+// the browser's guacamole-common-js client. Browser → server bytes
+// carry mouse / keyboard / clipboard / size; server → browser bytes
+// carry rendering instructions. The browser composites those into a
+// canvas, which the existing screenshot + recording pipelines then
+// read from.
+//
+// guacd is NOT bundled. Operators install it natively via their OS
+// package manager (apt install guacd / dnf install guacd /
+// brew install guacamole-server). The README documents this as part
+// of the beta opt-in. We deliberately do NOT add a docker dependency.
+const RDP_ENABLED = String(process.env.NRCC_RDP_ENABLED || "true").toLowerCase() !== "false";
+const RDP_IDLE_TIMEOUT_MS = Math.max(60_000, Number(process.env.NRCC_RDP_IDLE_TIMEOUT_MS || 15 * 60 * 1000));
+const RDP_MAX_SESSIONS = Math.max(1, Number(process.env.NRCC_RDP_MAX_SESSIONS || 64));
+const GUACD_HOST = String(process.env.NRCC_GUACD_HOST || "127.0.0.1").trim();
+const GUACD_PORT = Math.max(1, Math.min(65535, Number(process.env.NRCC_GUACD_PORT || 4822)));
+const GUACD_CONNECT_TIMEOUT_MS = Math.max(2_000, Number(process.env.NRCC_GUACD_CONNECT_TIMEOUT_MS || 15_000));
+// Default display dimensions for the RDP canvas. The client overrides
+// these in /api/rdp/start with the actual screen pane size, but we
+// keep sane defaults for any client that forgets to send them.
+const RDP_DEFAULT_WIDTH = Math.max(640, Math.min(4096, Number(process.env.NRCC_RDP_WIDTH || 1280)));
+const RDP_DEFAULT_HEIGHT = Math.max(480, Math.min(4096, Number(process.env.NRCC_RDP_HEIGHT || 800)));
+const RDP_DEFAULT_DPI = Math.max(72, Math.min(192, Number(process.env.NRCC_RDP_DPI || 96)));
+// "any" lets guacd negotiate. Override with rdp / nla / tls / vmconnect
+// for hosts that mis-advertise.
+const RDP_SECURITY = String(process.env.NRCC_RDP_SECURITY || "any").trim().toLowerCase();
+// Lab default: skip server certificate verification. Operators with a
+// PKI in place should set NRCC_RDP_IGNORE_CERT=false.
+const RDP_IGNORE_CERT = String(process.env.NRCC_RDP_IGNORE_CERT || "true").toLowerCase() !== "false";
+
+// =====================================================================
 // Feature-flag registry
 // =====================================================================
 //
@@ -156,9 +197,11 @@ const FEATURE_FLAGS = {
   settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" },
   // Beta features. UI is hidden via [data-feature="<id>"] gating until
   // the user toggles "Show beta features" in Settings AND the server
-  // has them enabled (NRCC_PROBE_ENABLED / NRCC_SSH_ENABLED).
+  // has them enabled (NRCC_PROBE_ENABLED / NRCC_SSH_ENABLED /
+  // NRCC_RDP_ENABLED).
   vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
-  sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" }
+  sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" },
+  rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" }
 };
 
 // Strict UUID match used everywhere we accept a VM UUID from the client.
@@ -463,6 +506,14 @@ app.use(
   "/vendor/xterm-addon-webgl",
   express.static(path.join(__dirname, "node_modules", "@xterm", "addon-webgl"))
 );
+// guacamole-common-js for the RDP console (beta: rdpConsole). Same
+// lazy approach as xterm: served from node_modules so we don't carry
+// a duplicate copy in the repo, and only fetched by the browser when
+// the user actually opens an RDP tab.
+app.use(
+  "/vendor/guacamole-common-js",
+  express.static(path.join(__dirname, "node_modules", "guacamole-common-js"))
+);
 app.use("/api", ensureSession);
 
 app.get("/api/health", (req, res) => {
@@ -490,7 +541,16 @@ app.get("/api/config", (req, res) => {
     loggingAvailable: LOGGING_ENABLED,
     featureFlags: FEATURE_FLAGS,
     appVersion: APP_VERSION,
-    updateAvailable: UPDATE_ENABLED
+    updateAvailable: UPDATE_ENABLED,
+    // RDP-specific bits the client needs at startup. Default
+    // dimensions are advisory — the browser sizes the canvas to its
+    // actual screen pane and overrides them in /api/rdp/start.
+    rdp: {
+      enabled: RDP_ENABLED,
+      defaultWidth: RDP_DEFAULT_WIDTH,
+      defaultHeight: RDP_DEFAULT_HEIGHT,
+      defaultDpi: RDP_DEFAULT_DPI
+    }
   });
 });
 
@@ -1187,6 +1247,82 @@ app.post("/api/ssh/start", (req, res) => {
     expiresAt: now + SSH_IDLE_TIMEOUT_MS
   });
   res.json({ sessionId, websocketUrl: `/ws-ssh/${sessionId}` });
+});
+
+// =====================================================================
+// RDP browser console (POST /api/rdp/start, WS /ws-rdp/<sessionId>)
+// =====================================================================
+//
+// Mirrors the SSH endpoints: HTTP call validates credentials + host
+// and parks them in `rdpSessions`; the WS upgrade consumes the entry
+// (single-use), opens TCP to guacd, performs the Guacamole handshake
+// using the stored creds, and pipes raw protocol bytes both
+// directions.
+const rdpSessions = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, sess] of rdpSessions.entries()) {
+    if (sess.expiresAt < now) rdpSessions.delete(id);
+  }
+}, 60_000).unref();
+
+app.post("/api/rdp/start", (req, res) => {
+  if (!RDP_ENABLED) {
+    return res.status(503).json({ error: "RDP consoles are disabled (NRCC_RDP_ENABLED=false)." });
+  }
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  if (rdpSessions.size >= RDP_MAX_SESSIONS) {
+    return res.status(429).json({ error: `Maximum RDP session count reached (${RDP_MAX_SESSIONS}). Close some tabs and retry.` });
+  }
+  const body = req.body || {};
+  const vmUuid = String(body.vmUuid || "").toLowerCase();
+  const host = String(body.host || "").trim();
+  const port = Number(body.port || 3389);
+  const username = String(body.username || "").trim();
+  const password = typeof body.password === "string" ? body.password : "";
+  const domain = typeof body.domain === "string" ? body.domain.trim() : "";
+  // Display dimensions are advisory bounds; the browser reports its
+  // actual canvas size so guacd produces correctly-sized framebuffers
+  // from the very first frame.
+  const width = Math.max(640, Math.min(4096, Number(body.width || RDP_DEFAULT_WIDTH)));
+  const height = Math.max(480, Math.min(4096, Number(body.height || RDP_DEFAULT_HEIGHT)));
+  const dpi = Math.max(72, Math.min(192, Number(body.dpi || RDP_DEFAULT_DPI)));
+  const security = (typeof body.security === "string" && body.security.trim())
+    ? body.security.trim().toLowerCase()
+    : RDP_SECURITY;
+  const ignoreCert = (typeof body.ignoreCert === "boolean") ? body.ignoreCert : RDP_IGNORE_CERT;
+
+  if (!VM_UUID_REGEX.test(vmUuid)) return res.status(400).json({ error: "Invalid vmUuid." });
+  if (!IPV4_REGEX.test(host) || !isProbeAllowedIp(host)) return res.status(400).json({ error: "Invalid or non-private host." });
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return res.status(400).json({ error: "Invalid port." });
+  if (!username) return res.status(400).json({ error: "Username is required." });
+  if (!password) return res.status(400).json({ error: "Password is required." });
+  if (!probeKnowsIpForVm(vmUuid, host)) {
+    return res.status(400).json({ error: `Host ${host} is not a known address for this VM. Run a port scan first.` });
+  }
+
+  const sessionId = crypto.randomBytes(16).toString("hex");
+  const now = Date.now();
+  rdpSessions.set(sessionId, {
+    vmUuid,
+    host,
+    port,
+    username,
+    password,
+    domain,
+    width,
+    height,
+    dpi,
+    security,
+    ignoreCert,
+    owner: req.nrccSession.currentUser,
+    sessionCookie: req.nrccSid || null,
+    createdAt: now,
+    expiresAt: now + RDP_IDLE_TIMEOUT_MS
+  });
+  res.json({ sessionId, websocketUrl: `/ws-rdp/${sessionId}` });
 });
 
 // =====================================================================
@@ -4511,6 +4647,12 @@ const wsChatServer = MULTI_USER_MODE ? new WebSocketServer({ noServer: true }) :
 // because the SSH feature is per-user, not multi-user; a single-user
 // install can still SSH into VMs from the browser.
 const wsSshServer = new WebSocketServer({ noServer: true });
+// RDP console WebSocketServer (beta: rdpConsole). Bridges the
+// browser's guacamole-common-js client to a locally-installed guacd
+// daemon. Always created so a feature-flag flip at runtime doesn't
+// require a process restart; the upgrade handler short-circuits when
+// the env var is off.
+const wsRdpServer = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   // The upgrade handler runs before Express middleware, so build a URL
@@ -4536,6 +4678,14 @@ server.on("upgrade", (req, socket, head) => {
     if (!SSH_ENABLED) { socket.destroy(); return; }
     wsSshServer.handleUpgrade(req, socket, head, (ws) => {
       wsSshServer.emit("connection", ws, req, requestUrl);
+    });
+    return;
+  }
+
+  if (requestUrl.pathname.startsWith("/ws-rdp/")) {
+    if (!RDP_ENABLED) { socket.destroy(); return; }
+    wsRdpServer.handleUpgrade(req, socket, head, (ws) => {
+      wsRdpServer.emit("connection", ws, req, requestUrl);
     });
     return;
   }
@@ -4815,6 +4965,302 @@ wsSshServer.on("connection", (ws, req, requestUrl) => {
     closeAll(1011, "connect-error");
     logSshClose(`connect-error:${err.message}`);
   }
+});
+
+// =====================================================================
+// RDP console WebSocket -> guacd bridge. Consumes a session id created
+// by /api/rdp/start, opens TCP to the locally-installed guacd, runs
+// the Guacamole protocol handshake using the cached host /
+// credentials, and then pipes raw protocol bytes both directions.
+// guacamole-common-js in the browser does the rendering.
+//
+// Guacamole protocol primer:
+//   <len>.<value>(,<len>.<value>)*; -- length is in UTF-16 code
+//   units, the same number JS gives you for `string.length`.
+// =====================================================================
+
+// Build a wire instruction from arbitrary string elements. Numbers
+// are coerced to strings; the length prefix counts UTF-16 code units
+// to match the protocol spec.
+function encodeGuacInstruction(...elements) {
+  return elements.map((e) => {
+    const s = String(e == null ? "" : e);
+    return `${s.length}.${s}`;
+  }).join(",") + ";";
+}
+
+// Best-effort parser. Returns { args, endIdx } when a complete
+// instruction is available starting at `startIdx`; null when more
+// data is required; throws on a malformed prefix so the caller can
+// abort the handshake instead of looping forever.
+function parseGuacInstruction(text, startIdx) {
+  const args = [];
+  let i = startIdx;
+  while (i < text.length) {
+    const dotIdx = text.indexOf(".", i);
+    if (dotIdx < 0) return null;
+    const lenStr = text.slice(i, dotIdx);
+    if (!/^\d+$/.test(lenStr)) {
+      throw new Error(`malformed guacd length at ${i}: ${JSON.stringify(lenStr)}`);
+    }
+    const len = parseInt(lenStr, 10);
+    const valStart = dotIdx + 1;
+    const valEnd = valStart + len;
+    if (valEnd >= text.length) return null;
+    args.push(text.slice(valStart, valEnd));
+    const sep = text[valEnd];
+    if (sep === ",") {
+      i = valEnd + 1;
+    } else if (sep === ";") {
+      return { args, endIdx: valEnd + 1 };
+    } else {
+      throw new Error(`malformed guacd separator at ${valEnd}: ${JSON.stringify(sep)}`);
+    }
+  }
+  return null;
+}
+
+// Map of arg-name -> resolved value for the RDP protocol. Anything
+// guacd asks for that we don't know is sent as an empty string,
+// which guacd treats as "use the protocol default". This is the
+// same "fill what we have, blank the rest" pattern used by the
+// reference Java tunnel.
+function buildRdpConnectValues(sess) {
+  return {
+    hostname: sess.host,
+    port: String(sess.port),
+    username: sess.username,
+    password: sess.password,
+    domain: sess.domain || "",
+    width: String(sess.width),
+    height: String(sess.height),
+    "dpi": String(sess.dpi),
+    security: sess.security || "any",
+    "ignore-cert": sess.ignoreCert ? "true" : "false",
+    "disable-auth": "false",
+    "console": "false",
+    // Sensible defaults for a browser-rendered session. Audio /
+    // printing / drives are off because we don't proxy any of those
+    // upstream.
+    "color-depth": "32",
+    "resize-method": "display-update",
+    "enable-wallpaper": "true",
+    "enable-theming": "true",
+    "enable-font-smoothing": "true",
+    "enable-full-window-drag": "false",
+    "enable-desktop-composition": "false",
+    "enable-menu-animations": "false",
+    "disable-bitmap-caching": "false",
+    "disable-offscreen-caching": "false",
+    "disable-glyph-caching": "false",
+    "client-name": "NRCC"
+  };
+}
+
+wsRdpServer.on("connection", (ws, req, requestUrl) => {
+  const sessionId = requestUrl.pathname.replace("/ws-rdp/", "");
+  const sess = rdpSessions.get(sessionId);
+  if (!sess) {
+    try { ws.close(1011, "Session not found"); } catch (_e) { /* ignore */ }
+    return;
+  }
+  rdpSessions.delete(sessionId);
+
+  if (!probeKnowsIpForVm(sess.vmUuid, sess.host)) {
+    try { ws.close(1011, "Probe cache expired; re-scan and retry"); } catch (_e) { /* ignore */ }
+    return;
+  }
+
+  const connectedAtMs = Date.now();
+  let consoleCloseLogged = false;
+  const logRdpClose = (reason) => {
+    if (consoleCloseLogged) return;
+    consoleCloseLogged = true;
+    appendLog({
+      type: "rdp.close",
+      vmUuid: sess.vmUuid,
+      username: sess.owner,
+      sessionId: sess.sessionCookie,
+      details: {
+        host: sess.host,
+        port: sess.port,
+        rdpUser: sess.username,
+        durationMs: Date.now() - connectedAtMs,
+        reason: reason || "closed"
+      }
+    });
+  };
+
+  const tcp = net.connect({ host: GUACD_HOST, port: GUACD_PORT });
+  tcp.setNoDelay(true);
+
+  let handshakeDone = false;
+  let argNames = null;
+  // Decoded text buffer used during the handshake. We switch to raw
+  // byte passthrough once we've consumed the args reply; anything
+  // straggling in the buffer at that point is forwarded to the WS.
+  const { StringDecoder } = require("string_decoder");
+  const decoder = new StringDecoder("utf8");
+  let textBuf = "";
+  // Once handshake finishes we're a byte pump; the WS may have
+  // received the open event and queued instructions before the TCP
+  // ready, so we flush a small queue.
+  const wsQueue = [];
+
+  const closeAll = (code, reason) => {
+    try { tcp.destroy(); } catch (_e) { /* ignore */ }
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.close(code || 1000, reason || "closed"); } catch (_e) { /* ignore */ }
+    }
+  };
+
+  const safeSendWs = (chunk) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(chunk, { binary: false }); } catch (_e) { /* ignore */ }
+  };
+
+  // Handshake timeout: if guacd never replies with `args`, abort so
+  // the user gets a clear error instead of a hung tab.
+  const handshakeTimer = setTimeout(() => {
+    if (!handshakeDone) {
+      try { ws.send(encodeGuacInstruction("error", "guacd handshake timeout", "519")); } catch (_e) { /* ignore */ }
+      closeAll(1011, "handshake-timeout");
+      logRdpClose("handshake-timeout");
+    }
+  }, GUACD_CONNECT_TIMEOUT_MS);
+
+  tcp.on("connect", () => {
+    appendLog({
+      type: "rdp.open",
+      vmUuid: sess.vmUuid,
+      username: sess.owner,
+      sessionId: sess.sessionCookie,
+      details: { host: sess.host, port: sess.port, rdpUser: sess.username }
+    });
+    try {
+      tcp.write(encodeGuacInstruction("select", "rdp"));
+    } catch (err) {
+      closeAll(1011, "select-write-failed");
+      logRdpClose(`select-write-failed:${err.message}`);
+    }
+  });
+
+  tcp.on("data", (chunk) => {
+    if (handshakeDone) {
+      // Plain text pump after the handshake. We funnel through the
+      // same StringDecoder so a UTF-8 codepoint split across two
+      // TCP chunks doesn't surface as a replacement character on
+      // the wire. guacamole-common-js's WebSocketTunnel reads text
+      // frames directly as instruction strings.
+      const text = decoder.write(chunk);
+      if (text) safeSendWs(text);
+      return;
+    }
+    textBuf += decoder.write(chunk);
+    try {
+      while (true) {
+        const inst = parseGuacInstruction(textBuf, 0);
+        if (!inst) break;
+        const op = inst.args[0];
+        textBuf = textBuf.slice(inst.endIdx);
+        if (op === "args") {
+          // First entry after `args` is the protocol VERSION; the
+          // rest are parameter names. We acknowledge the same
+          // version (echoes it back via the size handshake replies).
+          argNames = inst.args.slice(2); // drop "args" + VERSION
+          const values = buildRdpConnectValues(sess);
+          // Fill the connect instruction with values matching the
+          // arg-name order guacd dictated. Unknown names get an
+          // empty string, which guacd treats as "use default".
+          const connectArgs = ["connect"];
+          for (const name of argNames) {
+            connectArgs.push(values[name] !== undefined ? values[name] : "");
+          }
+          try {
+            // Order matters here: size/audio/video/image/timezone
+            // describe our display capabilities, then connect kicks
+            // off the protocol session.
+            tcp.write(encodeGuacInstruction("size", sess.width, sess.height, sess.dpi));
+            tcp.write(encodeGuacInstruction("audio")); // no audio playback
+            tcp.write(encodeGuacInstruction("video")); // no video decode
+            tcp.write(encodeGuacInstruction("image", "image/png", "image/jpeg", "image/webp"));
+            tcp.write(encodeGuacInstruction("timezone", "UTC"));
+            tcp.write(encodeGuacInstruction(...connectArgs));
+          } catch (err) {
+            closeAll(1011, "handshake-write-failed");
+            logRdpClose(`handshake-write-failed:${err.message}`);
+            return;
+          }
+          handshakeDone = true;
+          clearTimeout(handshakeTimer);
+          // Flush anything the browser sent before we were ready.
+          for (const queued of wsQueue) {
+            try { tcp.write(queued); } catch (_e) { /* ignore */ }
+          }
+          wsQueue.length = 0;
+          // And forward whatever guacd has already sent past the args.
+          if (textBuf.length) {
+            safeSendWs(textBuf);
+            textBuf = "";
+          }
+          return;
+        }
+        // guacd may emit `error` during handshake (bad protocol,
+        // unknown args). Forward to the client so it can show a
+        // real message, then close.
+        if (op === "error") {
+          safeSendWs(encodeGuacInstruction(...inst.args));
+          closeAll(1011, "guacd-error");
+          logRdpClose(`guacd-error:${inst.args[1] || ""}`);
+          return;
+        }
+        // Anything else pre-handshake is unexpected but not fatal;
+        // drop it so we don't loop on a misframed buffer.
+      }
+    } catch (err) {
+      try { ws.send(encodeGuacInstruction("error", `guacd protocol error: ${err.message}`, "519")); } catch (_e) { /* ignore */ }
+      closeAll(1011, "guacd-parse-error");
+      logRdpClose(`guacd-parse-error:${err.message}`);
+    }
+  });
+
+  tcp.on("error", (err) => {
+    try {
+      // 519 == UPSTREAM_NOT_FOUND in Guacamole's status code map.
+      // Most common cause is "guacd is not installed/running".
+      ws.send(encodeGuacInstruction("error", `guacd unreachable at ${GUACD_HOST}:${GUACD_PORT} (${err.code || err.message})`, "519"));
+    } catch (_e) { /* ignore */ }
+    closeAll(1011, "guacd-tcp-error");
+    logRdpClose(`guacd-tcp-error:${err.message}`);
+  });
+  tcp.on("close", () => {
+    closeAll(1000, "guacd-closed");
+    logRdpClose("guacd-closed");
+  });
+
+  ws.on("message", (data, isBinary) => {
+    // guacamole-common-js sends text frames containing protocol
+    // instructions; we forward them straight to guacd. Binary
+    // frames aren't part of the protocol but we accept them anyway
+    // for robustness.
+    const buf = isBinary ? data : Buffer.from(data.toString("utf8"), "utf8");
+    if (!handshakeDone) {
+      // Buffer until guacd is ready -- guacamole-common-js sometimes
+      // sends a `size` resize before our `connect` arrives.
+      wsQueue.push(buf);
+      return;
+    }
+    try { tcp.write(buf); } catch (_e) { /* ignore */ }
+  });
+
+  ws.on("close", () => {
+    closeAll(1000, "ws-closed");
+    logRdpClose("ws-closed");
+  });
+  ws.on("error", () => {
+    closeAll(1011, "ws-error");
+    logRdpClose("ws-error");
+  });
 });
 
 // =====================================================================
