@@ -6,6 +6,26 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 
 ---
 
+## Install in one line
+
+No clone, no build, no `sudo`. The installer auto-detects Docker (preferred — RDP works out of the box) or falls back to a self-contained Node.js install under your home directory. When it finishes, your browser is already open at the NRCC login screen.
+
+**Linux & macOS**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.sh | bash
+```
+
+**Windows (PowerShell)**
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.ps1 | iex
+```
+
+That's it. Full details — uninstall, autostart-at-login, environment overrides, the source-build path — are in the [Quickstart](#quickstart) section below.
+
+---
+
 ## Highlights
 
 - **Prism-Central-style sign-in.** Centered login card asks for the three things you actually need — Prism Central IP, username, password — and nothing else. After login, the page is clean: just the VM list, your consoles, and a logout button in the top right.
@@ -144,25 +164,22 @@ Vanilla JS + noVNC, no build step:
 
 ## Quickstart
 
-The fastest way to get NRCC running on a fresh machine is one copy/pasteable line. The script auto-detects whether **Docker** is installed (preferred — RDP works out of the box because it brings up `guacd` as a sidecar) and otherwise falls back to a **Node.js source install** under your home directory. In both cases it ends with:
+A one-liner is enough to install, start, and open NRCC on Linux, macOS, or Windows. The script:
 
-- a `nrcc` command on your PATH (subcommands: `start`, `stop`, `status`, `logs`, `open`, `upgrade`, `enable-service`, `uninstall`),
-- a desktop / Start Menu icon that starts NRCC and opens the browser,
-- the browser opened to <https://localhost:8443>.
+- detects **Docker** and uses it when available (RDP works out of the box because the `guacd` sidecar comes along), otherwise falls back to a self-contained **Node.js** install under your home directory,
+- drops a `nrcc` command on your PATH with `start | stop | restart | status | logs | open | upgrade | enable-service | disable-service | uninstall` subcommands,
+- creates a desktop icon (Linux `.desktop` entry, macOS `.command` launcher, Windows Desktop + Start Menu shortcuts with a proper multi-resolution `.ico`),
+- starts the server and opens your browser at `https://localhost:8443`.
 
-> The TLS cert is self-signed; click through the browser warning once. Nothing is installed system-wide and no `sudo` / Administrator prompt is required for the default install.
+No `sudo` / Administrator prompt is required, nothing is installed system-wide, and re-running the script is safe — it upgrades in place.
 
-### Linux
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.sh | bash
-```
-
-### macOS
+### Linux & macOS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.sh | bash
 ```
+
+`wget`-only host? Equivalent: `wget -qO- <url> | bash`.
 
 ### Windows (PowerShell)
 
@@ -170,11 +187,18 @@ curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/mai
 iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.ps1 | iex
 ```
 
-> On older Windows hosts (Windows 7 / 8.1 / Server 2012 R2, or any box that's never had WMF 5.1 / .NET strong-crypto enabled) `iwr` fails with `Could not create SSL/TLS secure channel` because the .NET default is TLS 1.0. Prepend a one-liner to switch the session to TLS 1.2 first:
->
-> ```powershell
-> [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.ps1 | iex
-> ```
+<details>
+<summary><b>Older Windows hosts (Win 7 / 8.1 / Server 2012 R2)</b></summary>
+
+If `iwr` fails with `Could not create SSL/TLS secure channel`, your shell defaults to TLS 1.0, which GitHub no longer accepts. Switch the session to TLS 1.2 first:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.ps1 | iex
+```
+
+The installer itself already handles the rest of the legacy-Windows quirks (uses `[ZipFile]::ExtractToDirectory` when PowerShell 5.0's `Expand-Archive` isn't available, kills lingering `node.exe` handles before re-running, falls back to portable Node when `winget` isn't around).
+
+</details>
 
 ### After install
 
@@ -182,12 +206,14 @@ iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main
 nrcc                    # start (if needed) and open the browser
 nrcc status             # is it running?
 nrcc logs               # tail server logs
-nrcc upgrade            # pull a newer build
-nrcc enable-service     # opt-in: register autostart at login
+nrcc upgrade            # pull a newer build (docker compose pull, or git pull + npm ci)
+nrcc enable-service     # opt-in: register autostart at login (systemd / launchd / Scheduled Task)
 nrcc uninstall          # stop everything and remove the install
 ```
 
 ### Override the defaults (optional)
+
+Set these before running the one-liner (`VAR=value curl ... | bash`, or `$env:VAR='value'` then `iwr ...`).
 
 | Variable                | Default                                                               | Purpose                                  |
 | ----------------------- | --------------------------------------------------------------------- | ---------------------------------------- |
@@ -198,11 +224,29 @@ nrcc uninstall          # stop everything and remove the install
 | `NRCC_PORT`             | `8443`                                                                | Host port to publish                     |
 | `NRCC_NO_OPEN`          | _unset_                                                               | Set to `1` to skip launching the browser |
 
-To uninstall later, run `nrcc uninstall` (or re-fetch and pipe the matching `uninstall.sh` / `uninstall.ps1`).
+### Tested platforms
+
+- Linux (recent Debian/Ubuntu and RHEL-family hosts, both Docker and source modes)
+- macOS (Docker Desktop and Homebrew Node)
+- Windows with PowerShell 5+ (Docker Desktop and `winget` Node)
+- **Older Windows** — Server 2012 R2 / Windows 8.1 with PowerShell 4.0 (uses the portable Node fallback and the legacy ZIP extractor)
+
+### To remove
+
+```bash
+nrcc uninstall
+```
+
+…or, if you've already lost the launcher, re-fetch and pipe the companion script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/uninstall.sh | bash      # POSIX
+iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/uninstall.ps1 | iex      # Windows
+```
 
 > **RDP / SSH note:** The Docker install ships a `guacd` sidecar so RDP and SSH consoles work immediately. The source install does **not** install `guacd`; follow the per-OS instructions in [Beta: VM port scan + SSH / RDP consoles](#beta-vm-port-scan--ssh--rdp-consoles) below.
 
-For the manual / developer flow (clone the repo, `npm install`, run from source), keep reading.
+For the manual / developer flow (clone the repo, `npm install`, run from source) — for example, when you're hacking on NRCC itself — keep reading.
 
 ---
 
