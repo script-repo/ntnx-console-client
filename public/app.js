@@ -169,7 +169,12 @@ const rdpCredsUsernameInput = document.getElementById("rdpCredsUsername");
 const rdpCredsDomainInput = document.getElementById("rdpCredsDomain");
 const rdpCredsPasswordInput = document.getElementById("rdpCredsPassword");
 const rdpCredsSecuritySelect = document.getElementById("rdpCredsSecurity");
-const rdpCredsIgnoreCertInput = document.getElementById("rdpCredsIgnoreCert");
+// rdpCredsIgnoreCert is no longer surfaced in the UI -- the typical
+// lab use case (self-signed RDP certs on AHV-hosted Windows VMs)
+// always wants this on, and the dialog was getting cluttered.
+// We keep the same wire-format key so the server-side handling
+// doesn't need to change.
+const RDP_IGNORE_CERT_DEFAULT = true;
 const rdpCredsRememberInput = document.getElementById("rdpCredsRemember");
 const rdpCredsErrorEl = document.getElementById("rdpCredsError");
 const rdpCredsCancelBtn = document.getElementById("rdpCredsCancel");
@@ -4387,7 +4392,7 @@ function promptForRdpCreds(vmUuid, host, port, prefill) {
     rdpCredsDomainInput.value = seed.domain || "";
     rdpCredsPasswordInput.value = "";
     rdpCredsSecuritySelect.value = seed.security || "any";
-    rdpCredsIgnoreCertInput.checked = (typeof seed.ignoreCert === "boolean") ? seed.ignoreCert : true;
+    // (legacy seed.ignoreCert ignored -- always RDP_IGNORE_CERT_DEFAULT)
     rdpCredsRememberInput.checked = !!seed.remember;
     rdpCredsErrorEl.style.display = "none";
     rdpCredsErrorEl.textContent = "";
@@ -4420,7 +4425,7 @@ function promptForRdpCreds(vmUuid, host, port, prefill) {
         password,
         domain: rdpCredsDomainInput.value.trim(),
         security: rdpCredsSecuritySelect.value || "any",
-        ignoreCert: rdpCredsIgnoreCertInput.checked,
+        ignoreCert: RDP_IGNORE_CERT_DEFAULT,
         remember: rdpCredsRememberInput.checked
       };
       cleanup();
@@ -7196,6 +7201,49 @@ if (consoleGridOverlay) {
   _showAllActiveObserver.observe(consoleGridOverlay, {
     attributes: true,
     attributeFilter: ["class"]
+  });
+}
+
+// =====================================================================
+// Sidebar collapse toggle.
+// =====================================================================
+//
+// Hides the VM-list sidebar so the console area can use the full
+// width of the page. The preference is persisted to localStorage
+// so it survives a reload, and the icon flips between << / >>
+// depending on which direction the click would move the chevron.
+
+const SIDEBAR_COLLAPSED_KEY = "nrcc.sidebar.collapsed";
+const layoutRoot = document.getElementById("layoutRoot");
+const sidebarToggleBtn = document.getElementById("sidebarToggleBtn");
+const sidebarToggleIcon = document.getElementById("sidebarToggleIcon");
+
+function applySidebarCollapsed(collapsed) {
+  if (!layoutRoot || !sidebarToggleBtn) return;
+  layoutRoot.classList.toggle("sidebar-collapsed", collapsed);
+  sidebarToggleBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  sidebarToggleBtn.title = collapsed ? "Show the VM list" : "Hide the VM list";
+  if (sidebarToggleIcon) {
+    sidebarToggleIcon.innerHTML = collapsed ? "&raquo;" : "&laquo;";
+  }
+}
+
+function loadSidebarCollapsed() {
+  try {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch (_e) {
+    return false;
+  }
+}
+
+if (sidebarToggleBtn) {
+  applySidebarCollapsed(loadSidebarCollapsed());
+  sidebarToggleBtn.addEventListener("click", () => {
+    const next = !layoutRoot.classList.contains("sidebar-collapsed");
+    applySidebarCollapsed(next);
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? "1" : "0");
+    } catch (_e) { /* private mode -- ignore */ }
   });
 }
 

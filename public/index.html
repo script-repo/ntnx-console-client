@@ -239,14 +239,67 @@
       .layout {
         display: flex;
         gap: 14px;
+        position: relative;
       }
       .sidebar {
         width: 380px;
         flex-shrink: 0;
+        transition: width 180ms ease, opacity 120ms ease;
       }
       .main {
         flex: 1;
         min-width: 0;
+      }
+      /* Collapsed sidebar: width zero, hide its panel content,
+         drop the gap. The toggle button stays visible (it lives
+         outside the .sidebar) so the user can expand again. */
+      .layout.sidebar-collapsed { gap: 0; }
+      .layout.sidebar-collapsed .sidebar {
+        width: 0;
+        opacity: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      /* Floating handle that flips between "<<" (collapse) when the
+         sidebar is open and ">>" (expand) when it's hidden. Lives
+         on the boundary between the sidebar and the main column.
+         Pinned to the column rail so it stays put while the user
+         scrolls the VM list. */
+      .sidebar-toggle {
+        flex: 0 0 22px;
+        width: 22px;
+        align-self: stretch;
+        margin: 0;
+        padding: 0;
+        background: var(--ntx-surface);
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        color: var(--ntx-text-subtle);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1;
+        box-shadow: var(--ntx-shadow-sm);
+        transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+      }
+      .sidebar-toggle:hover {
+        background: var(--ntx-accent-soft);
+        color: var(--ntx-accent);
+        border-color: var(--ntx-accent);
+      }
+      .sidebar-toggle:focus-visible {
+        outline: 2px solid var(--ntx-accent);
+        outline-offset: 2px;
+      }
+      /* Subtle reminder that the chevron is interactive even when
+         everything else on the page is dim (auto-logout warning,
+         etc). */
+      .sidebar-toggle-icon {
+        display: inline-block;
+        transform: translateY(-1px);
       }
       .section-title {
         margin: 0 0 8px 0;
@@ -1207,6 +1260,26 @@
         font-weight: 600;
         color: var(--ntx-text);
         font-size: 12px;
+      }
+      /* Inline checkbox row used inside modals.
+         Default <label> in .modal-body uses a vertical grid (label
+         text on top, control below) which looks wrong for a single
+         checkbox -- it pushes the box above the text and centers it.
+         This variant lays them out left-to-right: small box,
+         tightly-spaced label, both left-aligned. */
+      .modal-body label.modal-checkbox-row {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 8px;
+        font-weight: 500;
+      }
+      .modal-body label.modal-checkbox-row input[type="checkbox"] {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        flex: 0 0 14px;
+        cursor: pointer;
       }
       .modal-body input {
         width: 100%;
@@ -3025,7 +3098,7 @@
       <div class="login-card">
         <div class="login-brand">
           <div class="login-brand-text">
-            <span class="login-brand-title">Nutanix Remote Console</span>
+            <span class="login-brand-title">Nutanix Remote Console Client</span>
             <span class="login-brand-sub">NRCC</span>
           </div>
         </div>
@@ -3096,7 +3169,7 @@
         </div>
       </header>
       <div class="container">
-        <div class="layout">
+        <div id="layoutRoot" class="layout">
           <aside class="sidebar">
             <section class="panel">
               <div class="panel-body">
@@ -3117,6 +3190,18 @@
               </div>
             </section>
           </aside>
+
+          <button
+            id="sidebarToggleBtn"
+            type="button"
+            class="sidebar-toggle"
+            title="Hide / show the VM list"
+            aria-label="Hide or show the VM list"
+            aria-expanded="true"
+            aria-controls="layoutRoot"
+          >
+            <span id="sidebarToggleIcon" class="sidebar-toggle-icon">&laquo;</span>
+          </button>
 
           <main class="main">
             <section class="panel">
@@ -3368,13 +3453,13 @@
             Username
             <input id="sshCredsUsername" placeholder="root" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
           </label>
-          <label>
-            <input id="sshCredsUseKey" type="checkbox" />
-            Authenticate with a private key instead of a password
-          </label>
           <label id="sshCredsPasswordRow">
             Password
             <input id="sshCredsPassword" type="password" autocomplete="off" />
+          </label>
+          <label class="modal-checkbox-row">
+            <input id="sshCredsUseKey" type="checkbox" />
+            Authenticate with a private key instead of a password
           </label>
           <label id="sshCredsKeyRow" hidden>
             Private key (OpenSSH format, including the BEGIN/END lines)
@@ -3384,7 +3469,7 @@
             Key passphrase (optional)
             <input id="sshCredsPassphrase" type="password" autocomplete="off" />
           </label>
-          <label>
+          <label class="modal-checkbox-row">
             <input id="sshCredsRemember" type="checkbox" />
             Remember for this browser session
           </label>
@@ -3455,11 +3540,7 @@
               <option value="vmconnect">Hyper-V VMConnect</option>
             </select>
           </label>
-          <label>
-            <input id="rdpCredsIgnoreCert" type="checkbox" checked />
-            Ignore TLS certificate errors (typical for lab hosts)
-          </label>
-          <label>
+          <label class="modal-checkbox-row">
             <input id="rdpCredsRemember" type="checkbox" />
             Remember for this browser session
           </label>
