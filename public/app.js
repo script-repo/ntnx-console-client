@@ -96,12 +96,27 @@ const peCredsErrorEl = document.getElementById("peCredsError");
 const peCredsCancelBtn = document.getElementById("peCredsCancel");
 const peCredsSaveBtn = document.getElementById("peCredsSave");
 
+const settingsBtn = document.getElementById("settingsBtn");
+const settingsModal = document.getElementById("settingsModal");
+const settingsThemeInput = document.getElementById("settingsTheme");
+const settingsIdleTimeoutInput = document.getElementById("settingsIdleTimeout");
+const settingsLoggingEnabledInput = document.getElementById("settingsLoggingEnabled");
+const settingsLoggingHint = document.getElementById("settingsLoggingHint");
+const settingsLoggingDisabledHint = document.getElementById("settingsLoggingDisabledHint");
+const settingsBetaEnabledInput = document.getElementById("settingsBetaEnabled");
+const settingsCancelBtn = document.getElementById("settingsCancel");
+const settingsSaveBtn = document.getElementById("settingsSave");
+const settingsVersionLabel = document.getElementById("settingsVersionLabel");
+const settingsUpdateBtn = document.getElementById("settingsUpdateBtn");
+const settingsUpdateStatus = document.getElementById("settingsUpdateStatus");
+
 // =====================================================================
 // Storage keys
 // =====================================================================
 
 const profileStorageKey = "ntnxConsoleProfile";
 const favoritesStorageKey = "ntnxConsoleFavorites";
+const userPrefsStorageKey = "nrcc.userPrefs.v1";
 
 // =====================================================================
 // State
@@ -1040,6 +1055,10 @@ async function login(event) {
     // moment the user lands in the app shell.
     if (appConfig.multiUser) openChatSocket();
 
+    // Start the auto-poll that pins a "update available" dot on the
+    // gear icon when GitHub has a newer build.
+    startUpdateBadgePoll();
+
     // Clear the password field so it doesn't linger in the DOM.
     loginPasswordInput.value = "";
   } catch (error) {
@@ -1075,6 +1094,9 @@ function logout() {
   } catch (_e) { /* ignore */ }
   // Multi-user only: tear down the chat socket and forget chat state.
   if (typeof teardownChat === "function") teardownChat();
+  // Stop the update-availability poll and clear the gear-icon badge
+  // so the login screen doesn't show a stale dot.
+  stopUpdateBadgePoll();
   showLoginScreen();
   setStatus("Idle");
   setTimeout(() => loginPasswordInput.focus(), 100);
@@ -1202,6 +1224,7 @@ function sendCtrlAltDel() {
   rfb.sendKey(0xffe9, "AltLeft", false);
   rfb.sendKey(0xffe3, "ControlLeft", false);
   setStatus(`Sent Ctrl+Alt+Del to ${session.vmName}.`);
+  logEvent("console.ctrl-alt-del", session.vmUuid);
 }
 
 // Sentinel used so each in-flight paste cancels the previous one (clicking
@@ -1898,6 +1921,7 @@ async function pasteClipboardToConsole() {
   // bytes from bursty input. The cost is ~2ms per character — a
   // 200-char command is ~0.4s, well below the threshold of annoyance.
   await typeTextIntoSession(session, text, { perCharDelayMs: 2, perLineDelayMs: 25 });
+  logEvent("console.paste", session.vmUuid, { length: text.length });
 }
 
 function closeAllSessions() {
@@ -2526,7 +2550,11 @@ const appConfig = {
   screenshotMaxPerVm: 100,
   recording: { fps: 10, bitrate: 600_000, maxBytes: 524_288_000, maxPerVm: 50 },
   scripts: { maxBytes: 262_144 },
-  currentUser: null
+  currentUser: null,
+  loggingAvailable: false,
+  featureFlags: {},
+  appVersion: "",
+  updateAvailable: false
 };
 
 async function loadAppConfig() {
@@ -2544,13 +2572,544 @@ async function loadAppConfig() {
       appConfig.scripts = { ...appConfig.scripts, ...data.scripts };
     }
     appConfig.currentUser = data.currentUser || null;
+    appConfig.loggingAvailable = Boolean(data.loggingAvailable);
+    appConfig.featureFlags = (data.featureFlags && typeof data.featureFlags === "object")
+      ? data.featureFlags
+      : {};
+    appConfig.appVersion = typeof data.appVersion === "string" ? data.appVersion : "";
+    appConfig.updateAvailable = Boolean(data.updateAvailable);
     if (appConfig.multiUser) {
       chatRoot.hidden = false;
       document.body.classList.add("has-chat");
     }
+    // The settings UI shows a different hint depending on whether the
+    // server permits logging at all, and the feature-flag visibility
+    // pass picks up the brand-new flag registry. Both run safely even
+    // when the user is on the login screen.
+    refreshSettingsServerHints();
+    refreshSettingsVersionLabel();
+    refreshSettingsUpdateButton();
+    featureFlags.refresh();
   } catch (_e) {
     /* probe failures are non-fatal; the app behaves as single-user */
   }
+}
+
+// =====================================================================
+// User preferences (theme, idle timeout, logging, beta features)
+// =====================================================================
+//
+// All four settings are per-browser preferences persisted to
+// localStorage under userPrefsStorageKey. They are loaded once at boot
+// (so the theme is applied before the user even sees the login form)
+// and re-applied every time the user clicks Save in the settings
+// dialog. The server is not aware of these values; the only thing
+// it sees is the per-event `?clientLogging=1` query string the
+// log-event helper appends when the toggle is on.
+
+const userPrefs = {
+  theme: "light",
+  idleTimeoutMin: 15,
+  loggingEnabled: false,
+  betaFeaturesEnabled: false
+};
+
+function loadUserPrefs() {
+  try {
+    const raw = localStorage.getItem(userPrefsStorageKey);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.theme === "string") userPrefs.theme = parsed.theme;
+      if (Number.isFinite(parsed.idleTimeoutMin)) {
+        userPrefs.idleTimeoutMin = Math.max(0, Number(parsed.idleTimeoutMin));
+      }
+      if (typeof parsed.loggingEnabled === "boolean") {
+        userPrefs.loggingEnabled = parsed.loggingEnabled;
+      }
+      if (typeof parsed.betaFeaturesEnabled === "boolean") {
+        userPrefs.betaFeaturesEnabled = parsed.betaFeaturesEnabled;
+      }
+    }
+  } catch (_e) {
+    /* corrupted JSON shouldn't break the app */
+  }
+}
+
+function saveUserPrefs(patch) {
+  Object.assign(userPrefs, patch || {});
+  try {
+    localStorage.setItem(userPrefsStorageKey, JSON.stringify(userPrefs));
+  } catch (_e) {
+    /* localStorage may be disabled */
+  }
+  applyUserPrefs();
+}
+
+function resolvedTheme() {
+  if (userPrefs.theme === "dark" || userPrefs.theme === "light") {
+    return userPrefs.theme;
+  }
+  // "system" or anything we don't recognise: defer to OS preference.
+  try {
+    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
+  } catch (_e) { /* ignore */ }
+  return "light";
+}
+
+function applyUserPrefs() {
+  document.documentElement.setAttribute("data-theme", resolvedTheme());
+  installIdleTimer(userPrefs.idleTimeoutMin * 60 * 1000);
+  if (typeof featureFlags === "object") featureFlags.refresh();
+}
+
+// React to OS theme changes when the user has chosen "Match system".
+try {
+  const mq = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+  if (mq && typeof mq.addEventListener === "function") {
+    mq.addEventListener("change", () => {
+      if (userPrefs.theme === "system") {
+        document.documentElement.setAttribute("data-theme", resolvedTheme());
+      }
+    });
+  }
+} catch (_e) { /* matchMedia may not exist in very old browsers */ }
+
+// =====================================================================
+// Idle-logout timer
+// =====================================================================
+//
+// Reset on any UI activity (mouse/keyboard/touch/wheel) and on input
+// inside any console pane (RFB doesn't bubble its keystrokes to
+// document because they're consumed by the canvas). When the timer
+// expires we route through the existing logout(), which clears the
+// in-memory creds and closes every console tab.
+
+let idleTimerHandle = null;
+let idleTimerMs = 0;
+const idleTimerEvents = ["mousemove", "mousedown", "keydown", "touchstart", "wheel"];
+
+function resetIdleTimer() {
+  if (!idleTimerMs) return;
+  if (idleTimerHandle) clearTimeout(idleTimerHandle);
+  idleTimerHandle = setTimeout(() => {
+    if (!session.loggedIn) return;
+    setStatus("Logged out due to inactivity.");
+    logout();
+  }, idleTimerMs);
+}
+
+function installIdleTimer(ms) {
+  idleTimerMs = Math.max(0, Number(ms) || 0);
+  if (idleTimerHandle) {
+    clearTimeout(idleTimerHandle);
+    idleTimerHandle = null;
+  }
+  idleTimerEvents.forEach((evt) => {
+    window.removeEventListener(evt, resetIdleTimer, { capture: true });
+  });
+  if (!idleTimerMs) return;
+  idleTimerEvents.forEach((evt) => {
+    window.addEventListener(evt, resetIdleTimer, { capture: true, passive: true });
+  });
+  resetIdleTimer();
+}
+
+// =====================================================================
+// Feature flags (beta / GA gating)
+// =====================================================================
+//
+// The server publishes a `featureFlags` registry in /api/config with a
+// stage of "ga" or "beta" per known feature. Any DOM element marked
+// with data-feature="<id>" is hidden when the matching flag is "beta"
+// AND the user has not opted in to beta features. GA features are
+// always visible. Code paths that aren't tied to a specific element
+// can call featureFlags.isEnabled("<id>") directly.
+
+const featureFlags = {
+  isEnabled(id) {
+    const entry = appConfig.featureFlags && appConfig.featureFlags[id];
+    const stage = entry && typeof entry.stage === "string" ? entry.stage : "ga";
+    if (stage === "ga") return true;
+    return Boolean(userPrefs.betaFeaturesEnabled);
+  },
+  refresh() {
+    document.querySelectorAll("[data-feature]").forEach((el) => {
+      const id = el.getAttribute("data-feature");
+      if (!id) return;
+      const enabled = featureFlags.isEnabled(id);
+      el.hidden = !enabled;
+    });
+  }
+};
+
+// =====================================================================
+// Settings dialog
+// =====================================================================
+
+function refreshSettingsServerHints() {
+  // The "logging is server-disabled" message replaces the regular hint
+  // when NRCC_LOGGING isn't set on the server. We disable the toggle
+  // in that case so the user can't pretend it's on.
+  if (!settingsLoggingHint || !settingsLoggingDisabledHint || !settingsLoggingEnabledInput) return;
+  if (appConfig.loggingAvailable) {
+    settingsLoggingHint.hidden = false;
+    settingsLoggingHint.removeAttribute("data-disabled");
+    settingsLoggingDisabledHint.hidden = true;
+    settingsLoggingEnabledInput.disabled = false;
+  } else {
+    settingsLoggingHint.setAttribute("data-disabled", "true");
+    settingsLoggingDisabledHint.hidden = false;
+    settingsLoggingEnabledInput.disabled = true;
+  }
+}
+
+function refreshSettingsVersionLabel() {
+  if (!settingsVersionLabel) return;
+  const v = (appConfig.appVersion || "").trim();
+  settingsVersionLabel.textContent = v || "unknown";
+}
+
+// =====================================================================
+// In-app self-update (Settings -> Update button)
+// =====================================================================
+//
+// The button is hidden entirely if the operator disabled NRCC_UPDATE_*
+// on the server. Otherwise clicking it:
+//   1. POSTs /api/update/check, which reads build.info from the
+//      configured GitHub repo and compares it to APP_VERSION.
+//   2. If we're already current, shows a transient inline status.
+//   3. If a newer build exists, confirm() then POST /api/update/install.
+//      The server replies 202 immediately and exits as soon as the
+//      git pull / clone-swap + npm install finishes; the client
+//      polls /api/health until it comes back, then reloads the page.
+//
+// In addition to the manual click flow, an auto-poll runs in the
+// background after login (interval = UPDATE_BADGE_POLL_MS, default
+// 30 min) so a small dot appears on the gear icon as soon as a new
+// build lands on GitHub. The poll uses the server's cached check
+// result so we don't hammer raw.githubusercontent.com.
+
+let _updatePollHandle = null;
+let _updateBadgePollHandle = null;
+// Most recent /api/update/check result, populated by both manual
+// clicks and the background poll. Used to decorate the modal when
+// the user opens it (so the latest build / cache age are visible
+// immediately) and to drive the gear-icon badge.
+let _lastUpdateInfo = null;
+const UPDATE_BADGE_POLL_MS = 30 * 60 * 1000; // 30 minutes
+const UPDATE_BADGE_FIRST_DELAY_MS = 5_000;   // wait briefly after login before the first poll
+
+function setUpdateBadge(visible) {
+  if (!settingsBtn) return;
+  if (visible) {
+    settingsBtn.setAttribute("data-has-update", "true");
+    const latest = _lastUpdateInfo && _lastUpdateInfo.latest;
+    settingsBtn.setAttribute("aria-label", latest
+      ? `Open settings (update available: ${latest})`
+      : "Open settings (update available)");
+    settingsBtn.title = latest
+      ? `Settings - update available (${latest})`
+      : "Settings - update available";
+  } else {
+    settingsBtn.removeAttribute("data-has-update");
+    settingsBtn.setAttribute("aria-label", "Open settings");
+    settingsBtn.title = "Settings";
+  }
+}
+
+async function probeUpdateAvailability(opts) {
+  const force = opts && opts.force;
+  if (!appConfig.updateAvailable) return null;
+  try {
+    const url = "/api/update/check" + (force ? "?force=1" : "");
+    const resp = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (!resp.ok) return null;
+    const info = await resp.json().catch(() => null);
+    if (!info || typeof info !== "object") return null;
+    _lastUpdateInfo = info;
+    setUpdateBadge(Boolean(info.updateAvailable));
+    return info;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function startUpdateBadgePoll() {
+  if (!appConfig.updateAvailable) return;
+  if (_updateBadgePollHandle) return;
+  // First probe is delayed slightly so we don't pile a GitHub fetch
+  // on top of the login burst (config + VM list + chat WS).
+  setTimeout(() => { probeUpdateAvailability(); }, UPDATE_BADGE_FIRST_DELAY_MS);
+  _updateBadgePollHandle = setInterval(() => { probeUpdateAvailability(); }, UPDATE_BADGE_POLL_MS);
+}
+
+function stopUpdateBadgePoll() {
+  if (_updateBadgePollHandle) {
+    clearInterval(_updateBadgePollHandle);
+    _updateBadgePollHandle = null;
+  }
+  _lastUpdateInfo = null;
+  setUpdateBadge(false);
+}
+
+function setSettingsUpdateStatus(text, state) {
+  if (!settingsUpdateStatus) return;
+  if (!text) {
+    settingsUpdateStatus.hidden = true;
+    settingsUpdateStatus.textContent = "";
+    settingsUpdateStatus.removeAttribute("data-state");
+    return;
+  }
+  settingsUpdateStatus.hidden = false;
+  settingsUpdateStatus.textContent = text;
+  if (state) settingsUpdateStatus.setAttribute("data-state", state);
+  else settingsUpdateStatus.removeAttribute("data-state");
+}
+
+function refreshSettingsUpdateButton() {
+  if (!settingsUpdateBtn) return;
+  if (!appConfig.updateAvailable) {
+    settingsUpdateBtn.hidden = true;
+    setSettingsUpdateStatus("");
+    return;
+  }
+  settingsUpdateBtn.hidden = false;
+  settingsUpdateBtn.disabled = false;
+  settingsUpdateBtn.textContent = "Update";
+  // If the background poll has already discovered a new build, surface
+  // it the moment the modal opens so the user doesn't have to click
+  // Update just to see the version number.
+  if (_lastUpdateInfo && _lastUpdateInfo.updateAvailable) {
+    setSettingsUpdateStatus(`Update available: ${_lastUpdateInfo.latest}`, "ok");
+  } else {
+    setSettingsUpdateStatus("");
+  }
+}
+
+async function pollHealthUntilReady(onReady, opts) {
+  const max = (opts && opts.maxAttempts) || 60; // ~2 min at 2s
+  const interval = (opts && opts.interval) || 2000;
+  if (_updatePollHandle) {
+    clearInterval(_updatePollHandle);
+    _updatePollHandle = null;
+  }
+  let attempts = 0;
+  _updatePollHandle = setInterval(async () => {
+    attempts += 1;
+    try {
+      const resp = await fetch("/api/health", { credentials: "same-origin", cache: "no-store" });
+      if (resp.ok) {
+        const data = await resp.json().catch(() => null);
+        if (data && data.ok) {
+          clearInterval(_updatePollHandle);
+          _updatePollHandle = null;
+          onReady();
+          return;
+        }
+      }
+    } catch (_e) {
+      /* server is restarting; keep polling */
+    }
+    if (attempts >= max) {
+      clearInterval(_updatePollHandle);
+      _updatePollHandle = null;
+      setSettingsUpdateStatus(
+        "Server did not come back within the expected time. Please reload the page manually.",
+        "error"
+      );
+      if (settingsUpdateBtn) settingsUpdateBtn.disabled = false;
+    }
+  }, interval);
+}
+
+async function handleUpdateClick() {
+  if (!settingsUpdateBtn) return;
+  settingsUpdateBtn.disabled = true;
+  settingsUpdateBtn.textContent = "Checking...";
+  setSettingsUpdateStatus("Checking GitHub for a newer build...", "");
+
+  let info;
+  try {
+    // Force-refresh from GitHub on an explicit click; the user wants
+    // an authoritative answer, not whatever the background poll
+    // happened to cache.
+    const resp = await fetch("/api/update/check?force=1", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    info = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setSettingsUpdateStatus(
+        (info && info.error) || `Update check failed (HTTP ${resp.status}).`,
+        "error"
+      );
+      settingsUpdateBtn.disabled = false;
+      settingsUpdateBtn.textContent = "Update";
+      return;
+    }
+  } catch (err) {
+    setSettingsUpdateStatus(`Update check failed: ${err && err.message ? err.message : err}`, "error");
+    settingsUpdateBtn.disabled = false;
+    settingsUpdateBtn.textContent = "Update";
+    return;
+  }
+
+  // Sync the cached state and the gear-icon badge with the fresh
+  // result so they reflect reality even if the answer changed
+  // between the last background poll and now.
+  _lastUpdateInfo = info;
+  setUpdateBadge(Boolean(info.updateAvailable));
+
+  if (!info.updateAvailable) {
+    setSettingsUpdateStatus("You are running the latest build!", "ok");
+    settingsUpdateBtn.disabled = false;
+    settingsUpdateBtn.textContent = "Update";
+    setTimeout(() => {
+      if (settingsUpdateStatus && settingsUpdateStatus.textContent === "You are running the latest build!") {
+        setSettingsUpdateStatus("");
+      }
+    }, 5000);
+    return;
+  }
+
+  const ok = window.confirm(
+    `A newer build is available.\n\n` +
+    `Current: ${info.current}\n` +
+    `Latest:  ${info.latest}\n\n` +
+    `Install now? The server will restart and you may briefly lose connection.`
+  );
+  if (!ok) {
+    setSettingsUpdateStatus(`Update available: ${info.latest} (install cancelled).`, "");
+    settingsUpdateBtn.disabled = false;
+    settingsUpdateBtn.textContent = "Update";
+    return;
+  }
+
+  setSettingsUpdateStatus(`Installing ${info.latest}... server is restarting.`, "");
+  settingsUpdateBtn.textContent = "Updating...";
+
+  try {
+    const resp = await fetch("/api/update/install", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (resp.status !== 202) {
+      const data = await resp.json().catch(() => ({}));
+      setSettingsUpdateStatus(
+        (data && data.error) || `Install request failed (HTTP ${resp.status}).`,
+        "error"
+      );
+      settingsUpdateBtn.disabled = false;
+      settingsUpdateBtn.textContent = "Update";
+      return;
+    }
+  } catch (err) {
+    // Network failure here can also mean the server already exited
+    // before our request finished; fall through to the health poll.
+    console.warn("[update] install POST failed; falling through to health poll", err);
+  }
+
+  // Give the server a moment to start the upgrade before we begin
+  // hammering /api/health. The first few attempts are expected to
+  // fail (server is git-pulling and npm-installing).
+  setTimeout(() => {
+    pollHealthUntilReady(() => {
+      setSettingsUpdateStatus("Update complete - reloading.", "ok");
+      setTimeout(() => location.reload(), 600);
+    });
+  }, 3000);
+}
+
+function openSettingsModal() {
+  if (!settingsModal) return;
+  settingsThemeInput.value = userPrefs.theme;
+  settingsIdleTimeoutInput.value = String(userPrefs.idleTimeoutMin);
+  settingsLoggingEnabledInput.checked = Boolean(userPrefs.loggingEnabled && appConfig.loggingAvailable);
+  settingsBetaEnabledInput.checked = Boolean(userPrefs.betaFeaturesEnabled);
+  refreshSettingsServerHints();
+  refreshSettingsVersionLabel();
+  refreshSettingsUpdateButton();
+  settingsModal.classList.add("open");
+  setTimeout(() => settingsThemeInput.focus(), 50);
+}
+
+function closeSettingsModal() {
+  if (settingsModal) settingsModal.classList.remove("open");
+}
+
+function saveSettingsModal() {
+  const themeVal = settingsThemeInput.value;
+  const timeoutVal = Number(settingsIdleTimeoutInput.value);
+  const loggingVal = Boolean(settingsLoggingEnabledInput.checked && appConfig.loggingAvailable);
+  const betaVal = Boolean(settingsBetaEnabledInput.checked);
+  saveUserPrefs({
+    theme: ["light", "dark", "system"].includes(themeVal) ? themeVal : "light",
+    idleTimeoutMin: Number.isFinite(timeoutVal) ? Math.max(0, timeoutVal) : 0,
+    loggingEnabled: loggingVal,
+    betaFeaturesEnabled: betaVal
+  });
+  closeSettingsModal();
+  setStatus("Settings updated.");
+  logEvent("settings.saved", null, {
+    theme: userPrefs.theme,
+    idleTimeoutMin: userPrefs.idleTimeoutMin,
+    loggingEnabled: userPrefs.loggingEnabled,
+    betaFeaturesEnabled: userPrefs.betaFeaturesEnabled
+  });
+}
+
+if (settingsBtn) settingsBtn.addEventListener("click", openSettingsModal);
+if (settingsCancelBtn) settingsCancelBtn.addEventListener("click", closeSettingsModal);
+if (settingsSaveBtn) settingsSaveBtn.addEventListener("click", saveSettingsModal);
+if (settingsUpdateBtn) settingsUpdateBtn.addEventListener("click", handleUpdateClick);
+if (settingsModal) {
+  settingsModal.addEventListener("click", (event) => {
+    if (event.target === settingsModal) closeSettingsModal();
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && settingsModal && settingsModal.classList.contains("open")) {
+    closeSettingsModal();
+  }
+});
+
+// =====================================================================
+// Activity logging (per-user opt-in -> POST /api/log)
+// =====================================================================
+//
+// Called from feature code paths (paste, screenshot, recording start /
+// stop, script copy, etc.) to record a single activity event. The
+// server only writes when *both* (a) NRCC_LOGGING=true is set and
+// (b) the request carries ?clientLogging=1 -- so disabling the
+// per-user toggle in settings stops the server from receiving the
+// log line at all.
+
+function logEvent(type, vmUuid, details) {
+  if (!type) return;
+  if (!userPrefs.loggingEnabled || !appConfig.loggingAvailable) return;
+  const body = { type };
+  if (vmUuid) body.vmUuid = vmUuid;
+  if (details && typeof details === "object") body.details = details;
+  try {
+    fetch("/api/log?clientLogging=1", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).catch(() => { /* fire-and-forget */ });
+  } catch (_e) { /* ignore */ }
 }
 
 // ---- Screenshots --------------------------------------------------------
@@ -2631,6 +3190,10 @@ async function captureActiveScreenshot() {
       msg += ` (pruned ${data.prunedCount} older screenshot${data.prunedCount === 1 ? "" : "s"})`;
     }
     setStatus(msg);
+    logEvent("console.screenshot", session.vmUuid, {
+      filename: data.filename,
+      folder: folder || null
+    });
     // Refresh the modal in place so the user sees the new tile
     // appear without needing to hit Refresh manually.
     const activeAfter = screenshotLibrary.getActive();
@@ -3426,6 +3989,12 @@ async function startRecordingForSession(session) {
   refreshTabRecordingDot(session);
   refreshRecordButtonForActiveSession();
   setStatus(`Recording ${session.vmName} (${mimeType}, ${fps} fps).`);
+  logEvent("console.recording.start", session.vmUuid, {
+    recordingId: state.recordingId,
+    mimeType,
+    fps,
+    folder: folder || null
+  });
 }
 
 async function drainRecordingChunks(session, opts = {}) {
@@ -3504,6 +4073,12 @@ async function finalizeRecording(session) {
         let msg = `Recording saved: ${data.filename} (${fmtBytes(data.sizeBytes || 0)}, ${fmtElapsed(data.durationMs || 0)})`;
         if (data.prunedCount > 0) msg += ` (pruned ${data.prunedCount} older)`;
         setStatus(msg);
+        logEvent("console.recording.stop", session.vmUuid, {
+          recordingId: state.recordingId,
+          filename: data.filename,
+          sizeBytes: data.sizeBytes || 0,
+          durationMs: data.durationMs || 0
+        });
         const recActiveAfter = recordingLibrary.getActive();
         if (recActiveAfter && recActiveAfter.vmUuid === session.vmUuid) {
           recordingLibrary.refresh();
@@ -3729,8 +4304,16 @@ async function copyScriptToClipboard(folder, item) {
       document.body.removeChild(ta);
     } catch (_e) { /* ignore */ }
   }
-  if (copied) showToast(`Copied "${item.label}" to clipboard`);
-  else setStatus(`Could not copy to clipboard. Use Edit -> Copy from the editor instead.`);
+  if (copied) {
+    showToast(`Copied "${item.label}" to clipboard`);
+    logEvent("console.script.copy", null, {
+      folder: folder || null,
+      filename: item.filename,
+      label: item.label
+    });
+  } else {
+    setStatus(`Could not copy to clipboard. Use Edit -> Copy from the editor instead.`);
+  }
 }
 
 function showScriptItemContextMenu(ev, folder, item) {
@@ -4429,6 +5012,8 @@ closeAllBtn.addEventListener("click", () => {
 
 loadSavedProfile();
 loadFavoritesStore();
+loadUserPrefs();
+applyUserPrefs();
 renderAll();
 refreshPeCredsCache();
 // Probe deployment mode early so the chat surface is gated correctly.

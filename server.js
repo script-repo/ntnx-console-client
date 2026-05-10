@@ -5,10 +5,31 @@ const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
 const { URL } = require("url");
+const child_process = require("child_process");
 const express = require("express");
 const axios = require("axios");
 const { WebSocketServer, WebSocket } = require("ws");
 require("dotenv").config();
+
+// Build identifier follows Major.Minor.Patch-YYYYMMDD-NN where the
+// trailing -NN is the daily build counter (01, 02, ...). The bumper
+// writes the same string to two places:
+//   1. ./build.info  - single line, what the GitHub repo carries so
+//                      the in-app updater can read it without git.
+//   2. package.json   - canonical npm metadata.
+// We prefer build.info because it's the file the updater swaps; if
+// it's missing (older installs / stripped tarballs) we fall back to
+// package.json, then to a 0.0.0 placeholder.
+function loadAppVersion() {
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, "build.info"), "utf8");
+    const trimmed = String(raw).split(/\r?\n/)[0].trim();
+    if (trimmed) return trimmed;
+  } catch (_e) { /* fall through to package.json */ }
+  try { return String(require("./package.json").version || "0.0.0"); }
+  catch (_e) { return "0.0.0"; }
+}
+const APP_VERSION = loadAppVersion();
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -39,6 +60,68 @@ const RECORDING_MAX_PER_VM = Math.max(1, Number(process.env.NRCC_RECORDING_MAX_P
 const SCRIPTS_DIR = path.resolve(process.env.NRCC_SCRIPTS_DIR || "./scripts");
 const SCRIPT_MAX_BYTES = Math.max(1024, Number(process.env.NRCC_SCRIPT_MAX_BYTES || 262_144));
 
+// Activity logging. Disabled by default; an operator opts the
+// deployment in by setting NRCC_LOGGING=true. Per-user opt-in still
+// applies on top of that for client-emitted events (the request must
+// carry ?clientLogging=1). Server-emitted events (login, console-open,
+// console-close) always write when the master switch is on.
+const LOGGING_ENABLED = String(process.env.NRCC_LOGGING || "").toLowerCase() === "true";
+const LOGS_DIR = path.resolve(process.env.NRCC_LOGS_DIR || "./logs");
+
+// In-app updater configuration. Defaults point at the canonical public
+// repo so a fresh install can self-update out of the box; an operator
+// can pin a fork or a feature branch via env, or disable the feature
+// entirely with NRCC_UPDATE_ENABLED=false.
+const UPDATE_ENABLED = String(process.env.NRCC_UPDATE_ENABLED || "true").toLowerCase() !== "false";
+const UPDATE_REPO    = process.env.NRCC_UPDATE_REPO   || "https://github.com/script-repo/ntnx-console-client";
+const UPDATE_BRANCH  = process.env.NRCC_UPDATE_BRANCH || "main";
+// Items the file-swap path must NEVER overwrite. Anything user-data,
+// secrets, or operator-installed runtime that we'd otherwise clobber
+// when copying the cloned tree over the install dir. build.info is
+// in the list because the upgrade rewrites it AFTER the swap so we
+// always end up reflecting the version actually on disk.
+const UPDATE_PRESERVE = new Set([
+  "logs",
+  "recordings",
+  "screenshots",
+  "scripts",
+  "certs",
+  "node_modules",
+  ".env",
+  "build.info"
+]);
+// Whitelist for client-supplied event types so the log file stays
+// human-readable. Anything not in this set is normalised to
+// "client.unknown" and the original type is moved into details.
+const CLIENT_LOG_EVENT_TYPES = new Set([
+  "console.paste",
+  "console.ctrl-alt-del",
+  "console.screenshot",
+  "console.recording.start",
+  "console.recording.stop",
+  "console.script.copy",
+  "settings.saved",
+  "chat.send"
+]);
+
+// =====================================================================
+// Feature-flag registry
+// =====================================================================
+//
+// Every visible feature (existing or planned) declares a stage of
+// "ga" or "beta". GA features are always available; beta features
+// only render in the UI when the user has opted in via Settings ->
+// Show beta features. To promote a feature to GA, change its stage
+// to "ga" here. The client mirrors this object via /api/config.
+const FEATURE_FLAGS = {
+  chat:        { stage: "ga", description: "Multi-user VM chat panel" },
+  screenshots: { stage: "ga", description: "Per-VM screenshot capture and library" },
+  recordings:  { stage: "ga", description: "Per-VM video recording (10 fps WebM)" },
+  scripts:     { stage: "ga", description: "Global script library with click-to-clipboard" },
+  logging:     { stage: "ga", description: "Optional activity logging (server-gated)" },
+  settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" }
+};
+
 // Strict UUID match used everywhere we accept a VM UUID from the client.
 // Lowercase and hyphenated, no curly braces, no upper-case (the server
 // side normalises to lowercase before any filesystem use).
@@ -57,6 +140,76 @@ for (const [label, dir] of [
 // Recordings need a temp area for in-flight chunked uploads.
 try { fs.mkdirSync(path.join(RECORDINGS_DIR, "_tmp"), { recursive: true }); }
 catch (err) { console.warn(`[recordings] could not create _tmp: ${err.message}`); }
+// Logs dir is only created when logging is actually enabled, so the
+// "logs/" directory doesn't appear on disk for deployments that
+// haven't opted in.
+if (LOGGING_ENABLED) {
+  try {
+    fs.mkdirSync(LOGS_DIR, { recursive: true });
+    console.log(`[logging] activity logs enabled (dir: ${LOGS_DIR})`);
+  } catch (err) {
+    console.warn(`[logging] could not create ${LOGS_DIR}: ${err.message}`);
+  }
+}
+
+// ISO-8601 week number, used to pick the rotated log filename. We use
+// week-of-year rather than calendar week because it makes filenames
+// sortable and unambiguous across year boundaries.
+function isoWeekParts(date) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return { year: d.getUTCFullYear(), week: weekNo };
+}
+
+function logFilePathForDate(date) {
+  const { year, week } = isoWeekParts(date);
+  const ww = String(week).padStart(2, "0");
+  return path.join(LOGS_DIR, `nrcc-${year}-W${ww}.log`);
+}
+
+// Single-line JSON-per-event append. All events go to the same weekly
+// file; a real syslog / SIEM integration can tail it. We swallow write
+// errors so a wedged disk can never crash the server -- but we do warn
+// on the first failure so the operator notices.
+let _logWriteWarned = false;
+function appendLog(entry) {
+  if (!LOGGING_ENABLED) return;
+  if (!entry || typeof entry !== "object") return;
+  const now = new Date();
+  const line = JSON.stringify({
+    ts: now.toISOString(),
+    type: String(entry.type || "unknown"),
+    username: entry.username || null,
+    sessionId: entry.sessionId || null,
+    pcHost: entry.pcHost || null,
+    vmUuid: entry.vmUuid || null,
+    remoteIp: entry.remoteIp || null,
+    details: entry.details || null
+  }) + "\n";
+  try {
+    fs.appendFileSync(logFilePathForDate(now), line, "utf8");
+  } catch (err) {
+    if (!_logWriteWarned) {
+      console.warn(`[logging] write failed (${err.code || ""}): ${err.message}`);
+      _logWriteWarned = true;
+    }
+  }
+}
+
+// Convenience wrapper for handlers that already have `req` in scope.
+function appendLogForReq(req, entry) {
+  if (!LOGGING_ENABLED) return;
+  appendLog({
+    ...entry,
+    username: entry.username || req.nrccSession?.currentUser || null,
+    sessionId: entry.sessionId || req.nrccSid || null,
+    pcHost: entry.pcHost || req.nrccSession?.pcHost || null,
+    remoteIp: entry.remoteIp || req.ip || null
+  });
+}
 
 // Pull every IPv4 address on the box for the self-signed cert's SAN
 // list, so a browser pointed at the LAN IP doesn't trip a CN mismatch
@@ -278,7 +431,11 @@ app.get("/api/config", (req, res) => {
     scripts: {
       maxBytes: SCRIPT_MAX_BYTES
     },
-    currentUser: req.nrccSession.currentUser || null
+    currentUser: req.nrccSession.currentUser || null,
+    loggingAvailable: LOGGING_ENABLED,
+    featureFlags: FEATURE_FLAGS,
+    appVersion: APP_VERSION,
+    updateAvailable: UPDATE_ENABLED
   });
 });
 
@@ -304,10 +461,342 @@ app.delete("/api/pe-creds/:peHost", (req, res) => {
 // state); just clears the values so the chat WebSocket can't bind to
 // a stale username before a re-login completes.
 app.post("/api/logout", (req, res) => {
+  appendLogForReq(req, { type: "logout" });
   req.nrccSession.peCreds.clear();
   req.nrccSession.currentUser = null;
   req.nrccSession.pcHost = null;
   res.json({ ok: true });
+});
+
+// Per-user activity log endpoint. The client gates whether it sends
+// at all (via the Settings -> "Record my logins and console activity"
+// toggle), and the server only honours requests that explicitly opt
+// in via ?clientLogging=1. NRCC_LOGGING off short-circuits both
+// sides regardless of the query string.
+app.post("/api/log", (req, res) => {
+  if (!LOGGING_ENABLED) return res.status(204).end();
+  if (req.query.clientLogging !== "1") return res.status(204).end();
+  const body = req.body || {};
+  const rawType = String(body.type || "").trim();
+  const safeType = rawType && CLIENT_LOG_EVENT_TYPES.has(rawType) ? rawType : "client.unknown";
+  const details = body.details && typeof body.details === "object" ? body.details : null;
+  appendLogForReq(req, {
+    type: safeType,
+    vmUuid: typeof body.vmUuid === "string" ? body.vmUuid : null,
+    details: safeType === "client.unknown" ? { ...details, originalType: rawType } : details
+  });
+  res.status(204).end();
+});
+
+// =====================================================================
+// In-app self-update from GitHub.
+//
+// The Settings dialog shows the current build number (APP_VERSION) and
+// a blue "Update" button. Clicking it hits /api/update/check which
+// fetches the repo's `build.info` over raw.githubusercontent and
+// compares it to APP_VERSION. If a newer build is available the
+// client confirms and POSTs /api/update/install, which 202-replies
+// immediately and then runs the upgrade in the background:
+//   - Path A (in-place git): git fetch + git reset --hard
+//   - Path B (clone-and-swap): git clone --depth 1 to a tmp dir, then
+//     copy each child into the install dir, skipping UPDATE_PRESERVE
+//     entries (logs/, recordings/, screenshots/, etc) so user data
+//     isn't clobbered.
+// In both paths we then run `npm install --omit=dev --no-audit
+// --no-fund`, log an "update.install" event, and process.exit(0) to
+// hand off to whatever supervisor (k8s Deployment, systemd, PM2, ...)
+// owns the process and will restart it with the new code.
+// =====================================================================
+
+let _updateInFlight = false;
+// Short-lived cache of the most recent /api/update/check result so
+// the auto-poll the client runs (every UPDATE_CHECK_TTL_MS or so)
+// and any concurrent users sharing the install don't hammer
+// raw.githubusercontent.com. The cache is invalidated automatically
+// when its age exceeds the TTL.
+const UPDATE_CHECK_TTL_MS = Math.max(60_000, Number(process.env.NRCC_UPDATE_CHECK_TTL_MS || 5 * 60 * 1000));
+let _updateCheckCache = null; // { ts: number, info: <fetchRemoteBuildInfo result> }
+
+// Parse "https://github.com/<owner>/<repo>(.git)?" into { owner, repo }.
+// Anything else returns null and the caller bails with a 500.
+function parseGithubRepo(repoUrl) {
+  if (typeof repoUrl !== "string") return null;
+  const m = repoUrl.trim().replace(/\.git$/i, "").match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/?$/i);
+  if (!m) return null;
+  return { owner: m[1], repo: m[2] };
+}
+
+// Same shape as VERSION_RE in scripts/bump-build.js. The trailing
+// -YYYYMMDD-NN is optional so plain "1.2.3" tags from a release branch
+// still validate.
+const UPDATE_VERSION_RE = /^(\d+)\.(\d+)\.(\d+)(?:-(\d{8})-(\d{1,3}))?$/;
+
+function parseAppVersion(v) {
+  const s = String(v || "").trim();
+  const m = s.match(UPDATE_VERSION_RE);
+  if (!m) return null;
+  return {
+    raw: s,
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    date:  m[4] ? Number(m[4]) : 0,
+    build: m[5] ? Number(m[5]) : 0
+  };
+}
+
+// Returns >0 when `b` is newer than `a`, <0 when `a` is newer, 0 when equal.
+function compareAppVersion(a, b) {
+  const pa = parseAppVersion(a);
+  const pb = parseAppVersion(b);
+  if (!pa || !pb) {
+    // Fall back to plain string compare so an unparseable remote at
+    // least doesn't claim "you are up to date" when it's not.
+    if (String(a) === String(b)) return 0;
+    return String(a) < String(b) ? 1 : -1;
+  }
+  if (pa.major !== pb.major) return pb.major - pa.major;
+  if (pa.minor !== pb.minor) return pb.minor - pa.minor;
+  if (pa.patch !== pb.patch) return pb.patch - pa.patch;
+  if (pa.date  !== pb.date)  return pb.date  - pa.date;
+  if (pa.build !== pb.build) return pb.build - pa.build;
+  return 0;
+}
+
+function rawBuildInfoUrl() {
+  const parsed = parseGithubRepo(UPDATE_REPO);
+  if (!parsed) return null;
+  return `https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/${encodeURIComponent(UPDATE_BRANCH)}/build.info`;
+}
+
+function compareUrl(remoteVersion) {
+  const parsed = parseGithubRepo(UPDATE_REPO);
+  if (!parsed) return null;
+  return `https://github.com/${parsed.owner}/${parsed.repo}/compare/${encodeURIComponent(APP_VERSION)}...${encodeURIComponent(remoteVersion)}`;
+}
+
+// Single source of truth for "what build does the GitHub repo say is
+// current?" Returns { current, latest, updateAvailable, repo, branch,
+// url } or throws on failure. Pass `force: true` to bypass the
+// in-memory cache (used by the install handler to re-validate
+// immediately before the file swap).
+async function fetchRemoteBuildInfo(opts) {
+  const force = !!(opts && opts.force);
+  if (!force && _updateCheckCache && (Date.now() - _updateCheckCache.ts) < UPDATE_CHECK_TTL_MS) {
+    // Re-stamp `current` against the live APP_VERSION in case a hot
+    // restart raced the cache; everything else is a snapshot of the
+    // most recent remote read.
+    return Object.assign({}, _updateCheckCache.info, {
+      current: APP_VERSION,
+      updateAvailable: compareAppVersion(APP_VERSION, _updateCheckCache.info.latest) > 0,
+      cached: true,
+      cacheAgeMs: Date.now() - _updateCheckCache.ts
+    });
+  }
+  const url = rawBuildInfoUrl();
+  if (!url) {
+    const err = new Error("invalid NRCC_UPDATE_REPO; expected https://github.com/<owner>/<repo>");
+    err.statusCode = 500;
+    throw err;
+  }
+  let res;
+  try {
+    res = await axios.get(url, {
+      timeout: 10000,
+      // axios tries to JSON-parse a one-line "1.2.3" body; the
+      // identity transform forces it to stay a plain string.
+      transformResponse: [(r) => r],
+      headers: { "Accept": "text/plain", "User-Agent": `nrcc/${APP_VERSION}` },
+      validateStatus: () => true
+    });
+  } catch (err) {
+    const e = new Error(`failed to reach GitHub: ${err.message}`);
+    e.statusCode = 502;
+    e.cause = err;
+    throw e;
+  }
+  if (res.status !== 200) {
+    const e = new Error(`GitHub returned ${res.status} fetching build.info`);
+    e.statusCode = 502;
+    e.details = { status: res.status, body: typeof res.data === "string" ? res.data.slice(0, 200) : null };
+    throw e;
+  }
+  const latest = String(res.data || "").split(/\r?\n/)[0].trim();
+  if (!UPDATE_VERSION_RE.test(latest)) {
+    const e = new Error(`remote build.info value is not a recognised version string: "${latest.slice(0, 80)}"`);
+    e.statusCode = 502;
+    throw e;
+  }
+  const cmp = compareAppVersion(APP_VERSION, latest);
+  const info = {
+    current: APP_VERSION,
+    latest,
+    updateAvailable: cmp > 0,
+    repo: UPDATE_REPO,
+    branch: UPDATE_BRANCH,
+    url: compareUrl(latest),
+    cached: false,
+    cacheAgeMs: 0
+  };
+  _updateCheckCache = { ts: Date.now(), info: { ...info, cached: false, cacheAgeMs: 0 } };
+  return info;
+}
+
+app.post("/api/update/check", async (req, res) => {
+  if (!UPDATE_ENABLED) {
+    return res.status(503).json({ error: "Self-update is disabled on this server (NRCC_UPDATE_ENABLED=false)." });
+  }
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  // ?force=1 bypasses the cache (used by the explicit Update click
+  // when the user wants a fresh read; the auto-poll uses the cache).
+  const force = String(req.query.force || "") === "1";
+  try {
+    const info = await fetchRemoteBuildInfo({ force });
+    res.json(info);
+  } catch (err) {
+    const status = err.statusCode || 502;
+    res.status(status).json({ error: err.message, details: err.details || null });
+  }
+});
+
+// Spawn a child process inheriting stdio, return a Promise that
+// resolves with {code, signal} on exit. Used by the upgrade pipeline
+// so each step is isolated and the operator sees the live output in
+// the server's stdout/stderr.
+function runChild(file, args, opts) {
+  return new Promise((resolve, reject) => {
+    const child = child_process.spawn(file, args, Object.assign({ stdio: "inherit" }, opts || {}));
+    child.on("error", reject);
+    child.on("exit", (code, signal) => resolve({ code, signal }));
+  });
+}
+
+function gitAvailable() {
+  try {
+    child_process.execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch (_e) { return false; }
+}
+
+// Copy <srcDir>/* into <destDir>, skipping any top-level entry whose
+// name is in UPDATE_PRESERVE. Uses fs.cpSync (Node 16.7+) for the
+// recursive copy, with `force: true` so existing files are
+// overwritten. We only iterate the top-level entries because
+// UPDATE_PRESERVE only protects top-level names by design (e.g. we
+// always want to overwrite public/app.js even though `scripts/` at
+// the top level is preserved).
+function swapInstallTree(srcDir, destDir) {
+  const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+  for (const ent of entries) {
+    if (UPDATE_PRESERVE.has(ent.name)) continue;
+    const from = path.join(srcDir, ent.name);
+    const to   = path.join(destDir, ent.name);
+    fs.cpSync(from, to, { recursive: true, force: true });
+  }
+}
+
+async function runUpdate(latest) {
+  const installDir = __dirname;
+  const inPlaceGit = fs.existsSync(path.join(installDir, ".git"));
+  const mode = inPlaceGit ? "git-pull" : "clone-swap";
+  console.log(`[update] starting ${mode} upgrade ${APP_VERSION} -> ${latest}`);
+
+  if (!gitAvailable()) {
+    console.warn("[update] git not on PATH; aborting upgrade. Install git on the host and retry.");
+    appendLog({ type: "update.failed", details: { from: APP_VERSION, to: latest, mode, reason: "git-missing" } });
+    _updateInFlight = false;
+    return;
+  }
+
+  try {
+    if (inPlaceGit) {
+      let r = await runChild("git", ["-C", installDir, "fetch", "--depth", "1", "origin", UPDATE_BRANCH]);
+      if (r.code !== 0) throw new Error(`git fetch exited ${r.code}`);
+      r = await runChild("git", ["-C", installDir, "reset", "--hard", `origin/${UPDATE_BRANCH}`]);
+      if (r.code !== 0) throw new Error(`git reset exited ${r.code}`);
+    } else {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nrcc-update-"));
+      try {
+        const r = await runChild("git", ["clone", "--depth", "1", "--branch", UPDATE_BRANCH, UPDATE_REPO, tmpDir]);
+        if (r.code !== 0) throw new Error(`git clone exited ${r.code}`);
+        swapInstallTree(tmpDir, installDir);
+        // Mirror build.info from the cloned tree so the local stamp
+        // matches what's on disk (the install would otherwise still
+        // report APP_VERSION until restart anyway, but writing it
+        // explicitly catches the edge case where build.info itself
+        // was in UPDATE_PRESERVE for a previous release).
+        const remoteBuildInfo = path.join(tmpDir, "build.info");
+        if (fs.existsSync(remoteBuildInfo)) {
+          fs.copyFileSync(remoteBuildInfo, path.join(installDir, "build.info"));
+        }
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_e) { /* best-effort */ }
+      }
+    }
+
+    // Always re-resolve dependencies after the file swap. We prefer
+    // `npm ci` when a package-lock.json exists - it deletes and
+    // rebuilds node_modules from the lockfile exactly, which is both
+    // faster than `npm install` for clean trees and guarantees the
+    // newly-checked-out lockfile is honoured. If there's no lockfile
+    // we fall back to plain `npm install`.
+    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+    const lockExists = fs.existsSync(path.join(installDir, "package-lock.json"));
+    const npmCmd = lockExists ? "ci" : "install";
+    console.log(`[update] running 'npm ${npmCmd} --omit=dev' in ${installDir}`);
+    const npmRes = await runChild(npm, [npmCmd, "--omit=dev", "--no-audit", "--no-fund"], { cwd: installDir });
+    if (npmRes.code !== 0) {
+      console.warn(`[update] npm ${npmCmd} exited ${npmRes.code}; continuing with restart anyway (existing node_modules may still be usable)`);
+    } else {
+      console.log(`[update] npm ${npmCmd} completed successfully`);
+    }
+
+    appendLog({ type: "update.install", details: {
+      from: APP_VERSION, to: latest, mode,
+      npm: npmCmd,
+      npmExit: npmRes.code
+    } });
+    console.log(`[update] upgrade applied; exiting so supervisor can restart with new code`);
+    setTimeout(() => process.exit(0), 250);
+  } catch (err) {
+    console.error(`[update] upgrade failed: ${err.message}`);
+    appendLog({ type: "update.failed", details: { from: APP_VERSION, to: latest, mode, reason: err.message } });
+    _updateInFlight = false;
+  }
+}
+
+app.post("/api/update/install", async (req, res) => {
+  if (!UPDATE_ENABLED) {
+    return res.status(503).json({ error: "Self-update is disabled on this server (NRCC_UPDATE_ENABLED=false)." });
+  }
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  if (_updateInFlight) {
+    return res.status(409).json({ error: "An update is already in progress." });
+  }
+
+  let info;
+  try {
+    info = await fetchRemoteBuildInfo({ force: true });
+  } catch (err) {
+    const status = err.statusCode || 502;
+    return res.status(status).json({ error: err.message, details: err.details || null });
+  }
+
+  if (!info.updateAvailable) {
+    return res.status(409).json({ error: "Already on the latest build.", current: info.current, latest: info.latest });
+  }
+
+  _updateInFlight = true;
+  appendLogForReq(req, { type: "update.requested", details: { from: info.current, to: info.latest } });
+  res.status(202).json({ ok: true, message: "Update started; server will restart.", from: info.current, to: info.latest });
+
+  // Defer the actual work so Express can flush the 202 before we
+  // start spawning git and (eventually) call process.exit.
+  setImmediate(() => { runUpdate(info.latest); });
 });
 
 // =====================================================================
@@ -2838,15 +3327,31 @@ app.post("/api/pc-test", async (req, res) => {
       // themselves still live only in the browser.
       req.nrccSession.currentUser = username;
       req.nrccSession.pcHost = pcHost;
+      appendLogForReq(req, { type: "login.success", details: { probeStatus: winner.status } });
       return res.json({ ok: true, status: winner.status });
     } catch (_aggregate) {
       if (sawAuthFailure) {
+        appendLog({
+          type: "login.rejected",
+          username,
+          pcHost,
+          sessionId: req.nrccSid,
+          remoteIp: req.ip,
+          details: { reason: "credentials" }
+        });
         return res.status(401).json({
           ok: false,
           error: "Prism Central rejected those credentials (401).",
           details: lastDetail || undefined
         });
       }
+      appendLog({
+        type: "login.unreachable",
+        username,
+        pcHost,
+        sessionId: req.nrccSid,
+        remoteIp: req.ip
+      });
       return res.status(502).json({
         ok: false,
         error: `Prism Central at ${pcHost} did not respond to any probe.`,
@@ -3013,7 +3518,19 @@ async function respondWithPeLegacyProxy({
     tlsSkipVerify,
     sessionCookie,
     basicAuth: Buffer.from(`${peUsername}:${pePassword}`).toString("base64"),
-    createdAtMs: Date.now()
+    createdAtMs: Date.now(),
+    logMeta: {
+      vmUuid,
+      via: `pe-legacy:${peHost}`,
+      username: req.nrccSession?.currentUser || null,
+      sessionId: req.nrccSid || null,
+      pcHost: req.nrccSession?.pcHost || null
+    }
+  });
+  appendLogForReq(req, {
+    type: "console.open",
+    vmUuid,
+    details: { via: `pe-legacy:${peHost}` }
   });
   const wsProtocol = req.protocol === "https" ? "wss" : "ws";
   const websocketUrl = `${wsProtocol}://${req.get("host")}/ws-proxy/${proxySessionId}`;
@@ -3250,12 +3767,25 @@ app.post("/api/console-token", async (req, res) => {
       apiPassword
     );
     const proxySessionId = crypto.randomUUID();
+    const viaTag = usingPe ? `pe:${apiHost}` : `pc:${apiHost}`;
     wsProxySessions.set(proxySessionId, {
       targetUrl,
       tlsSkipVerify,
       sessionCookie,
       basicAuth: Buffer.from(`${apiUsername}:${apiPassword}`).toString("base64"),
-      createdAtMs: Date.now()
+      createdAtMs: Date.now(),
+      logMeta: {
+        vmUuid,
+        via: viaTag,
+        username: req.nrccSession?.currentUser || null,
+        sessionId: req.nrccSid || null,
+        pcHost: req.nrccSession?.pcHost || null
+      }
+    });
+    appendLogForReq(req, {
+      type: "console.open",
+      vmUuid,
+      details: { via: viaTag, tokenApiPath: usedUrl }
     });
     const wsProtocol = req.protocol === "https" ? "wss" : "ws";
     const websocketUrl = `${wsProtocol}://${req.get("host")}/ws-proxy/${proxySessionId}`;
@@ -3264,7 +3794,7 @@ app.post("/api/console-token", async (req, res) => {
       websocketUrl,
       vmConsoleToken,
       tokenApiPath: usedUrl,
-      via: usingPe ? `pe:${apiHost}` : `pc:${apiHost}`,
+      via: viaTag,
       note: usingPe
         ? "Token generated against Prism Element (CVM is not visible to PC)."
         : "Browser must already have a valid Prism session cookie for this host."
@@ -3578,6 +4108,29 @@ wsServer.on("connection", (clientSocket, req, requestUrl) => {
     return;
   }
 
+  // Snapshot logging metadata up-front -- we delete the
+  // wsProxySessions entry as soon as the upstream connects, so the
+  // close handler below can no longer pull it from the map.
+  const logMeta = session.logMeta || null;
+  const connectedAtMs = Date.now();
+  let consoleCloseLogged = false;
+  const logConsoleClose = (reason) => {
+    if (consoleCloseLogged || !logMeta) return;
+    consoleCloseLogged = true;
+    appendLog({
+      type: "console.close",
+      vmUuid: logMeta.vmUuid,
+      username: logMeta.username,
+      sessionId: logMeta.sessionId,
+      pcHost: logMeta.pcHost,
+      details: {
+        via: logMeta.via,
+        durationMs: Date.now() - connectedAtMs,
+        reason: reason || "closed"
+      }
+    });
+  };
+
   const headers = {
     "NTNX-Request-Id": crypto.randomUUID(),
     "X-Request-Id": crypto.randomUUID()
@@ -3620,14 +4173,22 @@ wsServer.on("connection", (clientSocket, req, requestUrl) => {
     if (clientSocket.readyState === WebSocket.OPEN) {
       clientSocket.close(code, reason.toString());
     }
+    logConsoleClose(`upstream:${code}`);
   });
-  clientSocket.on("close", () => closeBoth());
+  clientSocket.on("close", () => {
+    closeBoth();
+    logConsoleClose("client-close");
+  });
 
   upstream.on("error", (error) => {
     console.error("Upstream console WS error:", error.message);
     closeBoth(1011, "Upstream error");
+    logConsoleClose("upstream-error");
   });
-  clientSocket.on("error", () => closeBoth(1011, "Client error"));
+  clientSocket.on("error", () => {
+    closeBoth(1011, "Client error");
+    logConsoleClose("client-error");
+  });
 });
 
 // =====================================================================
@@ -3742,6 +4303,12 @@ if (wsChatServer) {
         };
         chatStore.append(vmUuid, record);
         chatBroadcast(vmUuid, { type: "msg", ...record });
+        appendLog({
+          type: "chat.send",
+          vmUuid,
+          username: ws.nrccUsername,
+          details: { length: text.length }
+        });
         return;
       }
 
@@ -3787,7 +4354,7 @@ setInterval(() => {
 
 server.listen(port, () => {
   const scheme = MULTI_USER_MODE ? "https" : "http";
-  console.log(`Nutanix console launcher running at ${scheme}://localhost:${port}`);
+  console.log(`NRCC ${APP_VERSION} running at ${scheme}://localhost:${port}`);
   if (MULTI_USER_MODE) {
     console.log("[mode] multi-user features enabled: HTTPS, per-VM chat, presence");
   }

@@ -27,6 +27,48 @@
         --ntx-shadow-md: 0 4px 14px rgba(15, 23, 42, 0.08);
         --ntx-shadow-lg: 0 18px 40px rgba(15, 23, 42, 0.18);
         --ntx-radius: 6px;
+        /* Surface tones used by inputs / buttons / cards. Split out so the
+           dark theme can swap them without touching every selector. */
+        --ntx-input-bg: #ffffff;
+        --ntx-button-bg: #ffffff;
+        --ntx-button-bg-hover: #f4f7fc;
+        --ntx-pill-bg: #eef1f6;
+        --ntx-danger-soft: #fdf2f4;
+        --ntx-danger-soft-border: #fbd0da;
+        --ntx-warn-soft: #fdecde;
+        --ntx-success-soft: #e8f6ee;
+        --ntx-modal-overlay: rgba(15, 23, 42, 0.55);
+      }
+      :root[data-theme="dark"] {
+        --ntx-bg: #0f172a;
+        --ntx-surface: #1a2336;
+        --ntx-surface-2: #131c2e;
+        --ntx-border: #2a3855;
+        --ntx-border-strong: #3a4a6b;
+        --ntx-text: #e6ebf5;
+        --ntx-text-muted: #a3acc1;
+        --ntx-text-subtle: #7c869c;
+        --ntx-brand: #0e1a2e;
+        --ntx-brand-2: #182b48;
+        --ntx-accent: #4f8dff;
+        --ntx-accent-soft: #1d2a4d;
+        --ntx-accent-hover: #2f72ff;
+        --ntx-success: #34d27a;
+        --ntx-success-hover: #28b366;
+        --ntx-warn: #f4a55a;
+        --ntx-danger: #f25c7a;
+        --ntx-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+        --ntx-shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
+        --ntx-shadow-lg: 0 18px 40px rgba(0, 0, 0, 0.55);
+        --ntx-input-bg: #131c2e;
+        --ntx-button-bg: #1f2a40;
+        --ntx-button-bg-hover: #2a3855;
+        --ntx-pill-bg: #1f2a40;
+        --ntx-danger-soft: #2d1620;
+        --ntx-danger-soft-border: #6b2236;
+        --ntx-warn-soft: #2d1f10;
+        --ntx-success-soft: #142a1d;
+        --ntx-modal-overlay: rgba(0, 0, 0, 0.65);
       }
       * {
         box-sizing: border-box;
@@ -152,23 +194,25 @@
           background 120ms ease;
       }
       input,
-      select {
-        background: #fff;
+      select,
+      textarea {
+        background: var(--ntx-input-bg);
       }
       input:focus,
-      select:focus {
+      select:focus,
+      textarea:focus {
         outline: none;
         border-color: var(--ntx-accent);
         box-shadow: 0 0 0 3px rgba(21, 101, 255, 0.18);
       }
       button {
-        background: #fff;
+        background: var(--ntx-button-bg);
         cursor: pointer;
         font-weight: 500;
         color: var(--ntx-text);
       }
       button:hover {
-        background: #f4f7fc;
+        background: var(--ntx-button-bg-hover);
         border-color: var(--ntx-text-subtle);
       }
       button:focus-visible {
@@ -251,7 +295,7 @@
       }
       #favoritesTree::-webkit-scrollbar-thumb,
       #vmList::-webkit-scrollbar-thumb {
-        background: #cdd4e0;
+        background: var(--ntx-border-strong);
         border-radius: 4px;
       }
       .vm-row {
@@ -307,7 +351,7 @@
         letter-spacing: 0.3px;
         text-transform: uppercase;
         color: var(--ntx-text-muted);
-        background: #eef1f6;
+        background: var(--ntx-pill-bg);
       }
       .state-pill::before {
         content: "";
@@ -321,17 +365,17 @@
       .vm-item .state-pill[data-state="ON"],
       .vm-item .state-pill[data-state="POWERED_ON"] {
         color: var(--ntx-success);
-        background: #e8f6ee;
+        background: var(--ntx-success-soft);
       }
       .vm-item .state-pill[data-state="OFF"],
       .vm-item .state-pill[data-state="POWERED_OFF"] {
         color: var(--ntx-text-subtle);
-        background: #eef1f6;
+        background: var(--ntx-pill-bg);
       }
       .vm-item .state-pill[data-state="PAUSED"],
       .vm-item .state-pill[data-state="SUSPENDED"] {
         color: var(--ntx-warn);
-        background: #fdecde;
+        background: var(--ntx-warn-soft);
       }
       .star {
         height: 28px;
@@ -840,7 +884,7 @@
       .modal-backdrop {
         position: fixed;
         inset: 0;
-        background: rgba(15, 23, 42, 0.55);
+        background: var(--ntx-modal-overlay);
         display: none;
         align-items: center;
         justify-content: center;
@@ -851,7 +895,7 @@
         display: flex;
       }
       .modal {
-        background: #fff;
+        background: var(--ntx-surface);
         border: 1px solid var(--ntx-border);
         border-radius: 8px;
         width: 440px;
@@ -899,10 +943,151 @@
       .modal-error {
         color: var(--ntx-danger);
         font-size: 12px;
-        background: #fdf2f4;
-        border: 1px solid #fbd0da;
+        background: var(--ntx-danger-soft);
+        border: 1px solid var(--ntx-danger-soft-border);
         border-radius: 4px;
         padding: 8px 10px;
+      }
+
+      /* Settings modal: a wider variant of the standard modal with
+         section dividers and grid-aligned label/control rows. */
+      .settings-modal { width: 520px; }
+      .settings-modal-body { gap: 0; padding: 0; }
+      .settings-section {
+        padding: 16px 18px;
+        border-bottom: 1px solid var(--ntx-border);
+        display: grid;
+        gap: 8px;
+      }
+      .settings-section:last-child { border-bottom: 0; }
+      .settings-section-title {
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--ntx-text-subtle);
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+      }
+      .settings-row {
+        display: grid;
+        grid-template-columns: 1fr 200px;
+        gap: 12px;
+        align-items: center;
+        font-weight: 500;
+        color: var(--ntx-text);
+      }
+      .settings-row-toggle {
+        grid-template-columns: 18px 1fr;
+        gap: 10px;
+      }
+      .settings-row-toggle input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
+        margin: 0;
+      }
+      .settings-label { font-size: 13px; }
+      .settings-input { width: 100%; }
+      .settings-hint {
+        margin: 0;
+        font-size: 12px;
+        color: var(--ntx-text-muted);
+        line-height: 1.45;
+      }
+      .settings-hint code {
+        background: var(--ntx-pill-bg);
+        padding: 1px 4px;
+        border-radius: 3px;
+        font-size: 11.5px;
+      }
+      .settings-hint-warn { color: var(--ntx-warn); }
+      .settings-hint[data-disabled] { opacity: 0.55; }
+      /* Version footer sits flush at the bottom of the dialog body so
+         the operator can always confirm which build they're running. */
+      .settings-section-meta {
+        background: var(--ntx-surface-2);
+        padding: 10px 18px;
+      }
+      .settings-version-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        font-size: 12px;
+        color: var(--ntx-text-muted);
+      }
+      .settings-version-label {
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        font-weight: 700;
+        color: var(--ntx-text-subtle);
+      }
+      .settings-version-value {
+        font-family: "Consolas", "Menlo", "DejaVu Sans Mono", monospace;
+        font-size: 11.5px;
+        color: var(--ntx-text);
+        background: var(--ntx-pill-bg);
+        padding: 2px 6px;
+        border-radius: 3px;
+        flex: 1 1 auto;
+      }
+      /* Blue update button beside the build number; uses the existing
+         .primary brand colour so it matches Save. Compact size keeps
+         the footer slim. */
+      .settings-update-btn {
+        flex: 0 0 auto;
+        padding: 4px 12px;
+        font-size: 12px;
+        line-height: 1.3;
+      }
+      .settings-update-status {
+        margin: 8px 0 0;
+        font-size: 12px;
+        color: var(--ntx-text-muted);
+        line-height: 1.4;
+      }
+      .settings-update-status[data-state="error"] {
+        color: var(--ntx-danger, #c0392b);
+      }
+      .settings-update-status[data-state="ok"] {
+        color: var(--ntx-success, #218838);
+      }
+
+      /* Topbar gear button: keep the existing topbar-btn surface but
+         center the SVG and trim the padding so the icon dominates. */
+      .topbar-btn-icon {
+        padding: 0;
+        width: 30px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+      }
+      .topbar-btn-icon svg { display: block; }
+      /* Update-available indicator: small coloured dot pinned to the
+         top-right of the gear icon. The auto-poll toggles
+         `data-has-update="true"` once it knows a newer build is on
+         GitHub; the dot disappears as soon as the user successfully
+         updates and APP_VERSION catches up. The pulsing ring is a
+         pure-CSS attention cue with prefers-reduced-motion respect. */
+      .topbar-btn-icon[data-has-update="true"]::after {
+        content: "";
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--ntx-accent, #1565ff);
+        box-shadow: 0 0 0 2px var(--ntx-button-bg, #fff);
+        pointer-events: none;
+        animation: nrcc-update-pulse 2s ease-in-out infinite;
+      }
+      @keyframes nrcc-update-pulse {
+        0%   { box-shadow: 0 0 0 2px var(--ntx-button-bg, #fff), 0 0 0 0 rgba(21, 101, 255, 0.55); }
+        70%  { box-shadow: 0 0 0 2px var(--ntx-button-bg, #fff), 0 0 0 6px rgba(21, 101, 255, 0); }
+        100% { box-shadow: 0 0 0 2px var(--ntx-button-bg, #fff), 0 0 0 0 rgba(21, 101, 255, 0); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .topbar-btn-icon[data-has-update="true"]::after { animation: none; }
       }
 
       /* Login screen */
@@ -2419,6 +2604,11 @@
           <span class="topbar-user">
             <span id="sessionUserLabel"></span>
           </span>
+          <button id="settingsBtn" type="button" class="topbar-btn topbar-btn-icon" title="Settings" aria-label="Open settings">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
+              <path fill="currentColor" d="M19.14 12.94a7.83 7.83 0 0 0 .05-.94 7.83 7.83 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.7 7.7 0 0 0-1.62-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.84a.5.5 0 0 0-.49.42l-.36 2.54a7.7 7.7 0 0 0-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.67 8.48a.5.5 0 0 0 .12.64l2.03 1.58a7.83 7.83 0 0 0 0 1.88L2.79 14.16a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .61.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54a.5.5 0 0 0 .49.42h3.84a.5.5 0 0 0 .49-.42l.36-2.54a7.7 7.7 0 0 0 1.62-.94l2.39.96a.5.5 0 0 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64ZM12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5Z"/>
+            </svg>
+          </button>
           <button id="forgetPeCredsBtn" type="button" class="topbar-btn">Forget PE credentials</button>
           <button id="logoutBtn" type="button" class="topbar-btn danger">Logout</button>
         </div>
@@ -2723,6 +2913,76 @@
         <div class="modal-footer">
           <button id="scriptEditorCancel" type="button">Cancel</button>
           <button id="scriptEditorSave" type="button" class="primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings modal (theme / idle timeout / logging / beta features) -->
+    <div id="settingsModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+      <div class="modal settings-modal">
+        <div class="modal-header">
+          <span id="settingsModalTitle">Settings</span>
+        </div>
+        <div class="modal-body settings-modal-body">
+          <section class="settings-section">
+            <div class="settings-section-title">Appearance</div>
+            <label class="settings-row">
+              <span class="settings-label">Theme</span>
+              <select id="settingsTheme" class="settings-input">
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+                <option value="system">Match system</option>
+              </select>
+            </label>
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-title">Session</div>
+            <label class="settings-row">
+              <span class="settings-label">Auto-logout after inactivity</span>
+              <select id="settingsIdleTimeout" class="settings-input">
+                <option value="15">15 minutes</option>
+                <option value="60">1 hour</option>
+                <option value="0">Never</option>
+              </select>
+            </label>
+            <p class="settings-hint">When idle for the selected interval, NRCC clears your in-memory credentials, closes any open consoles, and returns to the sign-in screen.</p>
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-title">Logging</div>
+            <label class="settings-row settings-row-toggle">
+              <input id="settingsLoggingEnabled" type="checkbox" />
+              <span class="settings-label">Record my logins and console activity</span>
+            </label>
+            <p class="settings-hint" id="settingsLoggingHint">
+              Activity is appended to a weekly-rotated log file on the NRCC server (one file per ISO week).
+              Each entry records the timestamp, your username, and the action.
+            </p>
+            <p class="settings-hint settings-hint-warn" id="settingsLoggingDisabledHint" hidden>
+              Logging is disabled at the server level (set <code>NRCC_LOGGING=true</code> to enable it).
+            </p>
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-title">Beta features</div>
+            <label class="settings-row settings-row-toggle">
+              <input id="settingsBetaEnabled" type="checkbox" />
+              <span class="settings-label">Show beta features</span>
+            </label>
+            <p class="settings-hint">
+              Reveals UI for features that are still under development. Beta features may change or be removed without notice.
+            </p>
+          </section>
+          <section class="settings-section settings-section-meta">
+            <div class="settings-version-row">
+              <span class="settings-version-label">Build</span>
+              <code id="settingsVersionLabel" class="settings-version-value">&mdash;</code>
+              <button id="settingsUpdateBtn" type="button" class="primary settings-update-btn" hidden>Update</button>
+            </div>
+            <p id="settingsUpdateStatus" class="settings-update-status" hidden></p>
+          </section>
+        </div>
+        <div class="modal-footer">
+          <button id="settingsCancel" type="button">Cancel</button>
+          <button id="settingsSave" type="button" class="primary">Save</button>
         </div>
       </div>
     </div>

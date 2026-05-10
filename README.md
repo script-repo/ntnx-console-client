@@ -128,6 +128,12 @@ copy .env.example .env       # Windows
 | `NUTANIX_PASSWORD`        | _empty_            | Default PC password.                                                                                   |
 | `NUTANIX_TLS_SKIP_VERIFY` | `true`             | Accept self-signed Prism certs (lab default).                                                          |
 | `NUTANIX_API_TIMEOUT_MS`  | `30000`            | Per-request timeout (ms) for outbound calls to Prism. Increase if VM listing times out against a slow PC. |
+| `NRCC_LOGGING`            | `false`            | Master switch for activity logging. When `true`, NRCC writes login / console-open / console-close / chat events (and any client-emitted activity, when the per-user toggle is on) to a weekly-rotated file. |
+| `NRCC_LOGS_DIR`           | `./logs`           | Directory for the weekly log files (`nrcc-YYYY-Www.log`). Created on first start when `NRCC_LOGGING=true`. |
+| `NRCC_UPDATE_ENABLED`     | `true`             | Master switch for the in-app **Update** button (Settings → Build). Set to `false` on locked-down installs to hide the button and refuse `/api/update/*` calls. |
+| `NRCC_UPDATE_REPO`        | `https://github.com/script-repo/ntnx-console-client` | GitHub repo (HTTPS clone URL) the updater fetches `build.info` from and clones / pulls. |
+| `NRCC_UPDATE_BRANCH`      | `main`             | Branch the updater compares against and resets / clones to. |
+| `NRCC_UPDATE_CHECK_TTL_MS`| `300000` (5 min)   | Cache TTL for `/api/update/check` results. Multiple users sharing the install and the per-client background poll all share this cache so `raw.githubusercontent.com` is hit at most once per TTL window. The Update button bypasses the cache via `?force=1`. Minimum 60 000 ms. |
 
 ### Run
 
@@ -208,6 +214,175 @@ See [Multi-user deployment](#multi-user-deployment) for the optional companion e
 - Paste also seeds the VNC clipboard via `clipboardPasteFrom`, so guests that *do* have a clipboard agent can use the host clipboard normally as well.
 - <kbd>Esc</kbd> closes the **Show All** grid overlay.
 - In the **Wall of Eyes** popup window, <kbd>Esc</kbd> exits browser fullscreen (the standard Fullscreen API behaviour); the toolbar (with **Full Screen** and **Close**) auto-fades after ~2.5 s of mouse-idle while in fullscreen and reappears on any movement.
+
+---
+
+## Settings
+
+After signing in, the **gear icon** in the top right opens a settings dialog with four per-browser preferences. All four are stored in `localStorage` under the key `nrcc.userPrefs.v1` and apply immediately when you click **Save**.
+
+| Setting                     | Options                       | Default     | Notes |
+| --------------------------- | ----------------------------- | ----------- | ----- |
+| **Theme**                   | Light, Dark, Match system     | Light       | Sets `data-theme` on `<html>`; the CSS variables in `index.html` swap palette accordingly. **Match system** follows `prefers-color-scheme` and re-evaluates if the OS theme changes while the page is open. |
+| **Auto-logout after inactivity** | 15 min, 1 hour, Never    | 15 min      | When idle for the chosen interval, NRCC clears in-memory PC credentials, closes every open console tab, and returns to the sign-in screen. Activity is detected from `mousemove` / `keydown` / `mousedown` / `wheel` / `touchstart` (capture phase, so console keystrokes also count). |
+| **Record my logins and console activity** | on / off       | off         | Per-user opt-in for activity logging. Greyed out unless `NRCC_LOGGING=true` is set on the server. When on, the client adds `?clientLogging=1` to its `POST /api/log` calls; the server only honours requests that carry that query parameter. |
+| **Show beta features**      | on / off                      | off         | Reveals UI elements marked as beta in the feature-flag registry (see **Feature flags**). All current features are GA, so this toggle is a no-op until a beta feature is shipped. |
+
+### Activity logging
+
+When `NRCC_LOGGING=true` is set on the server (and the per-user toggle is on for client events), NRCC writes one JSON record per line to a weekly-rotated file:
+
+```
+${NRCC_LOGS_DIR or ./logs}/nrcc-YYYY-Www.log
+```
+
+Each record is a single JSON object:
+
+```json
+{
+  "ts": "2026-05-09T20:14:11.482Z",
+  "type": "console.open",
+  "username": "alice",
+  "sessionId": "<uuid>",
+  "pcHost": "10.38.66.7",
+  "vmUuid": "11111111-2222-3333-4444-555555555555",
+  "remoteIp": "10.42.156.18",
+  "details": { "via": "pc:10.38.66.7" }
+}
+```
+
+Server-emitted event types (always written when the master switch is on):
+
+| Type                 | When                                                                 |
+| -------------------- | -------------------------------------------------------------------- |
+| `login.success`      | `/api/pc-test` accepted the credentials.                             |
+| `login.rejected`     | `/api/pc-test` returned 401.                                          |
+| `login.unreachable`  | No probe responded (PC unreachable / wrong host).                    |
+| `logout`             | `/api/logout`.                                                       |
+| `console.open`       | `/api/console-token` produced a websocket URL.                       |
+| `console.close`      | The /ws-proxy WebSocket was torn down (includes `durationMs`).      |
+| `chat.send`          | Multi-user chat message broadcast.                                   |
+
+Client-emitted event types (require **both** `NRCC_LOGGING=true` and the per-user toggle):
+
+| Type                       | When                                          |
+| -------------------------- | --------------------------------------------- |
+| `console.paste`            | Paste finished typing into the console.       |
+| `console.ctrl-alt-del`     | Ctrl+Alt+Del button.                          |
+| `console.screenshot`       | Screenshot saved.                             |
+| `console.recording.start`  | Recording started.                            |
+| `console.recording.stop`   | Recording finished and saved.                 |
+| `console.script.copy`      | A script tile was copied to the clipboard.    |
+| `settings.saved`           | Settings dialog saved.                        |
+
+The file is append-only with one line per event; nothing is rotated automatically beyond the weekly filename change. Operators are expected to ship/prune the log directory the same way they would any other application log.
+
+### Feature flags
+
+NRCC keeps a small feature-flag registry in `server.js` (`FEATURE_FLAGS`) that the server publishes via `GET /api/config`. Each flag carries a `stage` of `"ga"` or `"beta"`:
+
+```javascript
+const FEATURE_FLAGS = {
+  chat:        { stage: "ga", description: "Multi-user VM chat panel" },
+  screenshots: { stage: "ga", description: "Per-VM screenshot capture and library" },
+  recordings:  { stage: "ga", description: "Per-VM video recording (10 fps WebM)" },
+  scripts:     { stage: "ga", description: "Global script library with click-to-clipboard" },
+  logging:     { stage: "ga", description: "Optional activity logging (server-gated)" },
+  settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" }
+};
+```
+
+Conventions:
+
+- **All existing features are GA** at the time of writing.
+- A new feature lands as `{ stage: "beta" }`. UI elements that are only meaningful when the feature is on get a `data-feature="<id>"` attribute. The client's `featureFlags.refresh()` hides those elements unless `userPrefs.betaFeaturesEnabled` is true.
+- Code paths that aren't tied to a single DOM element can call `featureFlags.isEnabled("<id>")` to gate themselves.
+- Promote a feature to GA by changing `stage` to `"ga"` in the registry. Beta-only `data-feature` markers can stay; `featureFlags.refresh()` will simply leave them visible.
+
+---
+
+## Versioning
+
+NRCC uses a date-stamped, daily-counter build identifier:
+
+```
+Major.Minor.Patch-YYYYMMDD-NN
+```
+
+For example, `0.5.0-20260509-01` is the **first build** of `0.5.0` cut on **9 May 2026**. Cut a second build the same day and it becomes `0.5.0-20260509-02`. The first build the next day rolls the date and resets the counter (e.g. `0.5.0-20260510-01`).
+
+The active build is shown:
+
+- in the **NRCC startup log** (`NRCC 0.5.0-20260509-01 running at http://localhost:3000`),
+- in the **Settings dialog footer** (gear icon in the top right),
+- in `GET /api/config` as `appVersion`,
+- in `package.json` as the canonical `version` field,
+- in `build.info` at the repo / install root, as a single trimmed line. This is the file the in-app updater reads from GitHub.
+
+The server prefers `build.info` when both files exist, so a self-update that swaps the file tree without re-running `npm install` still reports the correct version.
+
+### Cutting a new build
+
+A small helper bumps the counter in `package.json` so the three surfaces above stay in sync from a single edit:
+
+```bash
+npm run bump-build              # roll today-NN (or 01 if today's date isn't yet present)
+npm run bump-build -- --patch   # bump patch, then today-01
+npm run bump-build -- --minor   # bump minor, zero patch, then today-01
+npm run bump-build -- --major   # bump major, zero minor + patch, then today-01
+npm run bump-build -- --set 0.6.0-20260512-03   # set explicitly
+```
+
+The script edits `package.json` in place and prints `bump-build: <old> -> <new>`; it does **not** create a git commit. Wrap it in your release flow if you want a tagged commit, e.g.:
+
+```bash
+npm run bump-build -- --patch
+git add package.json
+git commit -m "Release $(node -p "require('./package.json').version")"
+git tag "v$(node -p "require('./package.json').version")"
+```
+
+### Convention
+
+- Bump **patch** for bug fixes that don't change behavior.
+- Bump **minor** for new features that are backwards-compatible.
+- Bump **major** for breaking changes (API renames, removed env vars, etc.).
+- Cut a fresh **build** (`-NN` increment) for any rebuild of the same source on the same day, even if the patch level is unchanged. This is what differentiates two pushes of the same hotfix.
+
+### Self-update
+
+A blue **Update** button sits beside the build number in the Settings dialog, and a small blue dot appears on the gear icon in the top-right whenever the background poll detects a newer build on GitHub. Clicking the button:
+
+1. `POST /api/update/check?force=1` — server fetches `build.info` from `<NRCC_UPDATE_REPO>/<NRCC_UPDATE_BRANCH>` over `raw.githubusercontent.com` and compares it to the running `APP_VERSION`.
+2. If you are already on the latest build, an inline confirmation appears (**“You are running the latest build!”**) and nothing else happens.
+3. If a newer build exists, NRCC asks you to confirm the upgrade. On Yes it sends `POST /api/update/install`, the server replies `202 Accepted`, and the upgrade runs in the background. The browser polls `/api/health` until the server comes back, then reloads the page.
+
+The gear-icon badge is driven by an automatic background probe that runs every 30 minutes (with an initial probe ~5 s after login). The probe shares the server-side cache (`NRCC_UPDATE_CHECK_TTL_MS`, default 5 min) so multiple users open in the same install don't multiply the GitHub fetches. The dot disappears as soon as you complete the upgrade and `APP_VERSION` catches up.
+
+Two upgrade strategies are auto-selected:
+
+- **In-place git** (default when `<install>/.git` exists): the server runs `git fetch --depth 1 origin <branch>` followed by `git reset --hard origin/<branch>`. The working tree is reset to match the remote tip exactly, so any local edits to repo-tracked files are discarded — preserve them in a fork or a branch first.
+- **Clone-and-swap** (when there is no `.git` directory, e.g. inside a `kubectl cp`-deployed pod): the server runs `git clone --depth 1 --branch <branch> <repo> <tmpdir>` and then copies each top-level entry from `<tmpdir>` over the install dir, **skipping** anything in the preserve list (`logs/`, `recordings/`, `screenshots/`, `scripts/`, `certs/`, `node_modules/`, `.env`, `build.info`). The fresh `build.info` is then copied across so the version stamp matches what just landed.
+
+Both strategies are followed by a dependency re-resolve and `process.exit(0)`. The dependency step prefers `npm ci --omit=dev` when a `package-lock.json` is present (it deletes `node_modules/` and rebuilds from the lockfile exactly — fastest and safest after a full file swap) and falls back to `npm install --omit=dev` when there is no lockfile. **A process supervisor must restart the node process** (PM2, systemd, a Kubernetes Deployment with `restartPolicy: Always`, etc.) — `npm start` invoked directly in a terminal will simply exit.
+
+Prerequisites:
+
+- `git` must be on the server's `PATH`.
+- The user that runs `node server.js` needs write access to the install directory (and to `node_modules/`, where `npm install` writes).
+- The host must have outbound HTTPS access to `github.com` and `raw.githubusercontent.com`.
+
+#### Kubernetes caveat
+
+Inside an ephemeral pod, the upgraded files live on the container's writable layer. `process.exit(0)` triggers the kubelet to start a **new** pod from the **original** image, throwing the upgraded files away. To make self-update stick in Kubernetes, mount the install directory on a `PersistentVolumeClaim` (the cluster used in this project's manifests already does this for `/app`). Without a PVC the Update button will appear to succeed and the build number will then revert to whatever ships in the image.
+
+#### Auth and rollback
+
+- Any logged-in user can trigger an upgrade. This matches the rest of the multi-user trust model (everyone in the room is an admin).
+- Rollback is not built in. If a bad build ships, push a fix and run the upgrade again, or roll the Kubernetes Deployment back manually. NRCC does not snapshot the previous tree.
+- The server refuses concurrent upgrades; a second click while one is in flight returns `409 Conflict`.
+
+To disable the feature entirely (e.g. on a locked-down install), set `NRCC_UPDATE_ENABLED=false`. The Update button is hidden and `/api/update/check` and `/api/update/install` return `503 Service Unavailable`.
 
 ---
 
