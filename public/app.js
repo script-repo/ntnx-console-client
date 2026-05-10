@@ -110,6 +110,34 @@ const settingsVersionLabel = document.getElementById("settingsVersionLabel");
 const loginVersionLabel = document.getElementById("loginVersionLabel");
 const settingsUpdateBtn = document.getElementById("settingsUpdateBtn");
 const settingsUpdateStatus = document.getElementById("settingsUpdateStatus");
+const settingsLogRetentionInput = document.getElementById("settingsLogRetentionDays");
+const settingsLogRetentionDisabledHint = document.getElementById("settingsLogRetentionDisabledHint");
+const settingsViewLogsBtn = document.getElementById("settingsViewLogsBtn");
+
+const logsModal = document.getElementById("logsModal");
+const logsFileSelect = document.getElementById("logsFile");
+const logsTypeSelect = document.getElementById("logsType");
+const logsUserInput = document.getElementById("logsUser");
+const logsSearchInput = document.getElementById("logsSearch");
+const logsRefreshBtn = document.getElementById("logsRefreshBtn");
+const logsDownloadBtn = document.getElementById("logsDownloadBtn");
+const logsCloseBtn = document.getElementById("logsCloseBtn");
+const logsStatus = document.getElementById("logsStatus");
+const logsTableBody = document.getElementById("logsTableBody");
+const logsPrevBtn = document.getElementById("logsPrevBtn");
+const logsNextBtn = document.getElementById("logsNextBtn");
+const logsPageInfo = document.getElementById("logsPageInfo");
+
+const LOGS_PAGE_SIZE = 200;
+let _logsState = {
+  files: [],
+  currentFile: null,
+  offset: 0,
+  total: 0,
+  loading: false,
+  pendingFilterTimer: null
+};
+let _serverConfigCache = null; // last GET /api/server-config response
 
 const sshCredsModal = document.getElementById("sshCredsModal");
 const sshCredsTargetLabel = document.getElementById("sshCredsTarget");
@@ -3269,6 +3297,22 @@ function openSettingsModal() {
   refreshSettingsServerHints();
   refreshSettingsVersionLabel();
   refreshSettingsUpdateButton();
+  // Pull the latest server-config every time the dialog opens so two
+  // admins don't fight over a stale value. We seed the input with
+  // whatever we have cached so the field isn't blank during the
+  // round-trip.
+  if (settingsLogRetentionInput) {
+    if (_serverConfigCache && Number.isFinite(_serverConfigCache.logRetentionDays)) {
+      settingsLogRetentionInput.value = String(_serverConfigCache.logRetentionDays);
+    }
+    loadServerConfig().then(() => {
+      if (_serverConfigCache && Number.isFinite(_serverConfigCache.logRetentionDays)) {
+        settingsLogRetentionInput.value = String(_serverConfigCache.logRetentionDays);
+      }
+      refreshLogRetentionDisabledHint();
+    }).catch(() => { /* ignore -- hint already shows server availability */ });
+  }
+  refreshLogRetentionDisabledHint();
   settingsModal.classList.add("open");
   setTimeout(() => settingsThemeInput.focus(), 50);
 }
@@ -3277,7 +3321,7 @@ function closeSettingsModal() {
   if (settingsModal) settingsModal.classList.remove("open");
 }
 
-function saveSettingsModal() {
+async function saveSettingsModal() {
   const themeVal = settingsThemeInput.value;
   const timeoutVal = Number(settingsIdleTimeoutInput.value);
   const loggingVal = Boolean(settingsLoggingEnabledInput.checked && appConfig.loggingAvailable);
@@ -3288,20 +3332,83 @@ function saveSettingsModal() {
     loggingEnabled: loggingVal,
     betaFeaturesEnabled: betaVal
   });
+  // Persist server-config separately. We do this AFTER the per-user
+  // save so a server-config failure (e.g. read-only PVC) doesn't
+  // strand the local settings.
+  let serverConfigError = null;
+  if (settingsLogRetentionInput) {
+    const raw = Number(settingsLogRetentionInput.value);
+    const next = Number.isFinite(raw) ? Math.max(0, Math.min(3650, Math.floor(raw))) : null;
+    if (next !== null && (!_serverConfigCache || _serverConfigCache.logRetentionDays !== next)) {
+      try {
+        const resp = await fetch("/api/server-config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ logRetentionDays: next })
+        });
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          serverConfigError = data.error || `HTTP ${resp.status}`;
+        } else {
+          const data = await resp.json().catch(() => ({}));
+          if (_serverConfigCache) _serverConfigCache.logRetentionDays = data.logRetentionDays;
+        }
+      } catch (err) {
+        serverConfigError = err.message;
+      }
+    }
+  }
   closeSettingsModal();
-  setStatus("Settings updated.");
+  if (serverConfigError) {
+    setStatus(`Settings saved, but server-config failed: ${serverConfigError}`, { error: true });
+  } else {
+    setStatus("Settings updated.");
+  }
   logEvent("settings.saved", null, {
     theme: userPrefs.theme,
     idleTimeoutMin: userPrefs.idleTimeoutMin,
     loggingEnabled: userPrefs.loggingEnabled,
-    betaFeaturesEnabled: userPrefs.betaFeaturesEnabled
+    betaFeaturesEnabled: userPrefs.betaFeaturesEnabled,
+    logRetentionDays: _serverConfigCache?.logRetentionDays ?? null
   });
+}
+
+// Pull /api/server-config and cache it. Returns the cached object so
+// the caller can chain off it.
+async function loadServerConfig() {
+  try {
+    const resp = await fetch("/api/server-config");
+    if (!resp.ok) {
+      _serverConfigCache = null;
+      return null;
+    }
+    _serverConfigCache = await resp.json();
+    return _serverConfigCache;
+  } catch (_e) {
+    _serverConfigCache = null;
+    return null;
+  }
+}
+
+function refreshLogRetentionDisabledHint() {
+  if (!settingsLogRetentionDisabledHint) return;
+  const loggingOn = Boolean(appConfig.loggingAvailable);
+  settingsLogRetentionDisabledHint.hidden = loggingOn;
+  if (settingsLogRetentionInput) {
+    settingsLogRetentionInput.disabled = !loggingOn;
+  }
 }
 
 if (settingsBtn) settingsBtn.addEventListener("click", openSettingsModal);
 if (settingsCancelBtn) settingsCancelBtn.addEventListener("click", closeSettingsModal);
 if (settingsSaveBtn) settingsSaveBtn.addEventListener("click", saveSettingsModal);
 if (settingsUpdateBtn) settingsUpdateBtn.addEventListener("click", handleUpdateClick);
+if (settingsViewLogsBtn) {
+  settingsViewLogsBtn.addEventListener("click", () => {
+    closeSettingsModal();
+    openLogsModal();
+  });
+}
 if (settingsModal) {
   settingsModal.addEventListener("click", (event) => {
     if (event.target === settingsModal) closeSettingsModal();
@@ -3310,6 +3417,328 @@ if (settingsModal) {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && settingsModal && settingsModal.classList.contains("open")) {
     closeSettingsModal();
+  }
+});
+
+// =====================================================================
+// Logs viewer modal.
+// =====================================================================
+//
+// Loads /api/logs/files into the file dropdown, then /api/logs?file=
+// for each selection. Filter changes debounce so the user can type
+// freely without firing a request per keystroke. The table renders
+// only the current page; raw JSON for a row is exposed via an
+// inline "details" expander.
+
+function openLogsModal() {
+  if (!logsModal) return;
+  logsModal.classList.add("open");
+  // Reset pagination/filter state on each open so the operator gets
+  // a clean view.
+  _logsState.offset = 0;
+  refreshLogsFiles().catch((err) => {
+    setLogsStatus(`Failed to list log files: ${err.message}`, { kind: "error" });
+  });
+}
+
+function closeLogsModal() {
+  if (logsModal) logsModal.classList.remove("open");
+}
+
+function setLogsStatus(text, opts) {
+  if (!logsStatus) return;
+  logsStatus.textContent = text;
+  logsStatus.classList.remove("logs-status-warn", "logs-status-error");
+  if (opts?.kind === "warn") logsStatus.classList.add("logs-status-warn");
+  if (opts?.kind === "error") logsStatus.classList.add("logs-status-error");
+}
+
+async function refreshLogsFiles() {
+  if (!logsFileSelect) return;
+  setLogsStatus("Loading available files...");
+  const resp = await fetch("/api/logs/files");
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${resp.status}`);
+  }
+  const data = await resp.json();
+  if (!data.enabled) {
+    logsFileSelect.innerHTML = "";
+    _logsState.files = [];
+    _logsState.currentFile = null;
+    renderLogsRows([], 0);
+    setLogsStatus("Logging is disabled at the server level. No files to show.", { kind: "warn" });
+    updatePagination();
+    return;
+  }
+  _logsState.files = Array.isArray(data.files) ? data.files : [];
+  logsFileSelect.innerHTML = "";
+  if (!_logsState.files.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(no log files yet)";
+    logsFileSelect.appendChild(opt);
+    _logsState.currentFile = null;
+    renderLogsRows([], 0);
+    setLogsStatus(
+      `Logging is on, retention ${data.retentionDays}d. No log files have been written yet.`,
+      { kind: "warn" }
+    );
+    updatePagination();
+    return;
+  }
+  for (const f of _logsState.files) {
+    const opt = document.createElement("option");
+    opt.value = f.name;
+    const sizeKb = (f.sizeBytes / 1024).toFixed(1);
+    opt.textContent = `${f.name}  (${sizeKb} KB)`;
+    logsFileSelect.appendChild(opt);
+  }
+  // Default to the newest file.
+  _logsState.currentFile = _logsState.files[0].name;
+  logsFileSelect.value = _logsState.currentFile;
+  setLogsStatus(`${_logsState.files.length} file(s) available. Retention ${data.retentionDays}d.`);
+  await loadLogsPage();
+}
+
+async function loadLogsPage() {
+  if (!logsTableBody) return;
+  if (!_logsState.currentFile) {
+    renderLogsRows([], 0);
+    updatePagination();
+    return;
+  }
+  if (_logsState.loading) return;
+  _logsState.loading = true;
+  setLogsStatus("Loading entries...");
+  try {
+    const params = new URLSearchParams();
+    params.set("file", _logsState.currentFile);
+    params.set("offset", String(_logsState.offset));
+    params.set("limit", String(LOGS_PAGE_SIZE));
+    const t = (logsTypeSelect?.value || "").trim();
+    if (t) params.set("type", t);
+    const u = (logsUserInput?.value || "").trim();
+    if (u) params.set("user", u);
+    const q = (logsSearchInput?.value || "").trim();
+    if (q) params.set("q", q);
+    const resp = await fetch(`/api/logs?${params.toString()}`);
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    _logsState.total = data.total || 0;
+    syncLogsTypeOptions(data.types || [], t);
+    renderLogsRows(data.entries || [], _logsState.total);
+    if (!_logsState.total) {
+      setLogsStatus("No entries match the current filters.", { kind: "warn" });
+    } else {
+      setLogsStatus(`${_logsState.total} matching entries in ${_logsState.currentFile}.`);
+    }
+  } catch (err) {
+    renderLogsRows([], 0);
+    setLogsStatus(`Failed to load entries: ${err.message}`, { kind: "error" });
+  } finally {
+    _logsState.loading = false;
+    updatePagination();
+  }
+}
+
+function syncLogsTypeOptions(types, keepValue) {
+  if (!logsTypeSelect) return;
+  // Preserve the current selection if it's still present in the new
+  // set; otherwise fall back to "all".
+  const current = keepValue || logsTypeSelect.value;
+  logsTypeSelect.innerHTML = "";
+  const allOpt = document.createElement("option");
+  allOpt.value = "";
+  allOpt.textContent = "All types";
+  logsTypeSelect.appendChild(allOpt);
+  for (const t of types) {
+    const opt = document.createElement("option");
+    opt.value = t;
+    opt.textContent = t;
+    logsTypeSelect.appendChild(opt);
+  }
+  if (current && types.includes(current)) {
+    logsTypeSelect.value = current;
+  } else {
+    logsTypeSelect.value = "";
+  }
+}
+
+function renderLogsRows(entries, total) {
+  if (!logsTableBody) return;
+  logsTableBody.innerHTML = "";
+  if (!entries.length) {
+    const tr = document.createElement("tr");
+    tr.className = "logs-empty";
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.textContent = total ? "No entries on this page." : "No entries.";
+    tr.appendChild(td);
+    logsTableBody.appendChild(tr);
+    return;
+  }
+  for (const entry of entries) {
+    const tr = document.createElement("tr");
+    const tds = [
+      formatLogsCell("ts", entry.ts || ""),
+      formatLogsCell("type", entry.type || (entry._raw ? "raw" : "")),
+      formatLogsCell("user", entry.username || ""),
+      formatLogsCell("pcHost", entry.pcHost || ""),
+      formatLogsCell("vmUuid", entry.vmUuid || ""),
+      formatLogsCell("details", entry)
+    ];
+    for (const td of tds) tr.appendChild(td);
+    logsTableBody.appendChild(tr);
+  }
+}
+
+function formatLogsCell(kind, value) {
+  const td = document.createElement("td");
+  if (kind === "ts") {
+    td.className = "logs-cell-time";
+    td.textContent = String(value).replace("T", " ").replace(/\.\d+Z$/, "Z");
+    return td;
+  }
+  if (kind === "type") {
+    td.className = "logs-cell-type";
+    if (typeof value === "string" && /error/i.test(value)) td.dataset.kind = "error";
+    if (typeof value === "string" && /(security|update|server-config|login)/i.test(value)) td.dataset.kind = "security";
+    td.textContent = String(value);
+    return td;
+  }
+  if (kind === "details") {
+    td.className = "logs-cell-details";
+    // Build a compact summary line plus a "show raw" toggle that
+    // expands to the full JSON. The summary picks the most
+    // user-meaningful keys to keep the row shallow.
+    const entry = value && typeof value === "object" ? value : {};
+    const summaryBits = [];
+    if (entry._raw) summaryBits.push(`(unparseable) ${String(entry._raw).slice(0, 200)}`);
+    if (entry.host) summaryBits.push(`host=${entry.host}`);
+    if (entry.protocol) summaryBits.push(`proto=${entry.protocol}`);
+    if (entry.details && typeof entry.details === "object") {
+      const d = entry.details;
+      if (d.action) summaryBits.push(`action=${d.action}`);
+      if (d.field) summaryBits.push(`field=${d.field}`);
+      if (d.from !== undefined) summaryBits.push(`from=${JSON.stringify(d.from)}`);
+      if (d.to !== undefined) summaryBits.push(`to=${JSON.stringify(d.to)}`);
+      if (d.targetIp) summaryBits.push(`ip=${d.targetIp}`);
+      if (d.preview) summaryBits.push(`preview=${String(d.preview).slice(0, 80)}`);
+    }
+    if (entry.remoteIp) summaryBits.push(`from=${entry.remoteIp}`);
+    const summarySpan = document.createElement("span");
+    summarySpan.textContent = summaryBits.join("  |  ") || "(no details)";
+    td.appendChild(summarySpan);
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "logs-detail-toggle";
+    toggle.textContent = "  show raw";
+    let expanded = false;
+    const pre = document.createElement("pre");
+    pre.style.margin = "6px 0 0";
+    pre.style.fontSize = "11.5px";
+    pre.style.color = "var(--ntx-text-muted)";
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.wordBreak = "break-word";
+    pre.hidden = true;
+    pre.textContent = JSON.stringify(entry, null, 2);
+    toggle.addEventListener("click", () => {
+      expanded = !expanded;
+      pre.hidden = !expanded;
+      toggle.textContent = expanded ? "  hide raw" : "  show raw";
+    });
+    td.appendChild(toggle);
+    td.appendChild(pre);
+    return td;
+  }
+  td.textContent = String(value);
+  return td;
+}
+
+function updatePagination() {
+  if (!logsPrevBtn || !logsNextBtn || !logsPageInfo) return;
+  const total = _logsState.total;
+  const offset = _logsState.offset;
+  const pageStart = total ? offset + 1 : 0;
+  const pageEnd = Math.min(total, offset + LOGS_PAGE_SIZE);
+  logsPageInfo.textContent = total
+    ? `${pageStart}-${pageEnd} of ${total}`
+    : "0 of 0";
+  logsPrevBtn.disabled = offset <= 0 || _logsState.loading;
+  logsNextBtn.disabled = offset + LOGS_PAGE_SIZE >= total || _logsState.loading;
+}
+
+function bumpLogsPage(delta) {
+  const next = Math.max(0, _logsState.offset + delta * LOGS_PAGE_SIZE);
+  if (next === _logsState.offset) return;
+  _logsState.offset = next;
+  loadLogsPage();
+}
+
+function scheduleLogsFilterReload() {
+  if (_logsState.pendingFilterTimer) clearTimeout(_logsState.pendingFilterTimer);
+  _logsState.pendingFilterTimer = setTimeout(() => {
+    _logsState.offset = 0;
+    loadLogsPage();
+  }, 220);
+}
+
+if (logsFileSelect) {
+  logsFileSelect.addEventListener("change", () => {
+    _logsState.currentFile = logsFileSelect.value || null;
+    _logsState.offset = 0;
+    loadLogsPage();
+  });
+}
+if (logsTypeSelect) logsTypeSelect.addEventListener("change", scheduleLogsFilterReload);
+if (logsUserInput) logsUserInput.addEventListener("input", scheduleLogsFilterReload);
+if (logsSearchInput) logsSearchInput.addEventListener("input", scheduleLogsFilterReload);
+if (logsRefreshBtn) {
+  logsRefreshBtn.addEventListener("click", () => {
+    refreshLogsFiles().catch((err) => setLogsStatus(`Failed: ${err.message}`, { kind: "error" }));
+  });
+}
+if (logsDownloadBtn) {
+  logsDownloadBtn.addEventListener("click", () => {
+    if (!_logsState.currentFile) {
+      setLogsStatus("Select a file before downloading.", { kind: "warn" });
+      return;
+    }
+    // The /api/logs endpoint already gates on auth; downloading is
+    // just a max-limit fetch with no filters that we hand to the
+    // browser as a Blob so the user gets a real Save dialog.
+    const url = `/api/logs?file=${encodeURIComponent(_logsState.currentFile)}&limit=${LOGS_PAGE_SIZE * 50}&offset=0&order=asc`;
+    fetch(url)
+      .then((r) => r.json())
+      .then((data) => {
+        const lines = (data.entries || []).map((e) => JSON.stringify(e)).join("\n") + "\n";
+        const blob = new Blob([lines], { type: "application/x-ndjson" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = _logsState.currentFile;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      })
+      .catch((err) => setLogsStatus(`Download failed: ${err.message}`, { kind: "error" }));
+  });
+}
+if (logsCloseBtn) logsCloseBtn.addEventListener("click", closeLogsModal);
+if (logsPrevBtn) logsPrevBtn.addEventListener("click", () => bumpLogsPage(-1));
+if (logsNextBtn) logsNextBtn.addEventListener("click", () => bumpLogsPage(1));
+if (logsModal) {
+  logsModal.addEventListener("click", (event) => {
+    if (event.target === logsModal) closeLogsModal();
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && logsModal && logsModal.classList.contains("open")) {
+    closeLogsModal();
   }
 });
 

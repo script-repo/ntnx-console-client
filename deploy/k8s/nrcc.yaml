@@ -31,7 +31,14 @@ spec:
   storageClassName: nutanix-volume     # change to your cluster's default if needed
   resources:
     requests:
-      storage: 5Gi
+      # 20 GiB gives enough headroom for ~weeks of recordings + retained
+      # activity logs without the operator having to expand the PVC by
+      # hand. The Nutanix CSI storage class supports online expansion
+      # (allowVolumeExpansion: true), so re-applying the manifest with
+      # a larger value resizes the volume in place -- no pod restart
+      # needed. Shrinking is NOT supported by the CSI; if you ever
+      # need to go smaller, create a new PVC + migrate.
+      storage: 20Gi
 
 ---
 # nginx sidecar that 301-redirects http://<host>:32088 traffic to
@@ -81,6 +88,16 @@ spec:
       #   imagePullSecrets:
       #     - name: ghcr-pull
       # (and create the secret with `kubectl create secret docker-registry ghcr-pull ...`)
+      securityContext:
+        # The container runs as the unprivileged `node` user (uid 1000,
+        # gid 1000) -- see Dockerfile. fsGroup tells the kubelet to
+        # recursively chgrp the mounted PVC to gid 1000 on every
+        # mount, so any cert / log / recording the app writes (and
+        # everything inherited from a previous pod that wrote as
+        # root) is group-readable by the node user. Without this,
+        # NRCC fails to read /data/certs/key.pem with EACCES.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
 
         # ----- guacd: Apache Guacamole proxy daemon (RDP backend) -----
@@ -116,6 +133,16 @@ spec:
             - { name: NRCC_GUACD_HOST,         value: "127.0.0.1" }
             - { name: NRCC_GUACD_PORT,         value: "4822" }
             - { name: NUTANIX_TLS_SKIP_VERIFY, value: "true" }
+            # Server-side master switch for activity logging. Without
+            # this set to "true" the per-user "Record my logins and
+            # console activity" toggle in Settings is greyed out --
+            # the server short-circuits POST /api/log with 204 and
+            # never writes anything to disk. Logs are written under
+            # NRCC_LOGS_DIR (/data/logs in this manifest), one file
+            # per ISO week, and only when the per-user toggle is also
+            # on. Flip to "false" if you want to lock logging off
+            # cluster-wide regardless of any user's preference.
+            - { name: NRCC_LOGGING,            value: "true" }
             # The in-app self-update flow does `git pull` against the
             # repo on disk; that doesn't apply when the code lives in
             # an immutable image. Disable the Update button in the UI

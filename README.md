@@ -131,6 +131,8 @@ copy .env.example .env       # Windows
 | `NUTANIX_API_TIMEOUT_MS`  | `30000`            | Per-request timeout (ms) for outbound calls to Prism. Increase if VM listing times out against a slow PC. |
 | `NRCC_LOGGING`            | `false`            | Master switch for activity logging. When `true`, NRCC writes login / console-open / console-close / chat events (and any client-emitted activity, when the per-user toggle is on) to a weekly-rotated file. |
 | `NRCC_LOGS_DIR`           | `./logs`           | Directory for the weekly log files (`nrcc-YYYY-Www.log`). Created on first start when `NRCC_LOGGING=true`. |
+| `NRCC_LOG_RETENTION_DAYS` | `30`               | Default automatic-pruning window for the weekly log files. Files older than this many days (by mtime) are deleted by a sweep that runs every 6 hours. `0` disables pruning entirely (keep forever). The Settings → SERVER section can override this at runtime; the chosen value is persisted to `NRCC_SERVER_CONFIG_PATH` and survives pod restarts. |
+| `NRCC_SERVER_CONFIG_PATH` | `<dirname(NRCC_LOGS_DIR)>/nrcc-server-config.json` | File where the runtime-tunable server config (currently `logRetentionDays`) is stored. The default puts it next to the data directories so it survives pod restarts on the same PVC. |
 | `NRCC_UPDATE_ENABLED`     | `true`             | Master switch for the in-app **Update** button (Settings → Build). Set to `false` on locked-down installs to hide the button and refuse `/api/update/*` calls. |
 | `NRCC_UPDATE_REPO`        | `https://github.com/script-repo/ntnx-console-client` | GitHub repo (HTTPS clone URL) the updater fetches `build.info` from and clones / pulls. |
 | `NRCC_UPDATE_BRANCH`      | `main`             | Branch the updater compares against and resets / clones to. |
@@ -291,7 +293,26 @@ Client-emitted event types (require **both** `NRCC_LOGGING=true` and the per-use
 | `console.ssh.open`         | **Beta.** Browser-side SSH WebSocket reached `ready`. |
 | `console.ssh.close`        | **Beta.** Browser-side SSH WebSocket closed (includes `code` or `reason`). |
 
-The file is append-only with one line per event; nothing is rotated automatically beyond the weekly filename change. Operators are expected to ship/prune the log directory the same way they would any other application log.
+The file is append-only with one line per event; the filename rotates weekly. NRCC also runs an automatic retention sweep every 6 hours -- any file under `NRCC_LOGS_DIR` whose `mtime` is older than `logRetentionDays` is deleted. The default is **30 days**; operators can set a different baseline with `NRCC_LOG_RETENTION_DAYS=N` (`N=0` disables pruning entirely) and any signed-in user can change the live value from **Settings → SERVER → Log retention (days)**. The chosen value is persisted to `NRCC_SERVER_CONFIG_PATH` (default: `nrcc-server-config.json` next to the data directories) so it survives pod restarts.
+
+### Activity log viewer
+
+Settings → SERVER → **Open logs viewer** opens a dedicated dialog that reads log files directly off the server (no `kubectl exec` required):
+
+- **File picker.** Lists every `nrcc-YYYY-Www.log` file in `NRCC_LOGS_DIR`, newest first, with size in KB. Selecting a different file reloads the table.
+- **Filters.** Event-type dropdown (auto-populated from the file's distinct types), username substring match, and free-text search across the raw JSON. Filters debounce so typing doesn't fire a request per keystroke.
+- **Table.** Timestamp, type, user, cluster (`pcHost`), VM UUID, and a compact details summary. Each row has an inline **show raw** toggle that reveals the full JSON for the entry.
+- **Pagination.** 200 rows per page; the footer shows the matching range out of the filtered total.
+- **Download.** Saves the currently selected file (filtered by the active filters, capped at the first 10 000 entries) as NDJSON for offline analysis.
+
+The viewer hits two endpoints, both gated on a logged-in session:
+
+```
+GET /api/logs/files
+GET /api/logs?file=<name>&offset=<n>&limit=<n>&type=<t>&user=<u>&q=<text>&order=<asc|desc>
+```
+
+`file` is validated against `^nrcc-[A-Za-z0-9_-]+\.log$` so the endpoint can never read arbitrary paths.
 
 ### Feature flags
 
@@ -671,12 +692,12 @@ NRCC ships a container image to **GitHub Container Registry** so the multi-user 
 
 For a `build.info` value of `0.6.0-20260510-02` the workflow publishes four tags so callers can pin at any granularity:
 
-| Tag                                                                       | Behaviour                                       |
-| ------------------------------------------------------------------------- | ----------------------------------------------- |
-| `ghcr.io/script-repo/ntnx-console-client:0.6.0-20260510-02`              | Immutable, exact build. Use in production.      |
-| `ghcr.io/script-repo/ntnx-console-client:0.6.0`                          | Rolls forward inside the 0.6.0 patch stream.    |
-| `ghcr.io/script-repo/ntnx-console-client:0.6`                            | Rolls forward inside the 0.6 minor stream.      |
-| `ghcr.io/script-repo/ntnx-console-client:latest`                         | Always the most recent successful publish.      |
+| Tag                                                          | Behaviour                                    |
+| ------------------------------------------------------------ | -------------------------------------------- |
+| `ghcr.io/script-repo/ntnx-console-client:0.6.0-20260510-02` | Immutable, exact build. Use in production.   |
+| `ghcr.io/script-repo/ntnx-console-client:0.6.0`             | Rolls forward inside the 0.6.0 patch stream. |
+| `ghcr.io/script-repo/ntnx-console-client:0.6`               | Rolls forward inside the 0.6 minor stream.   |
+| `ghcr.io/script-repo/ntnx-console-client:latest`            | Always the most recent successful publish.   |
 
 The workflow runs `linux/amd64` only (matches the current x86 deployment target). Add `linux/arm64` to `platforms` in `.github/workflows/publish.yml` if you need multi-arch.
 
@@ -693,31 +714,6 @@ git push origin main
 
 GitHub Actions takes ~2–3 minutes to build and push. Tail the run from the **Actions** tab.
 
-### Deploying the image to Kubernetes
-
-`deploy/k8s/nrcc.yaml` is a complete manifest (Namespace + PVC + ConfigMap + Deployment + Service) that pulls from GHCR. The first deploy:
-
-```bash
-kubectl apply -f deploy/k8s/nrcc.yaml
-```
-
-Subsequent upgrades to a specific build:
-
-```bash
-kubectl set image deployment/nrcc -n nrcc \
-  app=ghcr.io/script-repo/ntnx-console-client:0.6.0-20260510-02
-```
-
-Or, if you stayed on `:latest`, just force a re-pull:
-
-```bash
-kubectl rollout restart deployment/nrcc -n nrcc
-```
-
-User data (screenshots, recordings, scripts, certs, logs) lives on a 5 Gi PVC mounted at `/data`; the application code lives in the image, so a pod restart never loses content **and** never gets stuck waiting for a `kubectl cp`.
-
-> **Self-update is disabled in the container deployment.** The in-app Update button does a `git pull` against the source tree, which doesn't apply to an immutable image. The manifest sets `NRCC_UPDATE_ENABLED=false` so the button is hidden in the Settings panel; rolling forward is `kubectl set image` instead.
-
 ### Building locally
 
 ```bash
@@ -728,7 +724,181 @@ docker run --rm -p 8443:8443 \
   nrcc:dev
 ```
 
-The image runs as the unprivileged `node` user (uid 1000); the bind-mounted `data/` directory must be writable by that uid.
+The image runs as the unprivileged `node` user (uid 1000); the bind-mounted `data/` directory must be writable by that uid (or by gid 1000 — see the `fsGroup` note in the Kubernetes section below).
+
+---
+
+## Deploying NRCC to Kubernetes
+
+`deploy/k8s/nrcc.yaml` is a complete, single-file manifest that pulls the image from GHCR and stands up an HTTPS-fronted multi-user NRCC instance. The same file works for the first install and every subsequent upgrade.
+
+### What the manifest creates
+
+| Resource                     | Purpose                                                                            |
+| ---------------------------- | ---------------------------------------------------------------------------------- |
+| `Namespace nrcc`             | Holds everything below.                                                            |
+| `PersistentVolumeClaim nrcc-data` (5 Gi) | Mounted at `/data` for screenshots, recordings, scripts, certs, logs.  |
+| `ConfigMap nrcc-nginx-redirect` | nginx config that 301-redirects `:8080` → `https://<host>:32444`.               |
+| `Deployment nrcc`            | One pod with three containers: `guacd` (RDP backend), `app` (NRCC), `redirect` (nginx). |
+| `Service nrcc` (NodePort)    | Publishes port 8443 as **NodePort 32444** (HTTPS) and 8080 as **32088** (HTTP redirect). |
+
+### Prerequisites
+
+- A Kubernetes cluster with `kubectl` access.
+- A default StorageClass that supports `ReadWriteOnce` (the manifest references `nutanix-volume`; change to your cluster's class if different).
+- Outbound network access from your worker nodes to `ghcr.io` (the package is public — no `imagePullSecret` needed).
+- Cluster nodes that can route to the Prism Central / Prism Element addresses NRCC's users will log into.
+
+### First install
+
+```bash
+git clone https://github.com/script-repo/ntnx-console-client.git
+cd ntnx-console-client
+kubectl apply -f deploy/k8s/nrcc.yaml
+```
+
+The first apply creates the namespace, PVC, ConfigMap, Deployment, and Service. The pod typically reaches `Ready 3/3` within ~60–90 s on a warm cluster (most of that is the first `ghcr.io` pull, which is ~50 MB).
+
+Open it at:
+
+```
+https://<any-node-ip>:32444
+```
+
+The TLS cert is self-signed on first start and persisted to the PVC, so the SHA-256 fingerprint stays stable across pod restarts (you only have to accept the browser warning once per browser).
+
+### Upgrades
+
+The publish workflow rolls every release out as `:latest` (and as a pinned `0.X.Y-YYYYMMDD-NN` tag). With the default manifest (`image: ghcr.io/script-repo/ntnx-console-client:latest` + `imagePullPolicy: Always`):
+
+```bash
+# Roll forward to whatever :latest points at right now
+kubectl rollout restart deployment/nrcc -n nrcc
+```
+
+To pin to a specific build (recommended for production):
+
+```bash
+kubectl set image deployment/nrcc -n nrcc \
+  app=ghcr.io/script-repo/ntnx-console-client:0.6.0-20260510-02
+```
+
+Watch the rollout:
+
+```bash
+kubectl rollout status deployment/nrcc -n nrcc
+kubectl get pods -n nrcc -w
+```
+
+The Deployment uses a **`Recreate`** strategy because the `nrcc-data` PVC is `ReadWriteOnce` — only one pod can mount it at a time, so a rolling update would block on Multi-Attach. Expect ~10–15 s of downtime per upgrade.
+
+### Rollback
+
+```bash
+kubectl rollout undo deployment/nrcc -n nrcc                # back to the previous image
+kubectl rollout history deployment/nrcc -n nrcc             # list past revisions
+kubectl rollout undo deployment/nrcc -n nrcc --to-revision=N
+```
+
+The `nrcc-data` PVC is unaffected by image rollbacks, so user content (screenshots, recordings, scripts) is preserved.
+
+### Self-update is disabled in the container deployment
+
+The in-app **Update** button does a `git pull` against the source tree on disk, which doesn't apply to an immutable image. The manifest sets `NRCC_UPDATE_ENABLED=false` so the button is hidden in the Settings panel. To upgrade NRCC in Kubernetes, use `kubectl set image` (above) — that's the supported path.
+
+### Common gotchas
+
+#### `EACCES: permission denied, open '/data/certs/key.pem'`
+
+The container runs as uid 1000 (`node`). If the `/data` PVC was previously mounted by a root-running pod (e.g., the legacy `wait for /app/server.js` deployment that this manifest replaces), the cert files will be `0600 root:root` and unreadable by uid 1000.
+
+The manifest sets `securityContext.fsGroup: 1000` so the kubelet recursively `chgrp`s the PVC contents on every mount. If you've disabled that for some reason, you can also run:
+
+```bash
+kubectl exec -n nrcc deploy/nrcc -c app -- sh -c 'rm -f /data/certs/*.pem'
+kubectl rollout restart deployment/nrcc -n nrcc
+```
+
+NRCC will regenerate self-signed certs on next start, owned by `node`.
+
+#### Old `command:` field carried over after `kubectl apply`
+
+`kubectl apply` uses **strategic-merge patch** for Deployments. If you migrate from a Deployment that had an inline `command:` override (or a `volumeMount` the new manifest doesn't list), the apply *keeps* those fields — you'll see the wrong command running and a phantom volume mounted. The clean path:
+
+```bash
+kubectl delete deployment nrcc -n nrcc      # PVC + Service stay
+kubectl apply -f deploy/k8s/nrcc.yaml       # full re-create from manifest
+```
+
+The PVC and Service survive because the delete is scoped to the Deployment.
+
+#### Image pulled but old code running
+
+If `/data` (or any other in-image path) is overlaid by a PVC mount that already contains a `server.js` and `node_modules/`, the kernel's bind-mount will **shadow** the image's contents. NRCC's image only mounts `/data` (not `/app`), so this is a non-issue with the supplied manifest, but worth knowing if you customise.
+
+### Migrating from a manual `kubectl cp` install
+
+The legacy install style was: bare `node:20-alpine` image with an inline `until [ -f /app/server.js ]; do sleep 2; done` script, code uploaded into the pod via `kubectl cp`. To migrate to the GHCR image **without losing user data**:
+
+1. Inventory the old PVC's contents (so you know what's worth copying):
+
+   ```bash
+   kubectl exec -n nrcc deploy/nrcc -c app -- sh -c 'ls -la /app/screenshots /app/recordings /app/scripts /app/certs 2>/dev/null'
+   ```
+
+2. Apply the new manifest. The new PVC (`nrcc-data`) is created alongside the old one (`nrcc-app`); the running pod is replaced by a fresh one mounting only `nrcc-data`:
+
+   ```bash
+   kubectl delete deployment nrcc -n nrcc
+   kubectl apply -f deploy/k8s/nrcc.yaml
+   ```
+
+3. Copy the user-data subdirectories from the old PVC into the new one. Easiest with a one-shot helper pod that mounts both:
+
+   ```yaml
+   apiVersion: v1
+   kind: Pod
+   metadata: { name: pvc-migrate, namespace: nrcc }
+   spec:
+     restartPolicy: Never
+     containers:
+       - name: copy
+         image: alpine:3
+         command: ["sh","-c","cp -av /old/screenshots /new/ && cp -av /old/recordings /new/ && cp -av /old/scripts /new/ && chown -R 1000:1000 /new && sleep 5"]
+         volumeMounts:
+           - { name: old, mountPath: /old }
+           - { name: new, mountPath: /new }
+     volumes:
+       - { name: old, persistentVolumeClaim: { claimName: nrcc-app  } }
+       - { name: new, persistentVolumeClaim: { claimName: nrcc-data } }
+   ```
+
+   ⚠️ The old `nrcc-app` PVC and the live NRCC pod both want exclusive access (RWO); scale the Deployment to `0` first and back to `1` after the migrate pod completes.
+
+4. Once the new pod is happy and you've verified the data is intact, delete the old PVC:
+
+   ```bash
+   kubectl delete pvc nrcc-app -n nrcc
+   ```
+
+If you don't care about preserving the old data (it's all dev/test), skip steps 1–3.
+
+### Customising the manifest
+
+The fork-friendly substitutions in `deploy/k8s/nrcc.yaml`:
+
+- **Image org** — change `script-repo` to your GitHub user/org throughout. The publish workflow already uses `${{ github.repository_owner }}` so it follows your fork automatically.
+- **NodePorts** — `32444` (HTTPS) and `32088` (HTTP redirect). Change to whatever your cluster's NodePort range allows. If you also change the HTTPS port, update the redirect target in the `nrcc-nginx-redirect` ConfigMap.
+- **Storage** — `20Gi` PVC on `nutanix-volume`. The Nutanix CSI storage class has `allowVolumeExpansion: true`, so growing this in the manifest and re-applying expands the volume online (no pod restart required, beyond a one-time filesystem resize on the next pod re-schedule). The recording size limits in `.env.example` (`NRCC_RECORDING_MAX_BYTES`, `NRCC_RECORDING_MAX_PER_VM`) and the configurable activity-log retention (`NRCC_LOG_RETENTION_DAYS`, default 30 days) keep growth bounded.
+- **Probes / limits** — defaults are sized for a small team; raise CPU / memory if you see throttling under load.
+
+### Uninstall
+
+```bash
+kubectl delete -f deploy/k8s/nrcc.yaml      # removes Deployment, Service, ConfigMap, PVC, Namespace
+```
+
+The PVC's underlying storage class (`Delete` reclaim policy on `nutanix-volume`) deletes the backing volume too. If you want to keep user data, edit the PVC reclaim policy to `Retain` *before* running the delete.
 
 ---
 

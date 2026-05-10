@@ -74,6 +74,32 @@ const SCRIPT_MAX_BYTES = Math.max(1024, Number(process.env.NRCC_SCRIPT_MAX_BYTES
 const LOGGING_ENABLED = String(process.env.NRCC_LOGGING || "").toLowerCase() === "true";
 const LOGS_DIR = path.resolve(process.env.NRCC_LOGS_DIR || "./logs");
 
+// Default retention in days for the weekly log files. Files older
+// than this (by mtime) are deleted by the periodic sweep. The value
+// can be overridden at runtime via the SERVER section of the
+// Settings dialog (persisted to <SERVER_CONFIG_PATH>) -- the env var
+// only sets the default that ships with a fresh deployment. A value
+// of 0 disables pruning entirely (keep forever).
+const LOG_RETENTION_DAYS_DEFAULT = Math.max(
+  0,
+  Number.isFinite(Number(process.env.NRCC_LOG_RETENTION_DAYS))
+    ? Number(process.env.NRCC_LOG_RETENTION_DAYS)
+    : 30
+);
+const LOG_RETENTION_DAYS_MAX = 3650; // ten years; clamps any UI mistake
+
+// Server-wide persistent config. Anything that an operator may want
+// to tweak post-deploy without redeploying lives here. The file is
+// written next to the data dirs (so it survives pod restarts on the
+// same PVC) and is loaded once at startup, then re-loaded on every
+// PUT /api/server-config. We store ONLY values that the env var
+// defaults can be overridden by; the env var remains the source of
+// the initial value if the file doesn't exist yet.
+const SERVER_CONFIG_PATH = path.resolve(
+  process.env.NRCC_SERVER_CONFIG_PATH ||
+    path.join(path.dirname(LOGS_DIR), "nrcc-server-config.json")
+);
+
 // In-app updater configuration. Defaults point at the canonical public
 // repo so a fresh install can self-update out of the box; an operator
 // can pin a fork or a feature branch via env, or disable the feature
@@ -296,6 +322,117 @@ function appendLogForReq(req, entry) {
     pcHost: entry.pcHost || req.nrccSession?.pcHost || null,
     remoteIp: entry.remoteIp || req.ip || null
   });
+}
+
+// =====================================================================
+// Server-wide runtime config (persisted to SERVER_CONFIG_PATH).
+// =====================================================================
+//
+// Right now the file only carries `logRetentionDays`; new fields can
+// land here without a manifest change. The persistence format is a
+// plain JSON object so an operator can sed it in an emergency.
+
+const _serverConfigDefaults = Object.freeze({
+  logRetentionDays: LOG_RETENTION_DAYS_DEFAULT
+});
+
+let _serverConfig = { ..._serverConfigDefaults };
+
+function clampLogRetentionDays(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return 0;
+  return Math.min(LOG_RETENTION_DAYS_MAX, Math.floor(v));
+}
+
+function loadServerConfig() {
+  try {
+    if (!fs.existsSync(SERVER_CONFIG_PATH)) return;
+    const raw = fs.readFileSync(SERVER_CONFIG_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      if ("logRetentionDays" in parsed) {
+        _serverConfig.logRetentionDays = clampLogRetentionDays(parsed.logRetentionDays);
+      }
+    }
+  } catch (err) {
+    console.warn(`[server-config] failed to read ${SERVER_CONFIG_PATH}: ${err.message} (using defaults)`);
+  }
+}
+
+function saveServerConfig() {
+  try {
+    fs.mkdirSync(path.dirname(SERVER_CONFIG_PATH), { recursive: true });
+    // Write to a temp file then rename, so a partial write can never
+    // produce a half-parsed config on the next boot.
+    const tmp = `${SERVER_CONFIG_PATH}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(_serverConfig, null, 2) + "\n", "utf8");
+    fs.renameSync(tmp, SERVER_CONFIG_PATH);
+    return true;
+  } catch (err) {
+    console.warn(`[server-config] failed to write ${SERVER_CONFIG_PATH}: ${err.message}`);
+    return false;
+  }
+}
+
+function getServerConfig() {
+  return { ..._serverConfig };
+}
+
+// Load the persisted overrides on boot so a pod restart picks up
+// whatever the last admin set in the Settings dialog.
+loadServerConfig();
+
+// =====================================================================
+// Activity log retention sweep
+// =====================================================================
+//
+// Walks LOGS_DIR and deletes any *.log file whose mtime is older than
+// the configured retention window. We use mtime rather than parsing
+// the ISO-week filename so a manually-renamed file (or a tarball
+// extracted into the dir) is still pruned predictably.
+
+function pruneOldLogs(opts) {
+  const force = !!(opts && opts.force);
+  const days = clampLogRetentionDays(_serverConfig.logRetentionDays);
+  if (!days) return { deleted: 0, kept: 0, reason: "retention disabled" };
+  if (!LOGGING_ENABLED && !force) return { deleted: 0, kept: 0, reason: "logging disabled" };
+  if (!fs.existsSync(LOGS_DIR)) return { deleted: 0, kept: 0, reason: "no logs dir" };
+  const cutoffMs = Date.now() - days * 86_400_000;
+  let deleted = 0;
+  let kept = 0;
+  try {
+    const entries = fs.readdirSync(LOGS_DIR, { withFileTypes: true });
+    for (const ent of entries) {
+      if (!ent.isFile()) continue;
+      // Only touch files we own: must look like an NRCC log file.
+      if (!/^nrcc-.*\.log$/.test(ent.name)) continue;
+      const full = path.join(LOGS_DIR, ent.name);
+      try {
+        const st = fs.statSync(full);
+        if (st.mtimeMs < cutoffMs) {
+          fs.unlinkSync(full);
+          deleted++;
+        } else {
+          kept++;
+        }
+      } catch (_e) { /* ignore stat / unlink races */ }
+    }
+  } catch (err) {
+    console.warn(`[logging] prune sweep failed: ${err.message}`);
+    return { deleted, kept, reason: `error: ${err.message}` };
+  }
+  if (deleted > 0) {
+    console.log(`[logging] retention sweep: deleted ${deleted}, kept ${kept} (older-than ${days}d)`);
+  }
+  return { deleted, kept, reason: "ok" };
+}
+
+// Run an initial sweep at startup so a long-running deployment that
+// just had retention reduced from 90 -> 30 doesn't have to wait for
+// the next interval to catch up. Then sweep every 6 hours.
+if (LOGGING_ENABLED) {
+  setTimeout(() => pruneOldLogs(), 5_000).unref();
+  setInterval(() => pruneOldLogs(), 6 * 60 * 60 * 1000).unref();
 }
 
 // Pull every IPv4 address on the box for the self-signed cert's SAN
@@ -606,6 +743,197 @@ app.post("/api/log", (req, res) => {
     details: safeType === "client.unknown" ? { ...details, originalType: rawType } : details
   });
   res.status(204).end();
+});
+
+// =====================================================================
+// Server-wide runtime config (read + update).
+// =====================================================================
+//
+// All authenticated users may read and edit this -- NRCC has no role
+// system and the config only carries operator-tunable knobs that
+// affect the whole deployment. The Settings dialog calls these and
+// makes it explicit in the UI that "this affects all users".
+app.get("/api/server-config", (req, res) => {
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  res.json({
+    logRetentionDays: _serverConfig.logRetentionDays,
+    logRetentionDaysDefault: LOG_RETENTION_DAYS_DEFAULT,
+    logRetentionDaysMax: LOG_RETENTION_DAYS_MAX,
+    loggingAvailable: LOGGING_ENABLED,
+    logsDir: LOGS_DIR
+  });
+});
+
+app.put("/api/server-config", (req, res) => {
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  const body = req.body || {};
+  if ("logRetentionDays" in body) {
+    const next = clampLogRetentionDays(body.logRetentionDays);
+    if (next !== _serverConfig.logRetentionDays) {
+      const prev = _serverConfig.logRetentionDays;
+      _serverConfig.logRetentionDays = next;
+      if (!saveServerConfig()) {
+        // Roll back the in-memory change so a failed disk write
+        // doesn't silently diverge from the persisted state.
+        _serverConfig.logRetentionDays = prev;
+        return res.status(500).json({ error: "Could not persist server-config change." });
+      }
+      appendLogForReq(req, {
+        type: "server-config.update",
+        details: { field: "logRetentionDays", from: prev, to: next }
+      });
+      // If the new retention is shorter than the previous, sweep
+      // immediately so the user sees the effect without waiting for
+      // the 6h interval.
+      if (next > 0 && (prev === 0 || next < prev)) {
+        try { pruneOldLogs({ force: true }); } catch (_e) { /* ignore */ }
+      }
+    }
+  }
+  res.json({
+    logRetentionDays: _serverConfig.logRetentionDays
+  });
+});
+
+// =====================================================================
+// Logs viewer endpoints (file index + line reader).
+// =====================================================================
+//
+// /api/logs/files lists every weekly file under LOGS_DIR (newest
+// first) with a size summary. /api/logs reads one file with optional
+// filters and pagination -- the response always carries the total
+// count of MATCHING entries so the UI can render proper paging.
+//
+// All entries are kept in memory only for the duration of the
+// request, and we cap the per-page limit to keep big reads bounded.
+
+const LOGS_VIEW_PAGE_MAX = 1000;
+
+function isSafeLogFilename(name) {
+  // Only allow "nrcc-...log" with no path separators -- prevents the
+  // viewer from being used to peek at arbitrary files on disk.
+  if (typeof name !== "string") return false;
+  if (name.includes("/") || name.includes("\\") || name.includes("..")) return false;
+  return /^nrcc-[A-Za-z0-9_-]+\.log$/.test(name);
+}
+
+app.get("/api/logs/files", (req, res) => {
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  if (!LOGGING_ENABLED) {
+    return res.json({ enabled: false, retentionDays: _serverConfig.logRetentionDays, files: [] });
+  }
+  let files = [];
+  try {
+    if (fs.existsSync(LOGS_DIR)) {
+      const entries = fs.readdirSync(LOGS_DIR, { withFileTypes: true });
+      for (const ent of entries) {
+        if (!ent.isFile()) continue;
+        if (!isSafeLogFilename(ent.name)) continue;
+        const full = path.join(LOGS_DIR, ent.name);
+        try {
+          const st = fs.statSync(full);
+          files.push({
+            name: ent.name,
+            sizeBytes: st.size,
+            mtime: st.mtime.toISOString()
+          });
+        } catch (_e) { /* skip files that vanish mid-walk */ }
+      }
+    }
+  } catch (err) {
+    return res.status(500).json({ error: `failed to list logs: ${err.message}` });
+  }
+  // Newest first so the dropdown defaults to the active week.
+  files.sort((a, b) => b.mtime.localeCompare(a.mtime));
+  res.json({
+    enabled: true,
+    retentionDays: _serverConfig.logRetentionDays,
+    files
+  });
+});
+
+app.get("/api/logs", (req, res) => {
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  if (!LOGGING_ENABLED) {
+    return res.status(503).json({ error: "Logging is disabled (NRCC_LOGGING=false)." });
+  }
+  const filename = String(req.query.file || "").trim();
+  if (!isSafeLogFilename(filename)) {
+    return res.status(400).json({ error: "Invalid file." });
+  }
+  const fullPath = path.join(LOGS_DIR, filename);
+  if (!fs.existsSync(fullPath)) {
+    return res.status(404).json({ error: "File not found." });
+  }
+  // Filters
+  const wantType = String(req.query.type || "").trim();
+  const wantUser = String(req.query.user || "").trim().toLowerCase();
+  const wantVm = String(req.query.vm || "").trim();
+  const search = String(req.query.q || "").trim().toLowerCase();
+  // Pagination
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const limit = Math.max(1, Math.min(LOGS_VIEW_PAGE_MAX, Number(req.query.limit) || 200));
+  // Newest first by default; let the UI flip via ?order=asc.
+  const newestFirst = String(req.query.order || "desc").toLowerCase() !== "asc";
+
+  let raw;
+  try {
+    raw = fs.readFileSync(fullPath, "utf8");
+  } catch (err) {
+    return res.status(500).json({ error: `failed to read file: ${err.message}` });
+  }
+  const lines = raw.split("\n");
+  // Decode + filter in a single pass. Bad lines are still surfaced
+  // (as `_raw`) so a partially-corrupt file doesn't disappear from
+  // view.
+  const allEntries = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); }
+    catch { entry = { _raw: line }; }
+    if (typeof entry !== "object" || entry === null) {
+      entry = { _raw: line };
+    }
+    // Apply filters
+    if (wantType && entry.type !== wantType) continue;
+    if (wantUser) {
+      const u = String(entry.username || "").toLowerCase();
+      if (!u.includes(wantUser)) continue;
+    }
+    if (wantVm && entry.vmUuid !== wantVm) continue;
+    if (search) {
+      // Cheap substring match across the raw JSON string -- catches
+      // hits in `details` without per-key plumbing.
+      if (!line.toLowerCase().includes(search)) continue;
+    }
+    allEntries.push(entry);
+  }
+  if (newestFirst) allEntries.reverse();
+  const total = allEntries.length;
+  const paged = allEntries.slice(offset, offset + limit);
+  // Distinct event types in the filtered set, so the UI can populate
+  // a "type" filter dropdown without scanning twice.
+  const typesSeen = new Set();
+  for (const e of allEntries) if (e && e.type) typesSeen.add(e.type);
+  res.json({
+    file: filename,
+    total,
+    offset,
+    limit,
+    order: newestFirst ? "desc" : "asc",
+    types: Array.from(typesSeen).sort(),
+    entries: paged
+  });
 });
 
 // =====================================================================
