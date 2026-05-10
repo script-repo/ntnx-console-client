@@ -170,6 +170,12 @@ curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/mai
 iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.ps1 | iex
 ```
 
+> On older Windows hosts (Windows 7 / 8.1 / Server 2012 R2, or any box that's never had WMF 5.1 / .NET strong-crypto enabled) `iwr` fails with `Could not create SSL/TLS secure channel` because the .NET default is TLS 1.0. Prepend a one-liner to switch the session to TLS 1.2 first:
+>
+> ```powershell
+> [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.ps1 | iex
+> ```
+
 ### After install
 
 ```bash

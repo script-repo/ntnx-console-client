@@ -38,6 +38,25 @@ function Test-Cmd([string]$name) {
   $null -ne (Get-Command -Name $name -ErrorAction SilentlyContinue)
 }
 
+# Expand-Archive landed in PowerShell 5.0; Windows Server 2012 R2 ships
+# with PowerShell 4.0. Fall back to System.IO.Compression.ZipFile, which
+# is available on every box with .NET 4.5+ (ie. 2012 R2 and later).
+function Expand-Zip([string]$ZipPath, [string]$Destination) {
+  if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
+    return
+  }
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  if (Test-Path $Destination) {
+    Get-ChildItem -LiteralPath $Destination -Recurse -Force | Remove-Item -Recurse -Force
+  } else {
+    $null = New-Item -ItemType Directory -Force -Path $Destination
+  }
+  [System.IO.Compression.ZipFile]::ExtractToDirectory(
+    [System.IO.Path]::GetFullPath($ZipPath),
+    [System.IO.Path]::GetFullPath($Destination))
+}
+
 if ([System.IntPtr]::Size -ne 8) {
   Write-Warn2 "32-bit PowerShell detected -- some downloads may fail. Re-run from 64-bit PowerShell if needed."
 }
@@ -171,7 +190,7 @@ function Ensure-Node {
   $null = New-Item -ItemType Directory -Force -Path $runtime
   $zip = "$runtime\node.zip"
   Fetch $url $zip
-  Expand-Archive -LiteralPath $zip -DestinationPath $runtime -Force
+  Expand-Zip $zip $runtime
   Remove-Item $zip
   $nodeExe = Get-ChildItem -Path $runtime -Recurse -Filter 'node.exe' | Select-Object -First 1
   if (-not $nodeExe) { Die "Portable Node extraction failed (no node.exe found under $runtime)." }
@@ -199,7 +218,7 @@ function Bootstrap-Source {
       Write-Log "git not found -- downloading tarball instead"
       $tar = "$NrccInstallDir\app.zip"
       Fetch "$NrccRepo/archive/refs/heads/$NrccBranch.zip" $tar
-      Expand-Archive -LiteralPath $tar -DestinationPath "$NrccInstallDir\app-tmp" -Force
+      Expand-Zip $tar "$NrccInstallDir\app-tmp"
       $extracted = Get-ChildItem "$NrccInstallDir\app-tmp" | Select-Object -First 1
       Move-Item -Path $extracted.FullName -Destination "$NrccInstallDir\app"
       Remove-Item -Recurse -Force "$NrccInstallDir\app-tmp"
