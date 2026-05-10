@@ -11,8 +11,9 @@ Thumbs.db
 .idea/
 *.log
 
-# Multi-user deployment artifacts
-certs/
-screenshots/
-recordings/
-scripts/
+# Multi-user deployment artifacts (anchored to repo root so they
+# don't accidentally match docs/screenshots/, etc.)
+/certs/
+/screenshots/
+/recordings/
+/scripts/
