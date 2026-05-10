@@ -4,6 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NRCC — Nutanix Remote Console Client</title>
+    <!-- Favicon: a single PNG covers every modern browser tab and
+         the iOS / Android home-screen icon. Same file is used for
+         the in-app brand mark on the login screen and the empty
+         console placeholder. -->
+    <link rel="icon" type="image/png" href="/assets/nrcc-logo.png" />
+    <link rel="shortcut icon" type="image/png" href="/assets/nrcc-logo.png" />
+    <link rel="apple-touch-icon" href="/assets/nrcc-logo.png" />
     <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
     <style>
       :root {
@@ -1131,7 +1138,11 @@
         width: 100%;
         height: auto;
         opacity: 0.85;
-        filter: drop-shadow(0 4px 18px rgba(255, 255, 255, 0.05));
+        /* The supplied logo is dark-on-transparent, but the empty
+           console stage is dark too -- invert turns the mark white
+           so it shows up. The drop-shadow is then computed on the
+           inverted (white) pixels. */
+        filter: invert(1) drop-shadow(0 4px 18px rgba(255, 255, 255, 0.08));
         user-select: none;
         -webkit-user-drag: none;
       }
@@ -1595,16 +1606,18 @@
         margin-bottom: 22px;
       }
       .login-brand-mark {
+        /* Brand mark is now an <img> of the supplied logo. The
+           source is dark-on-transparent and the login card is dark
+           too, so invert(1) renders the X in white. The faint blue
+           drop-shadow keeps the residual brand glow from the old
+           gradient tile. object-fit ensures the PNG never distorts
+           if the source aspect ratio changes. */
         width: 38px;
         height: 38px;
-        border-radius: 8px;
-        background: linear-gradient(135deg, #4f8dff, #1565ff);
-        display: grid;
-        place-items: center;
-        color: #fff;
-        font-weight: 800;
-        font-size: 16px;
-        box-shadow: 0 4px 14px rgba(21, 101, 255, 0.4);
+        object-fit: contain;
+        filter: invert(1) drop-shadow(0 4px 14px rgba(21, 101, 255, 0.35));
+        user-select: none;
+        -webkit-user-drag: none;
       }
       .login-brand-text {
         display: flex;
@@ -3020,7 +3033,12 @@
     <div id="loginScreen" class="login-screen">
       <div class="login-card">
         <div class="login-brand">
-          <div class="login-brand-mark">N</div>
+          <img
+            src="/assets/nrcc-logo.png"
+            alt="NRCC"
+            class="login-brand-mark"
+            draggable="false"
+          />
           <div class="login-brand-text">
             <span class="login-brand-title">Nutanix Remote Console</span>
             <span class="login-brand-sub">NRCC</span>
@@ -3126,8 +3144,8 @@
                     <div id="consoleEmpty" class="console-empty">
                       <div class="console-empty-inner">
                         <img
-                          src="/assets/nutanix-logo.png"
-                          alt="Nutanix"
+                          src="/assets/nrcc-logo.png"
+                          alt="NRCC"
                           class="console-empty-logo"
                           draggable="false"
                         />
