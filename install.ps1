@@ -41,6 +41,46 @@ function Test-Cmd([string]$name) {
 # Expand-Archive landed in PowerShell 5.0; Windows Server 2012 R2 ships
 # with PowerShell 4.0. Fall back to System.IO.Compression.ZipFile, which
 # is available on every box with .NET 4.5+ (ie. 2012 R2 and later).
+# Stop any node.exe whose path lives under the install dir, so it can no
+# longer hold file handles open under runtime\ or app\. Best-effort: we
+# never raise.
+function Stop-RunningNrcc {
+  $rootLower = $NrccInstallDir.ToLower()
+  Get-Process node -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Path -and $_.Path.ToLower().StartsWith($rootLower) }
+    catch { $false }
+  } | ForEach-Object {
+    try {
+      Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+      Write-Log "Stopped lingering node.exe pid=$($_.Id)"
+    } catch {}
+  }
+}
+
+# Recursively delete a directory, riding out the file-in-use / antivirus
+# / NTFS handle-release lag that bites every Windows install on a re-run.
+# If the dir simply will not let go, rename it out of the way so the
+# install can still proceed; the user can clean up the .old.* sibling later.
+function Reset-Dir([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  Stop-RunningNrcc
+  for ($i = 0; $i -lt 6; $i++) {
+    try {
+      Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+      return
+    } catch {
+      Start-Sleep -Seconds 2
+    }
+  }
+  $bak = "$Path.old.$([DateTime]::Now.ToString('yyyyMMddHHmmss'))"
+  try {
+    Move-Item -LiteralPath $Path -Destination $bak -Force -ErrorAction Stop
+    Write-Warn2 "Could not delete '$Path' (file in use). Renamed to '$bak' so the install can continue. Remove that folder later when the file handle is released (a reboot always clears it)."
+  } catch {
+    Die "Could not delete or rename '$Path'. Close any node.exe / explorer / antivirus that is browsing it and re-run the installer."
+  }
+}
+
 function Expand-Zip([string]$ZipPath, [string]$Destination) {
   if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
@@ -186,7 +226,7 @@ function Ensure-Node {
   $nodeArch = if ($arch -eq 'amd64') { 'x64' } elseif ($arch -eq 'arm64') { 'arm64' } else { 'x86' }
   $url      = "https://nodejs.org/dist/$nodeVer/node-$nodeVer-win-$nodeArch.zip"
   $runtime  = "$NrccInstallDir\runtime"
-  if (Test-Path $runtime) { Remove-Item -Recurse -Force $runtime }
+  Reset-Dir $runtime
   $null = New-Item -ItemType Directory -Force -Path $runtime
   $zip = "$runtime\node.zip"
   Fetch $url $zip
@@ -199,6 +239,9 @@ function Ensure-Node {
 }
 
 function Bootstrap-Source {
+  # Free file handles from any prior run before we touch app\ or runtime\.
+  Stop-RunningNrcc
+
   $nodePath = Ensure-Node
 
   if (Test-Path "$NrccInstallDir\app\.git") {
@@ -210,7 +253,7 @@ function Bootstrap-Source {
     } finally { Pop-Location }
   } else {
     Write-Log "Cloning $NrccRepo (branch $NrccBranch) ..."
-    if (Test-Path "$NrccInstallDir\app") { Remove-Item -Recurse -Force "$NrccInstallDir\app" }
+    Reset-Dir "$NrccInstallDir\app"
     if (Test-Cmd 'git') {
       & git clone --depth 1 --branch $NrccBranch $NrccRepo "$NrccInstallDir\app"
       if ($LASTEXITCODE -ne 0) { Die "git clone failed" }
