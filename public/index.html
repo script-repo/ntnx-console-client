@@ -46,6 +46,13 @@
         --ntx-warn-soft: #fdecde;
         --ntx-success-soft: #e8f6ee;
         --ntx-modal-overlay: rgba(15, 23, 42, 0.55);
+        /* Inactive console tab chip. Light theme keeps the original
+           cool-grey gradient; dark theme overrides this below to a
+           dark chip so the muted-grey label stays readable instead
+           of becoming light-on-light. */
+        --ntx-tab-inactive-bg: linear-gradient(180deg, #f0f3f9, #e3e8f1);
+        --ntx-tab-inactive-bg-hover: linear-gradient(180deg, #fafcff, #ebf0f9);
+        --ntx-tab-inactive-text: #5a6478;
       }
       :root[data-theme="dark"] {
         --ntx-bg: #0f172a;
@@ -77,6 +84,11 @@
         --ntx-warn-soft: #2d1f10;
         --ntx-success-soft: #142a1d;
         --ntx-modal-overlay: rgba(0, 0, 0, 0.65);
+        /* Dark inactive tab: a dim navy chip (darker than active so
+           the active tab still pops) with bright label text. */
+        --ntx-tab-inactive-bg: linear-gradient(180deg, #0f1828, #0a1322);
+        --ntx-tab-inactive-bg-hover: linear-gradient(180deg, #182338, #11192a);
+        --ntx-tab-inactive-text: #c8d0e3;
       }
       * {
         box-sizing: border-box;
@@ -595,14 +607,17 @@
         gap: 8px;
         align-items: center;
         border: 1px solid var(--ntx-border-strong);
-        background: linear-gradient(180deg, #f0f3f9, #e3e8f1);
+        /* Inactive tab background uses theme vars so the dark theme
+           gets a darker chip rather than the light grey gradient
+           bleeding through (which made labels unreadable). */
+        background: var(--ntx-tab-inactive-bg);
         border-bottom: none;
         border-top-left-radius: 8px;
         border-top-right-radius: 8px;
         padding: 7px 14px 8px 14px;
         font-size: 12px;
         font-weight: 500;
-        color: var(--ntx-text-muted);
+        color: var(--ntx-tab-inactive-text);
         cursor: pointer;
         max-width: 240px;
         position: relative;
@@ -617,7 +632,7 @@
         margin-left: 0;
       }
       .tab:hover {
-        background: linear-gradient(180deg, #fafcff, #ebf0f9);
+        background: var(--ntx-tab-inactive-bg-hover);
         color: var(--ntx-text);
         z-index: 2;
       }
@@ -929,7 +944,11 @@
         position: fixed;
         z-index: 90;
         min-width: 170px;
-        background: #fff;
+        /* Use the theme surface var (was hardcoded #fff) so the menu
+           switches to a dark panel in dark mode -- otherwise the
+           default light text rendered light-on-white. */
+        background: var(--ntx-surface);
+        color: var(--ntx-text);
         border: 1px solid var(--ntx-border-strong);
         border-radius: 6px;
         box-shadow: var(--ntx-shadow-lg);
@@ -963,7 +982,10 @@
       }
       .ctx-menu-item:hover {
         background: var(--ntx-accent-soft);
-        color: var(--ntx-accent-hover);
+        /* In dark mode --ntx-accent-hover is a deep blue that goes
+           too dark over --ntx-accent-soft (also navy); fall back to
+           the brighter --ntx-accent so text stays legible. */
+        color: var(--ntx-accent);
       }
       .ctx-menu-item.disabled {
         color: var(--ntx-text-subtle);
@@ -1138,11 +1160,7 @@
         width: 100%;
         height: auto;
         opacity: 0.85;
-        /* The supplied logo is dark-on-transparent, but the empty
-           console stage is dark too -- invert turns the mark white
-           so it shows up. The drop-shadow is then computed on the
-           inverted (white) pixels. */
-        filter: invert(1) drop-shadow(0 4px 18px rgba(255, 255, 255, 0.08));
+        filter: drop-shadow(0 4px 18px rgba(255, 255, 255, 0.05));
         user-select: none;
         -webkit-user-drag: none;
       }
@@ -1606,16 +1624,13 @@
         margin-bottom: 22px;
       }
       .login-brand-mark {
-        /* Brand mark is now an <img> of the supplied logo. The
-           source is dark-on-transparent and the login card is dark
-           too, so invert(1) renders the X in white. The faint blue
-           drop-shadow keeps the residual brand glow from the old
-           gradient tile. object-fit ensures the PNG never distorts
-           if the source aspect ratio changes. */
-        width: 38px;
-        height: 38px;
+        /* Brand mark is the supplied transparent NRCC PNG, rendered
+           natively (no invert, no drop-shadow) so it looks like the
+           file you see in the assets folder. object-fit keeps the
+           aspect ratio if the source dimensions ever change. */
+        width: 42px;
+        height: 42px;
         object-fit: contain;
-        filter: invert(1) drop-shadow(0 4px 14px rgba(21, 101, 255, 0.35));
         user-select: none;
         -webkit-user-drag: none;
       }
@@ -3144,8 +3159,8 @@
                     <div id="consoleEmpty" class="console-empty">
                       <div class="console-empty-inner">
                         <img
-                          src="/assets/nrcc-logo.png"
-                          alt="NRCC"
+                          src="/assets/nutanix-logo.png"
+                          alt="Nutanix"
                           class="console-empty-logo"
                           draggable="false"
                         />
