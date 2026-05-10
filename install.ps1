@@ -81,6 +81,69 @@ function Reset-Dir([string]$Path) {
   }
 }
 
+# Build a real multi-resolution Windows .ico from a source PNG so that
+# Desktop / Start Menu shortcuts get a proper icon. .lnk's IconLocation
+# requires .ico -- pointing it at a PNG silently degrades to the cmd.exe
+# default. Each frame is encoded as PNG inside the ICO container; Vista+
+# parses that fine and PNG keeps alpha channel + small file size for
+# the larger sizes (especially 256x256).
+function Convert-PngToIco([string]$PngPath, [string]$IcoPath) {
+  Add-Type -AssemblyName System.Drawing
+  $sizes = @(16, 24, 32, 48, 64, 128, 256)
+  $original = [System.Drawing.Image]::FromFile((Resolve-Path -LiteralPath $PngPath).ProviderPath)
+  $frames = @()
+  try {
+    foreach ($size in $sizes) {
+      $bmp = New-Object System.Drawing.Bitmap $size, $size
+      $g   = [System.Drawing.Graphics]::FromImage($bmp)
+      $g.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+      $g.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+      $g.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+      $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+      $g.Clear([System.Drawing.Color]::Transparent)
+      $g.DrawImage($original, 0, 0, $size, $size)
+      $g.Dispose()
+
+      $ms = New-Object System.IO.MemoryStream
+      $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+      $bmp.Dispose()
+      $frames += ,@{ Size = $size; Bytes = $ms.ToArray() }
+      $ms.Dispose()
+    }
+  } finally {
+    $original.Dispose()
+  }
+
+  $fs = [System.IO.File]::Create($IcoPath)
+  $bw = New-Object System.IO.BinaryWriter $fs
+  try {
+    # ICONDIR header (6 bytes)
+    $bw.Write([UInt16]0)                # reserved, must be 0
+    $bw.Write([UInt16]1)                # type 1 = ICO
+    $bw.Write([UInt16]$frames.Count)    # number of images
+
+    # ICONDIRENTRY (16 bytes each)
+    $offset = 6 + (16 * $frames.Count)
+    foreach ($f in $frames) {
+      $sz = if ($f.Size -ge 256) { 0 } else { $f.Size }   # 256 is encoded as 0
+      $bw.Write([byte]$sz)              # width
+      $bw.Write([byte]$sz)              # height
+      $bw.Write([byte]0)                # color count (0 = no palette / true colour)
+      $bw.Write([byte]0)                # reserved
+      $bw.Write([UInt16]1)              # color planes
+      $bw.Write([UInt16]32)             # bits per pixel
+      $bw.Write([UInt32]$f.Bytes.Length)
+      $bw.Write([UInt32]$offset)
+      $offset += $f.Bytes.Length
+    }
+
+    foreach ($f in $frames) { $bw.Write($f.Bytes) }
+  } finally {
+    $bw.Flush()
+    $bw.Close()
+  }
+}
+
 function Expand-Zip([string]$ZipPath, [string]$Destination) {
   if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
@@ -146,6 +209,14 @@ Write-Log "Fetching launcher and assets from $NrccRaw ..."
 Fetch "$NrccRaw/cli/bin/nrcc.ps1"   "$NrccInstallDir\bin\nrcc.ps1"
 Fetch "$NrccRaw/cli/bin/nrcc.cmd"   "$NrccInstallDir\bin\nrcc.cmd"
 Fetch "$NrccRaw/public/assets/nrcc-logo.png" "$NrccInstallDir\icon.png"
+
+# .lnk shortcuts need a real .ico file -- generate one alongside the PNG.
+try {
+  Convert-PngToIco "$NrccInstallDir\icon.png" "$NrccInstallDir\icon.ico"
+  Write-Log "Generated icon.ico from icon.png"
+} catch {
+  Write-Warn2 "Failed to build icon.ico ($($_.Exception.Message)) -- shortcuts will use the default icon"
+}
 
 # ---- install.json: shared state read by the launcher ---------------
 
@@ -326,9 +397,13 @@ $StartMenuDir = Join-Path ([Environment]::GetFolderPath('Programs')) 'NRCC'
 $null         = New-Item -ItemType Directory -Force -Path $StartMenuDir
 
 # Modern Windows .lnk takes a PNG icon directly.
-New-Shortcut "$DesktopDir\NRCC.lnk"        "$LauncherDir\nrcc.cmd" "" "$NrccInstallDir\icon.png"
-New-Shortcut "$StartMenuDir\NRCC.lnk"      "$LauncherDir\nrcc.cmd" "" "$NrccInstallDir\icon.png"
-New-Shortcut "$StartMenuDir\NRCC Logs.lnk" "$LauncherDir\nrcc.cmd" "logs" "$NrccInstallDir\icon.png"
+# Prefer the generated .ico; fall back to .png so we still ship something
+# even if Convert-PngToIco failed (in which case Windows shows a blank icon
+# rather than crashing the install).
+$IconForLnk = if (Test-Path "$NrccInstallDir\icon.ico") { "$NrccInstallDir\icon.ico" } else { "$NrccInstallDir\icon.png" }
+New-Shortcut "$DesktopDir\NRCC.lnk"        "$LauncherDir\nrcc.cmd" ""     $IconForLnk
+New-Shortcut "$StartMenuDir\NRCC.lnk"      "$LauncherDir\nrcc.cmd" ""     $IconForLnk
+New-Shortcut "$StartMenuDir\NRCC Logs.lnk" "$LauncherDir\nrcc.cmd" "logs" $IconForLnk
 Write-Ok "Desktop shortcut: $DesktopDir\NRCC.lnk"
 Write-Ok "Start Menu folder: $StartMenuDir"
 
