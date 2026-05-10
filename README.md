@@ -29,6 +29,54 @@ NRCC speaks to Nutanix REST APIs (v4 / v3 / v2 / PrismGateway), discovers VMs ac
 
 ---
 
+## Screenshots
+
+A quick visual tour. All shots are from a live multi-user deployment running in dark mode.
+
+### Sign-in
+
+The login card uses your Prism Central credentials and confirms the running build in the footer.
+
+![Login screen](docs/screenshots/01-login.png)
+
+### Main view
+
+Sidebar VM browser (filter, favorites tree, full VM list with power and protocol pills), console tab strip across the top, the section-grouped action menu on the right (Input / Session / Recordings / Manage / View), and the per-VM chat panel docked bottom-right.
+
+![Main app view with chat panel](docs/screenshots/02-main-with-chat.png)
+
+### "Show All" grid
+
+One click in the action menu tiles every open console in a single grid view -- handy for keeping multiple lab boxes in sight at once. Click any tile to switch to it, click outside or press Escape to close.
+
+![Show All console grid](docs/screenshots/03-show-all-consoles.png)
+
+### Per-VM screenshots browser
+
+Per-VM screenshot library with folders, captions, an inline preview pane, and Save / Download / Delete actions. Captures are saved server-side under `NRCC_SCREENSHOTS_DIR` keyed by VM UUID, capped at 100 per VM by default.
+
+![Screenshots browser](docs/screenshots/04-screenshots-browser.png)
+
+### Per-VM recordings browser
+
+Same shape as the screenshots browser but for 10 fps WebM session recordings. Each recording shows duration, size, and the user who captured it; click to play back inline.
+
+![Recordings browser](docs/screenshots/05-recordings-browser.png)
+
+### Script library
+
+Click-to-clipboard script library with folders, language tags, and an inline editor. Useful for keeping common admin snippets (Bash, PowerShell, Python, troubleshooting one-liners) one click away from any console you happen to be in.
+
+![Script library editor](docs/screenshots/06-script-library.png)
+
+### Activity logs viewer
+
+Settings → SERVER → **Open logs viewer** opens a dedicated dialog that reads weekly log files directly off the server. Pick a file, filter by event type / username / free-text, paginate, and expand any row to see the raw JSON. Optional download of the filtered view as NDJSON.
+
+![Activity logs viewer](docs/screenshots/07-logs-viewer.png)
+
+---
+
 ## Architecture
 
 ```
