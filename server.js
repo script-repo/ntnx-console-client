@@ -1,6 +1,7 @@
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const net = require("net");
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
@@ -101,8 +102,41 @@ const CLIENT_LOG_EVENT_TYPES = new Set([
   "console.recording.stop",
   "console.script.copy",
   "settings.saved",
-  "chat.send"
+  "chat.send",
+  "console.ssh.open",
+  "console.ssh.close"
 ]);
+
+// =====================================================================
+// VM port-scan probe (beta feature: vmPortScan)
+// =====================================================================
+//
+// After the VM list arrives the client batches the VM IPs to
+// /api/probe/ports; the server TCP-dials each (vm, ip, port) tuple
+// (typically 22 + 3389) and caches the result. The cache is also
+// the SSRF guard for /api/ssh/start: an SSH session can only be
+// opened against an IP that the probe just observed for that VM.
+const PROBE_ENABLED = String(process.env.NRCC_PROBE_ENABLED || "true").toLowerCase() !== "false";
+const PROBE_PORTS = String(process.env.NRCC_PROBE_PORTS || "22,3389")
+  .split(",").map((s) => Number(String(s).trim())).filter((n) => Number.isInteger(n) && n > 0 && n < 65536);
+const PROBE_TIMEOUT_MS = Math.max(250, Number(process.env.NRCC_PROBE_TIMEOUT_MS || 2000));
+const PROBE_CONCURRENCY = Math.max(1, Number(process.env.NRCC_PROBE_CONCURRENCY || 20));
+const PROBE_CACHE_TTL_MS = Math.max(15_000, Number(process.env.NRCC_PROBE_CACHE_TTL_MS || 120_000));
+const PROBE_MAX_IPS_PER_VM = Math.max(1, Number(process.env.NRCC_PROBE_MAX_IPS_PER_VM || 4));
+
+// =====================================================================
+// SSH browser console (beta feature: sshConsole)
+// =====================================================================
+//
+// POST /api/ssh/start authorises a session (validates host against the
+// probe cache) and stores credentials in memory; the WS upgrade at
+// /ws-ssh/<id> opens the actual ssh2.Client.shell() and pipes it to
+// the browser's xterm.js terminal. Sessions auto-expire after
+// NRCC_SSH_IDLE_TIMEOUT_MS of inactivity.
+const SSH_ENABLED = String(process.env.NRCC_SSH_ENABLED || "true").toLowerCase() !== "false";
+const SSH_IDLE_TIMEOUT_MS = Math.max(60_000, Number(process.env.NRCC_SSH_IDLE_TIMEOUT_MS || 15 * 60 * 1000));
+const SSH_MAX_SESSIONS = Math.max(1, Number(process.env.NRCC_SSH_MAX_SESSIONS || 64));
+const SSH_READY_TIMEOUT_MS = Math.max(5_000, Number(process.env.NRCC_SSH_READY_TIMEOUT_MS || 15_000));
 
 // =====================================================================
 // Feature-flag registry
@@ -119,7 +153,12 @@ const FEATURE_FLAGS = {
   recordings:  { stage: "ga", description: "Per-VM video recording (10 fps WebM)" },
   scripts:     { stage: "ga", description: "Global script library with click-to-clipboard" },
   logging:     { stage: "ga", description: "Optional activity logging (server-gated)" },
-  settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" }
+  settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" },
+  // Beta features. UI is hidden via [data-feature="<id>"] gating until
+  // the user toggles "Show beta features" in Settings AND the server
+  // has them enabled (NRCC_PROBE_ENABLED / NRCC_SSH_ENABLED).
+  vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
+  sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" }
 };
 
 // Strict UUID match used everywhere we accept a VM UUID from the client.
@@ -407,6 +446,22 @@ app.use(express.static(path.join(__dirname, "public")));
 app.use(
   "/vendor/novnc",
   express.static(path.join(__dirname, "node_modules", "@novnc", "novnc"))
+);
+// xterm.js ESM bundles for the SSH terminal. The browser imports them
+// from /vendor/xterm/* so we can keep the (large) WebGL renderer out
+// of the main bundle and only pay for it when a user actually opens
+// an SSH tab.
+app.use(
+  "/vendor/xterm",
+  express.static(path.join(__dirname, "node_modules", "@xterm", "xterm"))
+);
+app.use(
+  "/vendor/xterm-addon-fit",
+  express.static(path.join(__dirname, "node_modules", "@xterm", "addon-fit"))
+);
+app.use(
+  "/vendor/xterm-addon-webgl",
+  express.static(path.join(__dirname, "node_modules", "@xterm", "addon-webgl"))
 );
 app.use("/api", ensureSession);
 
@@ -797,6 +852,341 @@ app.post("/api/update/install", async (req, res) => {
   // Defer the actual work so Express can flush the 202 before we
   // start spawning git and (eventually) call process.exit.
   setImmediate(() => { runUpdate(info.latest); });
+});
+
+// =====================================================================
+// VM port-scan probe (POST /api/probe/ports)
+// =====================================================================
+//
+// Server-side TCP-connect probe. The browser cannot raw-dial sockets
+// itself, so the client batches its known VM IPs through this
+// endpoint after the VM list arrives. Results are cached per-VM so
+// repeated re-renders / re-prompts do not multiply the dial volume.
+//
+// The same cache is consulted by /api/ssh/start as the SSRF guard:
+// an SSH session can only target an IP that the probe just observed
+// for that VM. This means an attacker who fakes /api/ssh/start
+// requests still cannot pivot to arbitrary internal hosts because
+// the probe is the only way to seed the allow-list, and the probe
+// itself rejects anything outside the local / RFC1918 ranges.
+const IPV4_REGEX = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+
+function isProbeAllowedIp(ip) {
+  if (typeof ip !== "string" || !IPV4_REGEX.test(ip)) return false;
+  const parts = ip.split(".").map((s) => Number(s));
+  const [a, b] = parts;
+  // RFC1918 private ranges
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  // Carrier-grade NAT (often used in lab/test setups)
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  // Link-local
+  if (a === 169 && b === 254) return true;
+  // Loopback - useful for local smoke tests against sshd on the host
+  if (a === 127) return true;
+  return false;
+}
+
+// Cache shape: Map<vmUuid, { ts, ips: Map<ip, Map<port, status>> }>
+// Each port's status is one of: "open" | "refused" | "timeout" | "error".
+const probeCache = new Map();
+
+function probeCacheGet(uuid) {
+  const entry = probeCache.get(uuid);
+  if (!entry) return null;
+  if ((Date.now() - entry.ts) > PROBE_CACHE_TTL_MS) {
+    probeCache.delete(uuid);
+    return null;
+  }
+  return entry;
+}
+
+function summariseProbeEntry(entry) {
+  if (!entry) return null;
+  const ips = {};
+  let ssh = false, rdp = false;
+  let preferredSshIp = null, preferredRdpIp = null;
+  for (const [ip, ports] of entry.ips.entries()) {
+    const portObj = {};
+    for (const [port, status] of ports.entries()) {
+      portObj[String(port)] = status;
+      if (status === "open") {
+        if (port === 22) {
+          ssh = true;
+          if (!preferredSshIp) preferredSshIp = ip;
+        } else if (port === 3389) {
+          rdp = true;
+          if (!preferredRdpIp) preferredRdpIp = ip;
+        }
+      }
+    }
+    ips[ip] = portObj;
+  }
+  return {
+    scannedAt: entry.ts,
+    ips,
+    ssh,
+    rdp,
+    preferredIp: { ssh: preferredSshIp, rdp: preferredRdpIp }
+  };
+}
+
+// TCP connect probe with bounded timeout. Resolves to a status string;
+// never rejects (callers Promise.all without try/catch).
+function probeOneTcp(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch (_e) { /* already destroyed */ }
+      resolve(status);
+    };
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish("open"));
+    socket.once("timeout", () => finish("timeout"));
+    socket.once("error", (err) => {
+      // ECONNREFUSED is informative ("nothing listening, but the host
+      // is reachable"). Other errors collapse to "error".
+      if (err && err.code === "ECONNREFUSED") finish("refused");
+      else finish("error");
+    });
+    try {
+      socket.connect({ host, port });
+    } catch (_e) {
+      finish("error");
+    }
+  });
+}
+
+// Lightweight semaphore for the global concurrency cap. Returns a
+// release callback that the caller MUST invoke (we use try/finally).
+function makeSemaphore(max) {
+  let active = 0;
+  const waiters = [];
+  function acquire() {
+    if (active < max) {
+      active += 1;
+      return Promise.resolve(release);
+    }
+    return new Promise((resolve) => waiters.push(resolve));
+  }
+  function release() {
+    active -= 1;
+    const next = waiters.shift();
+    if (next) {
+      active += 1;
+      next(release);
+    }
+  }
+  return { acquire };
+}
+
+const probeSemaphore = makeSemaphore(PROBE_CONCURRENCY);
+
+async function probeVm(uuid, ipAddresses) {
+  const cached = probeCacheGet(uuid);
+  if (cached) return cached;
+  const ipsMap = new Map();
+  const tasks = [];
+  // Trim, dedupe, validate, and cap per-VM IP fan-out before any TCP work.
+  const seen = new Set();
+  const ipsToProbe = [];
+  for (const raw of ipAddresses) {
+    const ip = String(raw || "").trim();
+    if (!isProbeAllowedIp(ip)) continue;
+    if (seen.has(ip)) continue;
+    seen.add(ip);
+    ipsToProbe.push(ip);
+    if (ipsToProbe.length >= PROBE_MAX_IPS_PER_VM) break;
+  }
+  for (const ip of ipsToProbe) {
+    const portsMap = new Map();
+    ipsMap.set(ip, portsMap);
+    for (const port of PROBE_PORTS) {
+      tasks.push((async () => {
+        const release = await probeSemaphore.acquire();
+        try {
+          const status = await probeOneTcp(ip, port, PROBE_TIMEOUT_MS);
+          portsMap.set(port, status);
+        } finally {
+          release();
+        }
+      })());
+    }
+  }
+  await Promise.all(tasks);
+  const entry = { ts: Date.now(), ips: ipsMap };
+  probeCache.set(uuid, entry);
+  return entry;
+}
+
+// Periodic cache sweep so a long-lived process doesn't hold onto
+// entries for VMs the user no longer touches.
+setInterval(() => {
+  const cutoff = Date.now() - PROBE_CACHE_TTL_MS;
+  for (const [uuid, entry] of probeCache.entries()) {
+    if (entry.ts < cutoff) probeCache.delete(uuid);
+  }
+}, Math.max(60_000, Math.floor(PROBE_CACHE_TTL_MS / 2))).unref();
+
+app.post("/api/probe/ports", async (req, res) => {
+  if (!PROBE_ENABLED) {
+    return res.status(503).json({ error: "Port-scan probe is disabled (NRCC_PROBE_ENABLED=false)." });
+  }
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  const body = req.body || {};
+  const vms = Array.isArray(body.vms) ? body.vms : null;
+  if (!vms) {
+    return res.status(400).json({ error: "Body must include `vms: [{ uuid, ipAddresses }]`." });
+  }
+  // Cap the per-request VM count so a malicious client cannot pin the
+  // event loop with a single 50k-VM payload. The legitimate client
+  // batches in groups of 50.
+  if (vms.length > 200) {
+    return res.status(413).json({ error: "Too many VMs in one request (max 200)." });
+  }
+
+  const ports = PROBE_PORTS.slice();
+  const results = {};
+  let totalScanned = 0;
+  await Promise.all(vms.map(async (vm) => {
+    if (!vm || typeof vm !== "object") return;
+    const uuid = String(vm.uuid || "").toLowerCase();
+    if (!VM_UUID_REGEX.test(uuid)) return;
+    const ipAddresses = Array.isArray(vm.ipAddresses) ? vm.ipAddresses : [];
+    if (!ipAddresses.length) {
+      results[uuid] = { scannedAt: Date.now(), ips: {}, ssh: false, rdp: false, preferredIp: { ssh: null, rdp: null } };
+      return;
+    }
+    const cachedBefore = probeCache.has(uuid);
+    const entry = await probeVm(uuid, ipAddresses);
+    results[uuid] = summariseProbeEntry(entry);
+    if (!cachedBefore) totalScanned += 1;
+  }));
+
+  if (totalScanned > 0) {
+    appendLogForReq(req, {
+      type: "probe.scan",
+      details: { vmCount: vms.length, scannedNow: totalScanned, ports }
+    });
+  }
+  res.json({ ports, results });
+});
+
+// =====================================================================
+// SSH browser console (POST /api/ssh/start, WS /ws-ssh/<sessionId>)
+// =====================================================================
+//
+// The HTTP endpoint validates credentials + host, allocates a session
+// id, and stores the connection metadata in `sshSessions`. The WS
+// upgrade at /ws-ssh/<id> is what actually opens the ssh2.Client and
+// pipes its shell stream to the browser; the session is consumed
+// (deleted from the map) on the WS upgrade so a session id can only
+// be used once. This means we never persist the SSH password beyond
+// the lifetime of a single WebSocket connection.
+
+let _ssh2Module = null;
+function getSsh2() {
+  if (_ssh2Module) return _ssh2Module;
+  try {
+    _ssh2Module = require("ssh2");
+    return _ssh2Module;
+  } catch (err) {
+    console.warn(`[ssh] ssh2 module not installed: ${err.message}`);
+    return null;
+  }
+}
+
+// sessionId -> { vmUuid, host, port, username, password|privateKey,
+//                passphrase, owner, createdAt, expiresAt }
+const sshSessions = new Map();
+
+function probeSawOpenPort(uuid, host, port) {
+  const entry = probeCacheGet(uuid);
+  if (!entry) return false;
+  const ports = entry.ips.get(host);
+  if (!ports) return false;
+  return ports.get(port) === "open";
+}
+
+// Soft SSRF guard: returns true if `host` is one of the IPs we've
+// probed for this VM, regardless of port status. The IPs in the
+// probe cache came from the VM's Prism-reported `ipAddresses`, so a
+// hit here means "this is one of the VM's own addresses" -- which
+// is the security property we actually want to enforce. This lets
+// the user attempt SSH against an IP whose port 22 looked closed
+// (firewall blocking SYN, source-IP ACLs, etc.) without giving up
+// the protection that they cannot pivot to arbitrary internal hosts.
+function probeKnowsIpForVm(uuid, host) {
+  const entry = probeCacheGet(uuid);
+  if (!entry) return false;
+  return entry.ips.has(host);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, sess] of sshSessions.entries()) {
+    if (sess.expiresAt < now) sshSessions.delete(id);
+  }
+}, 60_000).unref();
+
+app.post("/api/ssh/start", (req, res) => {
+  if (!SSH_ENABLED) {
+    return res.status(503).json({ error: "SSH consoles are disabled (NRCC_SSH_ENABLED=false)." });
+  }
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  if (!getSsh2()) {
+    return res.status(503).json({ error: "Server is missing the ssh2 dependency. Run `npm install` and restart." });
+  }
+  if (sshSessions.size >= SSH_MAX_SESSIONS) {
+    return res.status(429).json({ error: `Maximum SSH session count reached (${SSH_MAX_SESSIONS}). Close some tabs and retry.` });
+  }
+  const body = req.body || {};
+  const vmUuid = String(body.vmUuid || "").toLowerCase();
+  const host = String(body.host || "").trim();
+  const port = Number(body.port || 22);
+  const username = String(body.username || "").trim();
+  const password = typeof body.password === "string" ? body.password : "";
+  const privateKey = typeof body.privateKey === "string" ? body.privateKey.trim() : "";
+  const passphrase = typeof body.passphrase === "string" ? body.passphrase : "";
+
+  if (!VM_UUID_REGEX.test(vmUuid)) return res.status(400).json({ error: "Invalid vmUuid." });
+  if (!IPV4_REGEX.test(host) || !isProbeAllowedIp(host)) return res.status(400).json({ error: "Invalid or non-private host." });
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return res.status(400).json({ error: "Invalid port." });
+  if (!username) return res.status(400).json({ error: "Username is required." });
+  if (!password && !privateKey) return res.status(400).json({ error: "Either password or privateKey is required." });
+  // SSRF guard: the host MUST be one of the IPs we've probed for this
+  // VM. Whether the probe saw the port open is now an advisory hint
+  // only -- the user is allowed to "try anyway" against a closed-
+  // looking address since firewalls can block the probe SYN while
+  // still permitting the real SSH source-IP.
+  if (!probeKnowsIpForVm(vmUuid, host)) {
+    return res.status(400).json({ error: `Host ${host} is not a known address for this VM. Run a port scan first.` });
+  }
+
+  const sessionId = crypto.randomBytes(16).toString("hex");
+  const now = Date.now();
+  sshSessions.set(sessionId, {
+    vmUuid,
+    host,
+    port,
+    username,
+    password,
+    privateKey,
+    passphrase,
+    owner: req.nrccSession.currentUser,
+    sessionCookie: req.nrccSid || null,
+    createdAt: now,
+    expiresAt: now + SSH_IDLE_TIMEOUT_MS
+  });
+  res.json({ sessionId, websocketUrl: `/ws-ssh/${sessionId}` });
 });
 
 // =====================================================================
@@ -1958,38 +2348,83 @@ async function createPrismLegacySessionCookie(client, username, password) {
 
 function collectVmIpAddresses(vm) {
   const out = new Set();
-  const visit = (node) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      node.forEach(visit);
+  const IPV4_LITERAL = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+  const visit = (node, parentKey) => {
+    if (node == null) return;
+    // Plain IPv4 string under an IP-shaped key. This covers the common
+    // v4 AHV shape `nics[].networkInfo.ipv4Info.learnedIpAddresses:
+    // ["10.0.0.5"]` (each array element lands here as `parentKey =
+    // "learnedIpAddresses"`).
+    if (typeof node === "string") {
+      if (IPV4_LITERAL.test(node) && parentKey && /(ip|address)/i.test(parentKey)) {
+        out.add(node);
+      }
       return;
     }
-    // Common shapes: { ipAddress: { value: "1.2.3.4" } } or { ipAddress: "1.2.3.4" }
-    // or { value: "1.2.3.4" } inside ipv4Config / secondaryIpAddressList / ipAddresses.
+    if (typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      // Inherit the parent key so a `learnedIpAddresses: ["1.2.3.4"]`
+      // array passes the IP-shaped-key test for each element.
+      node.forEach((child) => visit(child, parentKey));
+      return;
+    }
+    // Object: pick up direct IP-shaped strings AND recurse into
+    // children (covers `ipAddress: { value: "1.2.3.4" }`,
+    // `ipv4Config.ipAddress.value`, etc).
     for (const [key, val] of Object.entries(node)) {
       if (
         typeof val === "string" &&
-        /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(val) &&
-        /(ip|address)/i.test(key)
+        IPV4_LITERAL.test(val) &&
+        /(ip|address|value)/i.test(key) &&
+        // The parent key has to look IP-related so we don't slurp
+        // unrelated fields like `metadata.uuid` (no IPv4 hits there
+        // anyway, but belt and braces).
+        (/(ip|address)/i.test(key) || /(ip|address)/i.test(parentKey || ""))
       ) {
         out.add(val);
       } else if (val && typeof val === "object") {
-        visit(val);
+        visit(val, key);
       }
     }
   };
   // Look at the most likely locations first to avoid sweeping unrelated fields.
   const roots = [
     vm?.nics,
+    vm?.spec?.resources?.nic_list,
+    vm?.status?.resources?.nic_list,
     vm?.spec?.resources?.nicList,
     vm?.status?.resources?.nicList,
     vm?.networkConfig,
     vm?.networkInfo
   ];
-  roots.forEach(visit);
-  // Fallback: scan whole record (cheap for these small objects).
-  if (out.size === 0) visit(vm);
+  roots.forEach((root) => visit(root, ""));
+  // Fallback: scan the whole record. Cheap for these small objects
+  // and catches less-common shapes like
+  // `vm.vm_nics[i].ip_endpoint_list[i].ip` that PE legacy hosts emit.
+  if (out.size === 0) visit(vm, "");
   return Array.from(out);
+}
+
+// Quick visibility into Prism IP-reporting coverage. Logged once per
+// /api/vms response so an operator can tell at a glance whether the
+// IP parser is keeping up with the VMs the cluster has, and how
+// many VMs are simply IP-less from Prism's point of view (no IPAM
+// lease, no NGT, etc.).
+function logIpCoverage(vms, variant, withCvm) {
+  if (!Array.isArray(vms) || !vms.length) return;
+  let withIp = 0;
+  let withoutIp = 0;
+  const samples = [];
+  for (const vm of vms) {
+    const ips = Array.isArray(vm.ipAddresses) ? vm.ipAddresses : [];
+    if (ips.length) {
+      withIp += 1;
+      if (samples.length < 3) samples.push(`${vm.name}=${ips[0]}`);
+    } else {
+      withoutIp += 1;
+    }
+  }
+  console.log(`[ip-coverage] variant=${variant || "default"} cvm-pass=${withCvm} total=${vms.length} withIp=${withIp} withoutIp=${withoutIp} samples=[${samples.join(", ")}]`);
 }
 
 function parseVmList(vmResponse) {
@@ -3232,6 +3667,7 @@ app.post("/api/vms", async (req, res) => {
           }
         }
       }
+      logIpCoverage(deduped, selectedVariant, true);
       return res.json({
         vms: deduped,
         count: deduped.length,
@@ -3245,6 +3681,7 @@ app.post("/api/vms", async (req, res) => {
         ]
       });
     }
+    logIpCoverage(deduped, selectedVariant, false);
     return res.json({
       vms: deduped,
       count: deduped.length,
@@ -4070,6 +4507,10 @@ const wsServer = new WebSocketServer({ noServer: true });
 // Chat WebSocketServer is only attached when multi-user mode is on; in
 // single-user mode it stays null and any /ws-chat upgrade is rejected.
 const wsChatServer = MULTI_USER_MODE ? new WebSocketServer({ noServer: true }) : null;
+// SSH terminal WebSocketServer. Always created even in single-user mode
+// because the SSH feature is per-user, not multi-user; a single-user
+// install can still SSH into VMs from the browser.
+const wsSshServer = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   // The upgrade handler runs before Express middleware, so build a URL
@@ -4087,6 +4528,14 @@ server.on("upgrade", (req, socket, head) => {
   if (wsChatServer && requestUrl.pathname === "/ws-chat") {
     wsChatServer.handleUpgrade(req, socket, head, (ws) => {
       wsChatServer.emit("connection", ws, req, requestUrl);
+    });
+    return;
+  }
+
+  if (requestUrl.pathname.startsWith("/ws-ssh/")) {
+    if (!SSH_ENABLED) { socket.destroy(); return; }
+    wsSshServer.handleUpgrade(req, socket, head, (ws) => {
+      wsSshServer.emit("connection", ws, req, requestUrl);
     });
     return;
   }
@@ -4189,6 +4638,183 @@ wsServer.on("connection", (clientSocket, req, requestUrl) => {
     closeBoth(1011, "Client error");
     logConsoleClose("client-error");
   });
+});
+
+// =====================================================================
+// SSH terminal WebSocket. Consumes a session id created by
+// /api/ssh/start, opens an ssh2.Client.shell() against the cached
+// host/credentials, and pipes raw bytes both directions. Text frames
+// from the client carry control messages (currently just window
+// resize). The session id is single-use: the entry is deleted from
+// `sshSessions` the moment the upgrade is accepted, so a captured
+// id cannot be replayed.
+// =====================================================================
+wsSshServer.on("connection", (ws, req, requestUrl) => {
+  const sessionId = requestUrl.pathname.replace("/ws-ssh/", "");
+  const sess = sshSessions.get(sessionId);
+  if (!sess) {
+    try { ws.close(1011, "Session not found"); } catch (_e) { /* ignore */ }
+    return;
+  }
+  // Single-use: the credentials only need to live in the map until we
+  // hand them to ssh2. This also means a duplicate WS upgrade for the
+  // same sessionId is a no-op.
+  sshSessions.delete(sessionId);
+
+  // Belt-and-braces re-validate the SSRF guard in case the probe
+  // cache expired between /api/ssh/start and the WS upgrade.
+  if (!probeKnowsIpForVm(sess.vmUuid, sess.host)) {
+    try { ws.close(1011, "Probe cache expired; re-scan and retry"); } catch (_e) { /* ignore */ }
+    return;
+  }
+
+  const ssh2 = getSsh2();
+  if (!ssh2) {
+    try { ws.close(1011, "ssh2 module not installed"); } catch (_e) { /* ignore */ }
+    return;
+  }
+
+  const connectedAtMs = Date.now();
+  let consoleCloseLogged = false;
+  const logSshClose = (reason) => {
+    if (consoleCloseLogged) return;
+    consoleCloseLogged = true;
+    appendLog({
+      type: "ssh.close",
+      vmUuid: sess.vmUuid,
+      username: sess.owner,
+      sessionId: sess.sessionCookie,
+      details: {
+        host: sess.host,
+        port: sess.port,
+        sshUser: sess.username,
+        durationMs: Date.now() - connectedAtMs,
+        reason: reason || "closed"
+      }
+    });
+  };
+
+  const client = new ssh2.Client();
+  let stream = null;
+
+  const closeAll = (code, reason) => {
+    try { if (stream) stream.end(); } catch (_e) { /* ignore */ }
+    try { client.end(); } catch (_e) { /* ignore */ }
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.close(code || 1000, reason || "closed"); } catch (_e) { /* ignore */ }
+    }
+  };
+
+  // ws.send is a no-op once the socket is closed; wrap to swallow the
+  // race where ssh2 emits a final chunk between ws "close" and the
+  // stream end firing.
+  const safeSend = (chunk) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(chunk, { binary: true }); } catch (_e) { /* ignore */ }
+  };
+
+  client.on("ready", () => {
+    appendLog({
+      type: "ssh.open",
+      vmUuid: sess.vmUuid,
+      username: sess.owner,
+      sessionId: sess.sessionCookie,
+      details: { host: sess.host, port: sess.port, sshUser: sess.username }
+    });
+    client.shell({ term: "xterm-256color", cols: 80, rows: 24 }, (err, sshStream) => {
+      if (err) {
+        safeSend(Buffer.from(`\r\n[nrcc] shell allocation failed: ${err.message}\r\n`));
+        closeAll(1011, "shell-failed");
+        logSshClose(`shell-error:${err.message}`);
+        return;
+      }
+      stream = sshStream;
+      // Notify the client that the shell is up so the UI can hide its
+      // "connecting..." overlay before the first prompt arrives.
+      try { ws.send(JSON.stringify({ type: "ready" })); } catch (_e) { /* ignore */ }
+      stream.on("data", (chunk) => safeSend(chunk));
+      stream.stderr.on("data", (chunk) => safeSend(chunk));
+      stream.on("close", () => {
+        closeAll(1000, "shell-closed");
+        logSshClose("shell-closed");
+      });
+    });
+  });
+
+  client.on("error", (err) => {
+    safeSend(Buffer.from(`\r\n[nrcc] ssh error: ${err.message}\r\n`));
+    closeAll(1011, "ssh-error");
+    logSshClose(`ssh-error:${err.message}`);
+  });
+
+  client.on("end", () => { logSshClose("client-end"); });
+  client.on("close", () => { closeAll(1000, "client-close"); });
+
+  ws.on("message", (data, isBinary) => {
+    // Binary frames go straight through to the shell; text frames are
+    // small JSON control messages. The legitimate client only sends
+    // resize today, but we leave the shape open for future extensions.
+    if (isBinary) {
+      if (stream) {
+        try { stream.write(data); } catch (_e) { /* ignore */ }
+      }
+      return;
+    }
+    let msg;
+    try { msg = JSON.parse(data.toString("utf8")); } catch (_e) { return; }
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "resize" && stream) {
+      const cols = Math.max(2, Math.min(500, Number(msg.cols) || 80));
+      const rows = Math.max(2, Math.min(500, Number(msg.rows) || 24));
+      try { stream.setWindow(rows, cols, 0, 0); } catch (_e) { /* ignore */ }
+    } else if (msg.type === "data" && typeof msg.data === "string" && stream) {
+      // Allow text-frame keystroke pass-through for clients that
+      // can't send binary frames (rare, but xterm.js does send
+      // strings via onData which the client encodes as binary).
+      try { stream.write(msg.data); } catch (_e) { /* ignore */ }
+    }
+  });
+
+  ws.on("close", () => {
+    closeAll(1000, "ws-closed");
+    logSshClose("ws-closed");
+  });
+  ws.on("error", () => {
+    closeAll(1011, "ws-error");
+    logSshClose("ws-error");
+  });
+
+  const connectOpts = {
+    host: sess.host,
+    port: sess.port,
+    username: sess.username,
+    readyTimeout: SSH_READY_TIMEOUT_MS,
+    keepaliveInterval: 30_000,
+    // v1: accept any host key. README documents this as a known beta
+    // limitation. The IP allow-list (RFC1918 + probe cache) is the
+    // primary defence.
+    hostVerifier: () => true
+  };
+  if (sess.privateKey) {
+    connectOpts.privateKey = sess.privateKey;
+    if (sess.passphrase) connectOpts.passphrase = sess.passphrase;
+  } else if (sess.password) {
+    connectOpts.password = sess.password;
+    // Some sshd configs require keyboard-interactive auth even when a
+    // password is configured; ssh2's tryKeyboard helper feeds the same
+    // password through that flow.
+    connectOpts.tryKeyboard = true;
+    client.on("keyboard-interactive", (_n, _i, _l, _p, finish) => {
+      finish([sess.password]);
+    });
+  }
+  try {
+    client.connect(connectOpts);
+  } catch (err) {
+    safeSend(Buffer.from(`\r\n[nrcc] ssh connect failed: ${err.message}\r\n`));
+    closeAll(1011, "connect-error");
+    logSshClose(`connect-error:${err.message}`);
+  }
 });
 
 // =====================================================================

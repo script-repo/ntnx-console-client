@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NRCC — Nutanix Remote Console Client</title>
+    <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
     <style>
       :root {
         --ntx-bg: #f4f6fa;
@@ -377,6 +378,26 @@
         color: var(--ntx-warn);
         background: var(--ntx-warn-soft);
       }
+      /* SSH / RDP availability pills (beta: vmPortScan). Rendered next
+         to the state pill in each VM row when the server-side probe
+         saw the corresponding port open. */
+      .vm-port-pill {
+        display: inline-flex;
+        align-items: center;
+        margin-left: 6px;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        background: var(--ntx-accent-soft);
+        color: var(--ntx-accent);
+      }
+      .vm-port-pill[data-protocol="rdp"] {
+        background: var(--ntx-warn-soft);
+        color: var(--ntx-warn);
+      }
       .star {
         height: 28px;
         width: 28px;
@@ -625,6 +646,22 @@
         border-top-left-radius: 8px;
         border-top-right-radius: 8px;
       }
+      /* SSH tabs are coloured green so they're easy to tell apart
+         from the (blue-accented) VNC tabs at a glance. The accent
+         strip on the active tab follows the same rule. */
+      .tab.is-ssh {
+        color: var(--ntx-success);
+      }
+      .tab.is-ssh:hover {
+        color: var(--ntx-success);
+      }
+      .tab.is-ssh.active {
+        color: var(--ntx-success);
+        border-color: var(--ntx-success);
+      }
+      .tab.is-ssh.active::before {
+        background: var(--ntx-success);
+      }
       .tab-close {
         border: 0;
         background: transparent;
@@ -829,6 +866,11 @@
       }
       .ctx-menu-item.power-on .ctx-icon { color: var(--ntx-success); }
       .ctx-menu-item.power-off .ctx-icon { color: var(--ntx-danger); }
+      .ctx-menu-sep {
+        height: 1px;
+        background: var(--ntx-border);
+        margin: 4px 6px;
+      }
       .console-stage {
         border: 1px solid var(--ntx-border-strong);
         background: #000;
@@ -845,6 +887,80 @@
       }
       .console-pane.active {
         display: block;
+      }
+      /* SSH (xterm.js) panes: black background and the xterm helper
+         spans need to fill the pane so canvas.captureStream picks up
+         the right viewport. */
+      .console-pane.is-ssh {
+        background: #000;
+      }
+      .console-pane.is-ssh .xterm,
+      .console-pane.is-ssh .xterm-viewport,
+      .console-pane.is-ssh .xterm-screen {
+        width: 100%;
+        height: 100%;
+      }
+      .console-pane.is-ssh .ssh-status-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0,0,0,0.7);
+        color: #fff;
+        font-size: 13px;
+        font-family: var(--font-mono, monospace);
+        text-align: center;
+        padding: 20px;
+        z-index: 5;
+        pointer-events: none;
+      }
+      .console-pane.is-ssh .ssh-status-overlay[hidden] { display: none; }
+      .ssh-ip-picker-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .ssh-ip-picker-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 10px;
+        background: var(--ntx-pill-bg);
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        cursor: pointer;
+        font-family: var(--font-mono, monospace);
+        font-size: 13px;
+      }
+      .ssh-ip-picker-row:hover {
+        background: var(--ntx-accent-soft);
+        border-color: var(--ntx-accent);
+      }
+      .ssh-ip-picker-row .ssh-ip-status {
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        text-transform: uppercase;
+        padding: 2px 6px;
+        border-radius: 4px;
+      }
+      .ssh-ip-picker-row .ssh-ip-status[data-status="open"] {
+        background: var(--ntx-success-soft);
+        color: var(--ntx-success);
+      }
+      .ssh-ip-picker-row .ssh-ip-status[data-status="refused"],
+      .ssh-ip-picker-row .ssh-ip-status[data-status="timeout"],
+      .ssh-ip-picker-row .ssh-ip-status[data-status="error"] {
+        background: var(--ntx-warn-soft);
+        color: var(--ntx-warn);
+      }
+      .ssh-ip-picker-row .ssh-ip-status[data-status="unknown"] {
+        background: var(--ntx-pill-bg);
+        color: var(--ntx-text-subtle);
       }
       .console-empty {
         position: absolute;
@@ -2731,6 +2847,74 @@
         <div class="modal-footer">
           <button id="peCredsCancel">Cancel</button>
           <button id="peCredsSave" class="primary">Test &amp; Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SSH credentials modal (beta: sshConsole). Hidden entirely by
+         the [data-feature] guard until the user enables Beta in
+         Settings AND the right-click "Open SSH" item is clicked. -->
+    <div id="sshCredsModal" class="modal-backdrop" role="dialog" aria-modal="true" data-feature="sshConsole">
+      <div class="modal">
+        <div class="modal-header">
+          SSH credentials
+        </div>
+        <div class="modal-body">
+          <p style="margin:0;color:var(--ntx-text-muted)">
+            Connecting to
+            <span id="sshCredsTarget" style="font-weight:600"></span>.
+            Credentials are kept in <strong>browser memory only</strong>
+            for the duration of the browser session, and forwarded to
+            the NRCC server only for the lifetime of this single SSH
+            connection.
+          </p>
+          <label>
+            Username
+            <input id="sshCredsUsername" placeholder="root" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+          </label>
+          <label>
+            <input id="sshCredsUseKey" type="checkbox" />
+            Authenticate with a private key instead of a password
+          </label>
+          <label id="sshCredsPasswordRow">
+            Password
+            <input id="sshCredsPassword" type="password" autocomplete="off" />
+          </label>
+          <label id="sshCredsKeyRow" hidden>
+            Private key (OpenSSH format, including the BEGIN/END lines)
+            <textarea id="sshCredsPrivateKey" rows="6" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."></textarea>
+          </label>
+          <label id="sshCredsPassphraseRow" hidden>
+            Key passphrase (optional)
+            <input id="sshCredsPassphrase" type="password" autocomplete="off" />
+          </label>
+          <label>
+            <input id="sshCredsRemember" type="checkbox" />
+            Remember for this browser session
+          </label>
+          <div id="sshCredsError" class="modal-error" style="display:none"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="sshCredsCancel">Cancel</button>
+          <button id="sshCredsSubmit" class="primary">Connect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SSH IP picker (beta: sshConsole). Shown when the VM has more
+         than one IP, OR the port scan saw port 22 closed on every IP
+         and the user is choosing to "try anyway". -->
+    <div id="sshIpPickerModal" class="modal-backdrop" role="dialog" aria-modal="true" data-feature="sshConsole">
+      <div class="modal">
+        <div class="modal-header">
+          Choose SSH target
+        </div>
+        <div class="modal-body">
+          <p id="sshIpPickerMsg" style="margin:0;color:var(--ntx-text-muted)"></p>
+          <div id="sshIpPickerList" class="ssh-ip-picker-list"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="sshIpPickerCancel">Cancel</button>
         </div>
       </div>
     </div>

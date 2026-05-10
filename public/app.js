@@ -110,6 +110,26 @@ const settingsVersionLabel = document.getElementById("settingsVersionLabel");
 const settingsUpdateBtn = document.getElementById("settingsUpdateBtn");
 const settingsUpdateStatus = document.getElementById("settingsUpdateStatus");
 
+const sshCredsModal = document.getElementById("sshCredsModal");
+const sshCredsTargetLabel = document.getElementById("sshCredsTarget");
+const sshCredsUsernameInput = document.getElementById("sshCredsUsername");
+const sshCredsUseKeyInput = document.getElementById("sshCredsUseKey");
+const sshCredsPasswordRow = document.getElementById("sshCredsPasswordRow");
+const sshCredsPasswordInput = document.getElementById("sshCredsPassword");
+const sshCredsKeyRow = document.getElementById("sshCredsKeyRow");
+const sshCredsPrivateKeyInput = document.getElementById("sshCredsPrivateKey");
+const sshCredsPassphraseRow = document.getElementById("sshCredsPassphraseRow");
+const sshCredsPassphraseInput = document.getElementById("sshCredsPassphrase");
+const sshCredsRememberInput = document.getElementById("sshCredsRemember");
+const sshCredsErrorEl = document.getElementById("sshCredsError");
+const sshCredsCancelBtn = document.getElementById("sshCredsCancel");
+const sshCredsSubmitBtn = document.getElementById("sshCredsSubmit");
+
+const sshIpPickerModal = document.getElementById("sshIpPickerModal");
+const sshIpPickerMsg = document.getElementById("sshIpPickerMsg");
+const sshIpPickerListEl = document.getElementById("sshIpPickerList");
+const sshIpPickerCancelBtn = document.getElementById("sshIpPickerCancel");
+
 // =====================================================================
 // Storage keys
 // =====================================================================
@@ -680,10 +700,22 @@ function createVmRow(vm, opts = {}) {
   const fav = isFavorite(vm.uuid);
   const normPower = normalizePowerState(vm.powerState);
   const pillLabel = vm.powerState ? normPower : isLive ? "UNKNOWN" : "Loading";
+  // Beta: render small SSH / RDP pills if the port scanner has seen
+  // them open. The wrapping span carries data-feature="vmPortScan" so
+  // the existing feature-flag refresh hides the entire group when
+  // the beta toggle is off.
+  const portStatus = vmPortStatus.get(vm.uuid);
+  let portPills = "";
+  if (portStatus && (portStatus.ssh || portStatus.rdp)) {
+    const parts = [];
+    if (portStatus.ssh) parts.push(`<span class="vm-port-pill" data-protocol="ssh" title="SSH (port 22) reachable">SSH</span>`);
+    if (portStatus.rdp) parts.push(`<span class="vm-port-pill" data-protocol="rdp" title="RDP (port 3389) reachable">RDP</span>`);
+    portPills = `<span data-feature="vmPortScan">${parts.join("")}</span>`;
+  }
   row.innerHTML = `
     <button class="star ${fav ? "is-fav" : ""}" title="${fav ? "Remove favorite" : "Add favorite"}">${fav ? "★" : "☆"}</button>
     <div class="vm-item ${isLive ? "" : "is-loading"}">
-      <div class="vm-name">${escapeHtml(vm.name || vm.uuid)}<span class="state-pill" data-state="${escapeHtml(normPower)}">${escapeHtml(pillLabel)}</span></div>
+      <div class="vm-name">${escapeHtml(vm.name || vm.uuid)}<span class="state-pill" data-state="${escapeHtml(normPower)}">${escapeHtml(pillLabel)}</span>${portPills}</div>
       <div class="vm-meta">${escapeHtml(metaLine(vm) || (isLive ? "" : "Updating from Prism Central..."))}</div>
     </div>
   `;
@@ -1097,6 +1129,9 @@ function logout() {
   // Stop the update-availability poll and clear the gear-icon badge
   // so the login screen doesn't show a stale dot.
   stopUpdateBadgePoll();
+  // Beta: drop any cached SSH credentials and stop the port scanner.
+  if (typeof sshCredsCache !== "undefined") sshCredsCache.clear();
+  if (typeof vmPortScanner !== "undefined") vmPortScanner.clear();
   showLoginScreen();
   setStatus("Idle");
   setTimeout(() => loginPasswordInput.focus(), 100);
@@ -1112,6 +1147,11 @@ function applyVmListResult(data) {
   fillFilterOptions();
   refreshFavoriteSnapshots();
   renderAll();
+  // Beta: schedule a TCP port scan over the freshly-loaded VM IPs so
+  // the SSH/RDP availability pills (and the "Open SSH" right-click
+  // item) light up. The scanner is a no-op when the beta feature is
+  // off, so leaving the call unconditional is safe.
+  vmPortScanner.scheduleProbe(vmCache);
 
   setStatus(
     `Loaded ${vmCache.length} VMs` +
@@ -1215,7 +1255,7 @@ function updateConsoleControls() {
 
 function sendCtrlAltDel() {
   const session = consoleSessions.find((s) => s.id === activeSessionId);
-  if (!session?.rfb) return;
+  if (!session?.rfb) return; // No-op for SSH tabs (xterm.js doesn't have a sendKey API)
   const rfb = session.rfb;
   rfb.sendKey(0xffe3, "ControlLeft", true);
   rfb.sendKey(0xffe9, "AltLeft", true);
@@ -1911,9 +1951,29 @@ async function readClipboardOrWarn() {
 
 async function pasteClipboardToConsole() {
   const session = consoleSessions.find((s) => s.id === activeSessionId);
-  if (!session?.rfb) return;
+  if (!session) return;
   const text = await readClipboardOrWarn();
   if (text == null) return;
+  // SSH tabs: write straight into the WS as bytes. The terminal
+  // renders the echo from the remote side so we get correct visual
+  // feedback for free, and we don't need the per-key Shift/AltGr
+  // dance the VNC path uses.
+  if (session.kind === "ssh") {
+    if (!session.ssh || !session.ssh.ws || session.ssh.ws.readyState !== WebSocket.OPEN) {
+      setStatus(`SSH session for ${session.vmName} is not connected.`);
+      return;
+    }
+    setStatus(`Pasting ${text.length} chars into ${session.vmName}...`);
+    try {
+      session.ssh.ws.send(new TextEncoder().encode(text));
+      logEvent("console.paste", session.vmUuid, { length: text.length, transport: "ssh" });
+      setStatus(`Pasted into ${session.vmName}.`);
+    } catch (err) {
+      setStatus(`Paste failed: ${err.message || err}`);
+    }
+    return;
+  }
+  if (!session.rfb) return;
   setStatus(`Typing clipboard into ${session.vmName}...`, { spinner: true });
   // Use a small per-keystroke delay (and a slightly longer pause after
   // each newline) so the same code path is safe everywhere: Windows
@@ -1942,10 +2002,18 @@ function closeSession(sessionId) {
     try { stopRecordingForSession(s, { reason: "session-closed" }); }
     catch (_e) { /* best-effort */ }
   }
-  try {
-    s.rfb.disconnect();
-  } catch (_error) {
-    /* ignore disconnect issues */
+  if (s.kind === "ssh") {
+    // SSH tabs use a WebSocket + xterm.js, not noVNC. Tear them down
+    // in their own helper which closes the WS, disposes the
+    // terminal, and disconnects the resize observer.
+    try { teardownSshSession(s); } catch (_error) { /* ignore */ }
+    logEvent("console.ssh.close", s.vmUuid, { reason: "session-closed" });
+  } else {
+    try {
+      s.rfb.disconnect();
+    } catch (_error) {
+      /* ignore disconnect issues */
+    }
   }
   s.tabEl.remove();
   s.screenEl.remove();
@@ -2212,6 +2280,48 @@ function showVmContextMenu(x, y, vmUuid) {
     });
   }
   ctxMenu.appendChild(offItem);
+
+  // Beta: SSH menu item is always present when the user has enabled
+  // the sshConsole flag AND the VM has at least one known IP. The
+  // label adapts to scan state so the user can tell at a glance
+  // whether the port is confirmed reachable, looks closed, or
+  // hasn't been scanned yet. Clicking will run an on-demand probe
+  // when needed and fall back to an IP picker if port 22 looks
+  // closed everywhere. RDP is intentionally not wired yet -- see
+  // the deferred plan; the marker below is the hook the follow-up
+  // will use.
+  if (featureFlags.isEnabled("sshConsole")) {
+    const liveVmForMenu = getVmByUuid(vmUuid);
+    const snapForMenu = liveVmForMenu || (favStore.vmMeta && favStore.vmMeta[vmUuid]) || null;
+    const ipsForMenu = liveVmForMenu
+      ? (Array.isArray(liveVmForMenu.ipAddresses) ? liveVmForMenu.ipAddresses : (liveVmForMenu.ipAddress ? [liveVmForMenu.ipAddress] : []))
+      : (snapForMenu && snapForMenu.ipAddress ? [snapForMenu.ipAddress] : []);
+    if (ipsForMenu.length) {
+      const sep = document.createElement("div");
+      sep.className = "ctx-menu-sep";
+      ctxMenu.appendChild(sep);
+      const sshItem = document.createElement("div");
+      sshItem.className = "ctx-menu-item";
+      sshItem.dataset.feature = "sshConsole";
+      const portStatus = vmPortStatus.get(vmUuid);
+      let label;
+      if (portStatus && portStatus.ssh && portStatus.preferredIp && portStatus.preferredIp.ssh) {
+        label = `Open SSH (${portStatus.preferredIp.ssh})`;
+      } else if (portStatus && !portStatus.ssh) {
+        label = "Open SSH (try anyway)";
+      } else {
+        label = "Open SSH (probe...)";
+      }
+      sshItem.innerHTML = `<span class="ctx-icon">$</span><span>${escapeHtml(label)}</span>`;
+      sshItem.addEventListener("click", () => {
+        hideContextMenu();
+        openSshFor(vmUuid);
+      });
+      ctxMenu.appendChild(sshItem);
+    }
+  }
+  // TODO(rdp): when the RDP guacd backend lands, mirror the SSH
+  // block above and gate on featureFlags.isEnabled("rdpConsole").
 
   // Position, then clamp to viewport
   ctxMenu.style.left = `${x}px`;
@@ -3086,6 +3196,529 @@ document.addEventListener("keydown", (event) => {
 });
 
 // =====================================================================
+// VM port-scan (beta: vmPortScan)
+// =====================================================================
+//
+// Posts batches of {uuid, ipAddresses[]} to /api/probe/ports after the
+// VM list arrives. Results are merged into vmPortStatus and the VM
+// list is re-rendered so the SSH / RDP availability pills appear.
+// The same map is consulted by openSshFor() to pick a target IP.
+
+// uuid -> { scannedAt, ips: { ip: { port: status } }, ssh, rdp,
+//           preferredIp: { ssh, rdp } }
+const vmPortStatus = new Map();
+const vmPortScanner = (() => {
+  let queue = [];
+  let timer = null;
+  let inFlight = false;
+  // Server endpoint caps each request at 200 VMs; we send a smaller
+  // batch to keep latency tight on big PCs.
+  const BATCH_SIZE = 50;
+  const DEBOUNCE_MS = 500;
+
+  function cancelTimer() {
+    if (timer) { clearTimeout(timer); timer = null; }
+  }
+
+  async function flush() {
+    if (inFlight || !queue.length) { timer = null; return; }
+    if (!featureFlags.isEnabled("vmPortScan")) { queue = []; timer = null; return; }
+    const batch = queue.splice(0, BATCH_SIZE);
+    inFlight = true;
+    try {
+      const resp = await fetch("/api/probe/ports", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ vms: batch })
+      });
+      if (resp.status === 503) {
+        // Server has the feature disabled. Stop scheduling; the user's
+        // beta toggle won't change that.
+        queue = [];
+        timer = null;
+        inFlight = false;
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const results = (data && data.results) || {};
+      for (const uuid of Object.keys(results)) {
+        vmPortStatus.set(uuid, results[uuid]);
+      }
+      // Coalesce one re-render per batch so 500 VMs don't trigger
+      // 500 layout passes.
+      try { renderVmList(); } catch (_e) { /* ignore */ }
+    } catch (_err) {
+      // Probe failures are non-fatal; the pills just won't appear.
+    } finally {
+      inFlight = false;
+      if (queue.length) {
+        timer = setTimeout(flush, DEBOUNCE_MS);
+      } else {
+        timer = null;
+      }
+    }
+  }
+
+  return {
+    scheduleProbe(vms) {
+      if (!Array.isArray(vms) || !vms.length) return;
+      if (!featureFlags.isEnabled("vmPortScan")) return;
+      // Build the lean payload (uuid + ipAddresses only) and skip VMs
+      // with no IPs, since the server has nothing to probe for them.
+      const seen = new Set(queue.map((v) => v.uuid));
+      for (const vm of vms) {
+        if (!vm || !vm.uuid) continue;
+        if (seen.has(vm.uuid)) continue;
+        // Skip if we already have a fresh-enough cached entry; the
+        // server caches too, but skipping the round-trip saves a
+        // request entirely.
+        const existing = vmPortStatus.get(vm.uuid);
+        if (existing && (Date.now() - existing.scannedAt) < 60_000) continue;
+        const ips = Array.isArray(vm.ipAddresses) ? vm.ipAddresses : (vm.ipAddress ? [vm.ipAddress] : []);
+        if (!ips.length) continue;
+        queue.push({ uuid: vm.uuid, ipAddresses: ips });
+        seen.add(vm.uuid);
+      }
+      cancelTimer();
+      timer = setTimeout(flush, DEBOUNCE_MS);
+    },
+    clear() {
+      vmPortStatus.clear();
+      queue = [];
+      cancelTimer();
+    },
+    // On-demand probe of a single VM. Bypasses the debounced queue so
+    // the caller (typically openSshFor) can await a fresh result. The
+    // backing /api/probe/ports endpoint is server-cached for
+    // NRCC_PROBE_CACHE_TTL_MS, so back-to-back clicks are cheap.
+    async probeNow(vm) {
+      if (!vm || !vm.uuid) return null;
+      const ips = Array.isArray(vm.ipAddresses) ? vm.ipAddresses : (vm.ipAddress ? [vm.ipAddress] : []);
+      if (!ips.length) return null;
+      try {
+        const resp = await fetch("/api/probe/ports", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ vms: [{ uuid: vm.uuid, ipAddresses: ips }] })
+        });
+        if (!resp.ok) return vmPortStatus.get(vm.uuid) || null;
+        const data = await resp.json();
+        const result = data && data.results && data.results[vm.uuid];
+        if (result) {
+          vmPortStatus.set(vm.uuid, result);
+          try { renderVmList(); } catch (_e) { /* ignore */ }
+        }
+        return result || null;
+      } catch (_err) {
+        return vmPortStatus.get(vm.uuid) || null;
+      }
+    }
+  };
+})();
+
+// =====================================================================
+// SSH browser console (beta: sshConsole)
+// =====================================================================
+//
+// Opens an SSH session as a console tab using xterm.js + a server
+// WebSocket proxy that runs the actual ssh2.Client. Because xterm's
+// WebGL renderer publishes a single <canvas> into the same console
+// pane that noVNC uses for VNC tabs, the existing screenshot and
+// recording pipelines work without modification.
+
+// Lazy-loaded ESM modules. We only pull them in when the user
+// actually opens an SSH tab so the noVNC-only happy path doesn't
+// pay the bundle cost.
+let _xtermModulesPromise = null;
+function loadXtermModules() {
+  if (_xtermModulesPromise) return _xtermModulesPromise;
+  _xtermModulesPromise = Promise.all([
+    import("/vendor/xterm/lib/xterm.mjs"),
+    import("/vendor/xterm-addon-fit/lib/addon-fit.mjs"),
+    import("/vendor/xterm-addon-webgl/lib/addon-webgl.mjs")
+  ]).then(([xtermMod, fitMod, webglMod]) => ({
+    Terminal: xtermMod.Terminal,
+    FitAddon: fitMod.FitAddon,
+    WebglAddon: webglMod.WebglAddon
+  }));
+  return _xtermModulesPromise;
+}
+
+// vmUuid -> { username, password, privateKey, passphrase }. Cleared
+// on logout. Populated only when the user ticks "Remember for this
+// browser session" in the SSH credentials modal.
+const sshCredsCache = new Map();
+
+function promptForSshCreds(vmUuid, host, port, prefill) {
+  return new Promise((resolve) => {
+    if (!sshCredsModal) { resolve(null); return; }
+    const seed = prefill || sshCredsCache.get(vmUuid) || {};
+    sshCredsTargetLabel.textContent = `${host}:${port}`;
+    sshCredsUsernameInput.value = seed.username || "root";
+    sshCredsUseKeyInput.checked = !!seed.privateKey;
+    sshCredsPasswordInput.value = "";
+    sshCredsPrivateKeyInput.value = seed.privateKey || "";
+    sshCredsPassphraseInput.value = "";
+    sshCredsRememberInput.checked = !!seed.remember;
+    sshCredsErrorEl.style.display = "none";
+    sshCredsErrorEl.textContent = "";
+
+    const syncRows = () => {
+      const useKey = sshCredsUseKeyInput.checked;
+      sshCredsPasswordRow.hidden = useKey;
+      sshCredsKeyRow.hidden = !useKey;
+      sshCredsPassphraseRow.hidden = !useKey;
+    };
+    syncRows();
+
+    sshCredsModal.classList.add("open");
+    setTimeout(() => sshCredsUsernameInput.focus(), 50);
+
+    const cleanup = () => {
+      sshCredsModal.classList.remove("open");
+      sshCredsCancelBtn.removeEventListener("click", onCancel);
+      sshCredsSubmitBtn.removeEventListener("click", onSubmit);
+      sshCredsUseKeyInput.removeEventListener("change", syncRows);
+      sshCredsModal.removeEventListener("keydown", onKey);
+      // Wipe sensitive inputs so they don't linger in the DOM.
+      sshCredsPasswordInput.value = "";
+      sshCredsPrivateKeyInput.value = "";
+      sshCredsPassphraseInput.value = "";
+    };
+    const onCancel = () => { cleanup(); resolve(null); };
+    const onSubmit = () => {
+      const username = sshCredsUsernameInput.value.trim();
+      const useKey = sshCredsUseKeyInput.checked;
+      const password = useKey ? "" : sshCredsPasswordInput.value;
+      const privateKey = useKey ? sshCredsPrivateKeyInput.value.trim() : "";
+      const passphrase = useKey ? sshCredsPassphraseInput.value : "";
+      if (!username) {
+        sshCredsErrorEl.textContent = "Username is required.";
+        sshCredsErrorEl.style.display = "block";
+        return;
+      }
+      if (useKey && !privateKey) {
+        sshCredsErrorEl.textContent = "Paste the private key (OpenSSH format) or untick the key checkbox.";
+        sshCredsErrorEl.style.display = "block";
+        return;
+      }
+      if (!useKey && !password) {
+        sshCredsErrorEl.textContent = "Password is required.";
+        sshCredsErrorEl.style.display = "block";
+        return;
+      }
+      const remember = sshCredsRememberInput.checked;
+      const creds = { username, password, privateKey, passphrase, remember };
+      cleanup();
+      resolve(creds);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") { event.preventDefault(); onCancel(); }
+    };
+    sshCredsCancelBtn.addEventListener("click", onCancel);
+    sshCredsSubmitBtn.addEventListener("click", onSubmit);
+    sshCredsUseKeyInput.addEventListener("change", syncRows);
+    sshCredsModal.addEventListener("keydown", onKey);
+  });
+}
+
+function teardownSshSession(s) {
+  const ssh = s.ssh;
+  if (!ssh) return;
+  if (ssh.resizeObserver) {
+    try { ssh.resizeObserver.disconnect(); } catch (_e) { /* ignore */ }
+  }
+  if (ssh.capture) {
+    try { ssh.capture.dispose(); } catch (_e) { /* ignore */ }
+  }
+  if (ssh.ws) {
+    try { ssh.ws.close(1000, "client-close"); } catch (_e) { /* ignore */ }
+  }
+  if (ssh.term) {
+    try { ssh.term.dispose(); } catch (_e) { /* ignore */ }
+  }
+  s.ssh = null;
+}
+
+// Picker modal for SSH target IP. Resolves with the chosen IP string,
+// or null on cancel. Each row shows the per-IP probe status (open /
+// refused / timeout / unknown) so the user can make an informed pick.
+function promptForSshIp(vmName, ips, statusEntry, message) {
+  return new Promise((resolve) => {
+    if (!sshIpPickerModal) { resolve(null); return; }
+    sshIpPickerMsg.textContent = message || `Choose an IP to SSH into ${vmName}.`;
+    sshIpPickerListEl.innerHTML = "";
+    const ipsObj = (statusEntry && statusEntry.ips) || {};
+    ips.forEach((ip) => {
+      const row = document.createElement("div");
+      row.className = "ssh-ip-picker-row";
+      const portStatus = (ipsObj[ip] && ipsObj[ip]["22"]) || "unknown";
+      row.innerHTML = `
+        <span class="ssh-ip-addr">${escapeHtml(ip)}</span>
+        <span class="ssh-ip-status" data-status="${escapeHtml(portStatus)}">${escapeHtml(portStatus)}</span>
+      `;
+      row.addEventListener("click", () => {
+        cleanup();
+        resolve(ip);
+      });
+      sshIpPickerListEl.appendChild(row);
+    });
+    sshIpPickerModal.classList.add("open");
+
+    const cleanup = () => {
+      sshIpPickerModal.classList.remove("open");
+      sshIpPickerCancelBtn.removeEventListener("click", onCancel);
+      sshIpPickerModal.removeEventListener("keydown", onKey);
+    };
+    const onCancel = () => { cleanup(); resolve(null); };
+    const onKey = (event) => {
+      if (event.key === "Escape") { event.preventDefault(); onCancel(); }
+    };
+    sshIpPickerCancelBtn.addEventListener("click", onCancel);
+    sshIpPickerModal.addEventListener("keydown", onKey);
+  });
+}
+
+async function openSshFor(vmUuid) {
+  if (!session.loggedIn) return;
+  if (!featureFlags.isEnabled("sshConsole")) return;
+
+  const liveVm = getVmByUuid(vmUuid);
+  const snap = liveVm || favStore.vmMeta[vmUuid];
+  const vmName = (liveVm?.name) || (snap && snap.name) || vmUuid;
+  const port = 22;
+  // Build the list of candidate IPs from whichever source has the
+  // freshest data. Live VM list wins; favorite snapshot is a
+  // single-IP fallback for when the user right-clicks a VM that's
+  // not currently in the filtered list.
+  const ips = liveVm
+    ? (Array.isArray(liveVm.ipAddresses) ? liveVm.ipAddresses : (liveVm.ipAddress ? [liveVm.ipAddress] : []))
+    : (snap && snap.ipAddress ? [snap.ipAddress] : []);
+  if (!ips.length) {
+    setStatus(`No known IPs for ${vmName}; cannot SSH.`);
+    return;
+  }
+
+  // Resolve the target host. Order of preference:
+  //   1) probe cache says port 22 is open on a specific IP -> use it
+  //   2) probe cache exists but port 22 looked closed everywhere ->
+  //      ask the user to pick (or auto-use the only IP if there's one)
+  //   3) probe cache missing/stale -> run a fresh on-demand probe,
+  //      then re-evaluate using rule 1 or 2
+  let host = null;
+  let statusEntry = vmPortStatus.get(vmUuid);
+  if (statusEntry && statusEntry.preferredIp && statusEntry.preferredIp.ssh) {
+    host = statusEntry.preferredIp.ssh;
+  } else {
+    if (!statusEntry || (Date.now() - statusEntry.scannedAt) > 60_000) {
+      setStatus(`Probing ${vmName} for SSH...`, { spinner: true });
+      const probeVmInput = liveVm || { uuid: vmUuid, ipAddresses: ips };
+      const fresh = await vmPortScanner.probeNow(probeVmInput);
+      statusEntry = fresh || vmPortStatus.get(vmUuid) || null;
+    }
+    if (statusEntry && statusEntry.preferredIp && statusEntry.preferredIp.ssh) {
+      host = statusEntry.preferredIp.ssh;
+    } else {
+      // Port 22 looked closed on all known IPs. Let the user try
+      // anyway -- a firewall might be blocking the probe SYN while
+      // still permitting the real SSH source IP.
+      const message = ips.length === 1
+        ? `SSH port 22 was not detected on ${ips[0]}. Try anyway?`
+        : `SSH port 22 was not detected on any of ${vmName}'s IPs. Pick one to try anyway:`;
+      const picked = await promptForSshIp(vmName, ips, statusEntry, message);
+      if (!picked) { setStatus("SSH cancelled."); return; }
+      host = picked;
+    }
+  }
+  if (!host) { setStatus("SSH cancelled."); return; }
+
+  // Prompt unless we already have remembered creds for this VM.
+  let creds = sshCredsCache.get(vmUuid) || null;
+  if (!creds) {
+    creds = await promptForSshCreds(vmUuid, host, port, null);
+    if (!creds) { setStatus("SSH cancelled."); return; }
+  }
+
+  setStatus(`Authorising SSH session to ${vmName} (${host})...`, { spinner: true });
+
+  // Reserve the session id with the server. The server validates
+  // host against the probe cache (SSRF guard) and will only accept
+  // the WS upgrade with this id once.
+  let startData;
+  try {
+    const resp = await fetch("/api/ssh/start", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        vmUuid,
+        host,
+        port,
+        username: creds.username,
+        password: creds.password || "",
+        privateKey: creds.privateKey || "",
+        passphrase: creds.passphrase || ""
+      })
+    });
+    startData = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(startData.error || `HTTP ${resp.status}`);
+  } catch (err) {
+    setStatus(`SSH start failed: ${err.message || err}`);
+    // Wipe potentially-bad cached creds so the next click re-prompts.
+    if (creds && creds.remember) sshCredsCache.delete(vmUuid);
+    return;
+  }
+
+  // Honour "Remember for this browser session" only after the start
+  // call accepted the credentials shape; cache nothing on validation
+  // errors above.
+  if (creds.remember) sshCredsCache.set(vmUuid, creds);
+
+  let xterm;
+  try {
+    xterm = await loadXtermModules();
+  } catch (err) {
+    setStatus(`Failed to load terminal bundle: ${err.message || err}`);
+    return;
+  }
+
+  const sessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const screenEl = document.createElement("div");
+  screenEl.className = "console-pane is-ssh";
+  // Inline status overlay so the user sees something between the
+  // POST returning and ssh2 finishing its TCP/auth handshake.
+  const overlay = document.createElement("div");
+  overlay.className = "ssh-status-overlay";
+  overlay.textContent = `Connecting to ${vmName} (${host}:${port})...`;
+  screenEl.appendChild(overlay);
+  screenStageEl.appendChild(screenEl);
+
+  const term = new xterm.Terminal({
+    cursorBlink: true,
+    convertEol: true,
+    fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
+    fontSize: 13,
+    theme: { background: "#000000" }
+  });
+  const fitAddon = new xterm.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(screenEl);
+  // WebGL renderer is what publishes the single <canvas> the
+  // screenshot + recording pipeline reads from. We MUST pass
+  // `preserveDrawingBuffer: true` -- without it the WebGL
+  // framebuffer is auto-cleared after each present, so canvas.toBlob
+  // (screenshots) and canvas.captureStream (recordings) read a
+  // blank/black canvas. If WebGL refuses to initialise (rare;
+  // mostly headless CI) we fall back to the default DOM renderer;
+  // recording will not work then but the terminal still functions.
+  let webglAddon = null;
+  try {
+    webglAddon = new xterm.WebglAddon(true);
+    term.loadAddon(webglAddon);
+  } catch (err) {
+    console.warn("[ssh] WebGL renderer unavailable, falling back to DOM renderer:", err);
+  }
+  try { fitAddon.fit(); } catch (_e) { /* ignore */ }
+  // Capture canvas: a private offscreen 2D canvas that we paint
+  // ourselves from xterm's text buffer. The WebGL render canvas is
+  // unreliable to capture from -- xterm composites several canvases
+  // inside .xterm-screen, the WebGL canvas uses dirty-region updates
+  // and (depending on browser) may have an empty / partial drawing
+  // buffer at the moment toBlob / captureStream reads it. Instead
+  // we walk `term.buffer.active` and paint a faithful 2D copy on
+  // every parsed write, on cursor move, on resize, and on a slow
+  // tick to catch cursor blink. Both the screenshot path and the
+  // recording captureStream path read from this canvas, completely
+  // bypassing xterm's renderer for capture purposes.
+  const sshCapture = createSshCaptureCanvas(term, screenEl);
+
+  const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${wsScheme}//${location.host}${startData.websocketUrl}`;
+  const ws = new WebSocket(wsUrl);
+  ws.binaryType = "arraybuffer";
+
+  let resizeObserver = null;
+  let pendingResize = null;
+  const sendResize = () => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try { fitAddon.fit(); } catch (_e) { /* ignore */ }
+    const cols = Math.max(2, Math.floor(term.cols || 80));
+    const rows = Math.max(2, Math.floor(term.rows || 24));
+    try { ws.send(JSON.stringify({ type: "resize", cols, rows })); } catch (_e) { /* ignore */ }
+  };
+  const debouncedResize = () => {
+    if (pendingResize) clearTimeout(pendingResize);
+    pendingResize = setTimeout(sendResize, 80);
+  };
+
+  ws.addEventListener("open", () => {
+    overlay.textContent = `Authenticating to ${vmName}...`;
+    sendResize();
+  });
+  ws.addEventListener("message", (event) => {
+    if (typeof event.data === "string") {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_e) { return; }
+      if (msg && msg.type === "ready") {
+        overlay.hidden = true;
+        setStatus(`SSH connected: ${vmName}`);
+      }
+      return;
+    }
+    // Binary frame: shell bytes
+    const buf = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : event.data;
+    term.write(buf);
+  });
+  ws.addEventListener("close", (event) => {
+    overlay.hidden = false;
+    overlay.textContent = `SSH disconnected: ${vmName} (${event.code})`;
+    setStatus(`SSH disconnected: ${vmName}`);
+    logEvent("console.ssh.close", vmUuid, { code: event.code });
+  });
+  ws.addEventListener("error", () => {
+    setStatus(`SSH transport error: ${vmName}`);
+  });
+
+  term.onData((data) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(new TextEncoder().encode(data)); } catch (_e) { /* ignore */ }
+  });
+
+  resizeObserver = new ResizeObserver(debouncedResize);
+  resizeObserver.observe(screenEl);
+
+  const newSession = {
+    id: sessionId,
+    vmUuid,
+    vmName,
+    kind: "ssh",
+    rfb: null,
+    screenEl,
+    tabEl: null,
+    keymap: lastUsedKeymap || DEFAULT_KEYMAP_ID,
+    ssh: { ws, term, fitAddon, resizeObserver, host, port, username: creds.username, overlay, capture: sshCapture, webglAddon }
+  };
+  const tabEl = createSessionTab(newSession);
+  // Distinguish SSH tabs visually so the user can tell at a glance
+  // which protocol each tab speaks. The .is-ssh class drives the
+  // green tab styling and label prefix.
+  tabEl.classList.add("is-ssh");
+  const tabLabelSpan = tabEl.querySelector("span:first-child");
+  if (tabLabelSpan) tabLabelSpan.textContent = `ssh: ${vmName}`;
+  newSession.tabEl = tabEl;
+  consoleSessions.push(newSession);
+  consoleTabsEl.appendChild(tabEl);
+  setActiveSession(sessionId);
+
+  // Focus the terminal so keystrokes go straight in.
+  setTimeout(() => { try { term.focus(); } catch (_e) { /* ignore */ } }, 50);
+  logEvent("console.ssh.open", vmUuid, { host, port });
+}
+
+// =====================================================================
 // Activity logging (per-user opt-in -> POST /api/log)
 // =====================================================================
 //
@@ -3127,10 +3760,204 @@ function blobToBase64(blob) {
   });
 }
 
+// =====================================================================
+// SSH capture canvas (renderer-independent screenshot / recording)
+// =====================================================================
+//
+// Reading pixels back from the xterm WebGL canvas turned out to be a
+// fool's errand: there are multiple stacked canvases inside
+// `.xterm-screen` (link layer, glyph layer, WebGL renderer canvas);
+// the WebGL renderer uses damage-region updates so the framebuffer
+// rarely contains a full screen at any instant; and the textureAtlas
+// may even be exposed in DOM showing one zoomed glyph. To make
+// screenshots and recordings actually work we maintain our OWN 2D
+// canvas that we paint from `term.buffer.active`, regardless of
+// what renderer xterm is using internally. The user still SEES the
+// fast WebGL renderer; capture just reads from the parallel 2D
+// canvas we keep in sync.
+
+const SSH_CAPTURE_FONT_FAMILY = 'Menlo, Consolas, "DejaVu Sans Mono", monospace';
+const SSH_CAPTURE_FONT_SIZE = 13;
+const SSH_CAPTURE_LINE_HEIGHT = 17;
+
+// Standard xterm 16-color palette + Linux-style brights. Indexes 16..255
+// follow the xterm 6x6x6 + grayscale extended palette.
+const SSH_ANSI_BASIC = [
+  "#000000", "#cd3131", "#0dbc79", "#e5e510",
+  "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
+  "#666666", "#f14c4c", "#23d18b", "#f5f543",
+  "#3b8eea", "#d670d6", "#29b8db", "#ffffff"
+];
+function sshAnsiPaletteToCss(idx, isFg) {
+  if (idx == null || idx < 0) return isFg ? "#e5e5e5" : "#000000";
+  if (idx < 16) return SSH_ANSI_BASIC[idx];
+  if (idx < 232) {
+    const i = idx - 16;
+    const r = Math.floor(i / 36);
+    const g = Math.floor((i % 36) / 6);
+    const b = i % 6;
+    const conv = (v) => (v === 0 ? 0 : v * 40 + 55);
+    return `rgb(${conv(r)},${conv(g)},${conv(b)})`;
+  }
+  const v = (idx - 232) * 10 + 8;
+  return `rgb(${v},${v},${v})`;
+}
+function sshRgbPackedToCss(packed) {
+  return `rgb(${(packed >> 16) & 0xff},${(packed >> 8) & 0xff},${packed & 0xff})`;
+}
+
+// Build a self-painting capture canvas tied to a term + screen pane.
+// Returns { canvas, paint, dispose, cellWidth, cellHeight }.
+function createSshCaptureCanvas(term, screenEl) {
+  const canvas = document.createElement("canvas");
+  // Detached from DOM -- toBlob / captureStream both work on
+  // unattached canvases. Keeping it offscreen avoids polluting the
+  // screen pane and rules out sizing surprises from CSS.
+  const ctx = canvas.getContext("2d", { alpha: false });
+
+  // Measure the actual cell width on a probe canvas so the rendered
+  // capture matches the terminal's column count. Using a fixed
+  // SSH_CAPTURE_LINE_HEIGHT keeps line spacing stable across glyphs.
+  let cellWidth = 8;
+  let cellHeight = SSH_CAPTURE_LINE_HEIGHT;
+  try {
+    const probe = document.createElement("canvas").getContext("2d");
+    probe.font = `${SSH_CAPTURE_FONT_SIZE}px ${SSH_CAPTURE_FONT_FAMILY}`;
+    const w = probe.measureText("M").width;
+    if (w > 0) cellWidth = Math.ceil(w);
+  } catch (_e) { /* keep defaults */ }
+
+  function paint() {
+    if (!term || !term.buffer || !term.buffer.active) return;
+    const cols = Math.max(2, term.cols || 80);
+    const rows = Math.max(2, term.rows || 24);
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = cols * cellWidth;
+    const cssH = rows * cellHeight;
+    const bufW = Math.max(2, Math.floor(cssW * dpr));
+    const bufH = Math.max(2, Math.floor(cssH * dpr));
+    if (canvas.width !== bufW || canvas.height !== bufH) {
+      canvas.width = bufW;
+      canvas.height = bufH;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, cssW, cssH);
+    ctx.textBaseline = "top";
+
+    const buf = term.buffer.active;
+    const baseLine = buf.viewportY || 0;
+    const cursorVisible = (buf.cursorY >= 0 && buf.cursorX >= 0);
+    const cursorAbsRow = baseLine + buf.cursorY;
+
+    for (let y = 0; y < rows; y++) {
+      const line = buf.getLine(baseLine + y);
+      if (!line) continue;
+      for (let x = 0; x < cols; x++) {
+        const cell = line.getCell(x);
+        if (!cell) continue;
+        const chars = cell.getChars();
+        // Background fill (only when not default).
+        let bgColor = null;
+        if (typeof cell.isBgRGB === "function" && cell.isBgRGB()) {
+          bgColor = sshRgbPackedToCss(cell.getBgColor());
+        } else if (typeof cell.isBgPalette === "function" && cell.isBgPalette()) {
+          bgColor = sshAnsiPaletteToCss(cell.getBgColor(), false);
+        }
+        if (bgColor) {
+          ctx.fillStyle = bgColor;
+          ctx.fillRect(x * cellWidth, y * cellHeight, cellWidth, cellHeight);
+        }
+        // Inverse video: swap fg/bg.
+        const inverse = (typeof cell.isInverse === "function" && cell.isInverse());
+        // Foreground.
+        let fgColor;
+        if (typeof cell.isFgRGB === "function" && cell.isFgRGB()) {
+          fgColor = sshRgbPackedToCss(cell.getFgColor());
+        } else if (typeof cell.isFgPalette === "function" && cell.isFgPalette()) {
+          fgColor = sshAnsiPaletteToCss(cell.getFgColor(), true);
+        } else {
+          fgColor = "#e5e5e5";
+        }
+        if (inverse) {
+          const baseBg = bgColor || "#000000";
+          ctx.fillStyle = fgColor;
+          ctx.fillRect(x * cellWidth, y * cellHeight, cellWidth, cellHeight);
+          fgColor = baseBg;
+        }
+        if (!chars) continue;
+        const isBold = typeof cell.isBold === "function" && cell.isBold();
+        const isItalic = typeof cell.isItalic === "function" && cell.isItalic();
+        let fontStr = "";
+        if (isItalic) fontStr += "italic ";
+        if (isBold) fontStr += "bold ";
+        fontStr += `${SSH_CAPTURE_FONT_SIZE}px ${SSH_CAPTURE_FONT_FAMILY}`;
+        ctx.font = fontStr;
+        ctx.fillStyle = fgColor;
+        ctx.fillText(chars, x * cellWidth, y * cellHeight + 1);
+      }
+    }
+    // Cursor: simple block over the cursor cell (non-blinking in
+    // captures so users get a deterministic image).
+    if (cursorVisible) {
+      const cy = (cursorAbsRow - baseLine);
+      if (cy >= 0 && cy < rows) {
+        ctx.fillStyle = "rgba(229,229,229,0.55)";
+        ctx.fillRect(buf.cursorX * cellWidth, cy * cellHeight, cellWidth, cellHeight);
+      }
+    }
+  }
+
+  // Hook xterm events that can change visible content. Each handler
+  // returns a disposable; we collect them so dispose() can clean up.
+  const disposables = [];
+  const safeAdd = (fn) => { try { const d = fn(); if (d) disposables.push(d); } catch (_e) { /* ignore */ } };
+  safeAdd(() => term.onWriteParsed(() => paint()));
+  safeAdd(() => term.onCursorMove(() => paint()));
+  safeAdd(() => term.onResize(() => paint()));
+  safeAdd(() => term.onScroll(() => paint()));
+
+  // Slow tick keeps captureStream emitting fresh frames during idle
+  // periods (cursor blink) and ensures any race between the WebGL
+  // refresh and our paint resolves quickly.
+  const idleHandle = setInterval(() => paint(), 500);
+
+  // First paint -- buffer may already have a prompt by the time the
+  // user opens the tab from a remembered SSH host.
+  setTimeout(paint, 0);
+
+  return {
+    canvas,
+    paint,
+    cellWidth,
+    cellHeight,
+    dispose() {
+      try { clearInterval(idleHandle); } catch (_e) { /* ignore */ }
+      for (const d of disposables) {
+        try { d.dispose(); } catch (_e) { /* ignore */ }
+      }
+    }
+  };
+}
+
+// Resolve the canvas the screenshot / recording pipeline reads from.
+// SSH tabs use the dedicated 2D capture canvas (see
+// createSshCaptureCanvas above); VNC tabs hand off to noVNC which
+// appends a single canvas inside the screen pane.
+function getSessionCanvas(s) {
+  if (!s) return null;
+  if (s.kind === "ssh" && s.ssh && s.ssh.capture) {
+    try { s.ssh.capture.paint(); } catch (_e) { /* ignore */ }
+    return s.ssh.capture.canvas;
+  }
+  return s.screenEl.querySelector("canvas");
+}
+
 function activeConsoleCanvas() {
   const session = consoleSessions.find((s) => s.id === activeSessionId);
   if (!session) return { session: null, canvas: null };
-  const canvas = session.screenEl.querySelector("canvas");
+  const canvas = getSessionCanvas(session);
   return { session, canvas };
 }
 
@@ -3883,7 +4710,7 @@ async function startRecordingForSession(session) {
     setStatus("MediaRecorder is not supported in this browser.");
     return;
   }
-  const canvas = session.screenEl.querySelector("canvas");
+  const canvas = getSessionCanvas(session);
   if (!canvas) { setStatus(`No canvas to record for ${session.vmName}.`); return; }
   const mimeType = pickRecordingMimeType();
   if (!mimeType) { setStatus("Browser does not support WebM recording."); return; }
@@ -3963,6 +4790,23 @@ async function startRecordingForSession(session) {
       recordBtnTimer.textContent = fmtElapsed(Date.now() - state.startedAt);
     }
   }, 500);
+
+  // SSH-only: xterm only repaints when the terminal receives data,
+  // so a quiet shell would produce a captureStream that emits
+  // duplicate (already-decoded) frames or nothing at all. Force a
+  // periodic redraw at the recording fps so the WebGL canvas keeps
+  // producing fresh frames for the encoder. The tick is cheap
+  // (xterm short-circuits when nothing changed) and gets cleared
+  // alongside `timerHandle` in finalizeRecording.
+  if (session.kind === "ssh" && session.ssh && session.ssh.capture) {
+    // Drive the capture canvas at the recording frame rate so
+    // canvas.captureStream always has a fresh frame to present, even
+    // when the shell is idle and not producing data.
+    const tickMs = Math.max(50, Math.floor(1000 / Math.max(1, fps)));
+    state.refreshTickHandle = setInterval(() => {
+      try { session.ssh.capture.paint(); } catch (_e) { /* ignore */ }
+    }, tickMs);
+  }
 
   recorder.ondataavailable = (ev) => {
     if (!ev.data || ev.data.size === 0) return;
@@ -4048,6 +4892,7 @@ async function finalizeRecording(session) {
   state.finishing = true;
   try { state.stream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* ignore */ }
   if (state.timerHandle) { clearInterval(state.timerHandle); state.timerHandle = null; }
+  if (state.refreshTickHandle) { clearInterval(state.refreshTickHandle); state.refreshTickHandle = null; }
   if (state.aborted || state.failed) {
     try {
       await fetch(`/api/recordings/${encodeURIComponent(session.vmUuid)}/abort`, {

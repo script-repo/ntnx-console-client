@@ -134,6 +134,16 @@ copy .env.example .env       # Windows
 | `NRCC_UPDATE_REPO`        | `https://github.com/script-repo/ntnx-console-client` | GitHub repo (HTTPS clone URL) the updater fetches `build.info` from and clones / pulls. |
 | `NRCC_UPDATE_BRANCH`      | `main`             | Branch the updater compares against and resets / clones to. |
 | `NRCC_UPDATE_CHECK_TTL_MS`| `300000` (5 min)   | Cache TTL for `/api/update/check` results. Multiple users sharing the install and the per-client background poll all share this cache so `raw.githubusercontent.com` is hit at most once per TTL window. The Update button bypasses the cache via `?force=1`. Minimum 60 000 ms. |
+| `NRCC_PROBE_ENABLED`      | `true`             | **Beta.** Master switch for the VM port-scan endpoint (`/api/probe/ports`). Set to `false` to hide SSH/RDP availability pills and refuse the probe / SSH-start endpoints. |
+| `NRCC_PROBE_PORTS`        | `22,3389`          | **Beta.** Comma-separated TCP ports the probe attempts per VM IP. Future-proofed for additions like `5985` (WinRM); keep narrow to limit probe noise. |
+| `NRCC_PROBE_TIMEOUT_MS`   | `2000`             | **Beta.** Per-socket connect timeout for each probe dial (ms). |
+| `NRCC_PROBE_CONCURRENCY`  | `20`               | **Beta.** Global semaphore over `(vm, ip, port)` tuples; prevents 200 VMs × 2 ports × 4 IPs from dialling all at once. |
+| `NRCC_PROBE_CACHE_TTL_MS` | `120000` (2 min)   | **Beta.** How long a per-VM probe result is reused before the next request triggers a re-probe. Also bounds the SSH SSRF allow-list lifetime. |
+| `NRCC_PROBE_MAX_IPS_PER_VM`| `4`               | **Beta.** Cap on IPs probed per VM (multi-NIC VMs commonly expose 2-3). |
+| `NRCC_SSH_ENABLED`        | `true`             | **Beta.** Master switch for the browser-side SSH console. Set to `false` to refuse `/api/ssh/start` and the `/ws-ssh/<id>` upgrade. |
+| `NRCC_SSH_IDLE_TIMEOUT_MS`| `900000` (15 min)  | **Beta.** How long an unused SSH session id is kept (the WS upgrade typically arrives within seconds; this only protects against orphaned `start` calls). |
+| `NRCC_SSH_MAX_SESSIONS`   | `64`               | **Beta.** Hard cap on simultaneous SSH sessions per server process. |
+| `NRCC_SSH_READY_TIMEOUT_MS`| `15000`           | **Beta.** How long `ssh2` waits for the remote handshake before giving up. |
 
 ### Run
 
@@ -262,6 +272,9 @@ Server-emitted event types (always written when the master switch is on):
 | `console.open`       | `/api/console-token` produced a websocket URL.                       |
 | `console.close`      | The /ws-proxy WebSocket was torn down (includes `durationMs`).      |
 | `chat.send`          | Multi-user chat message broadcast.                                   |
+| `probe.scan`         | **Beta.** `/api/probe/ports` issued at least one new probe (cached results don't log). Includes `vmCount`, `scannedNow`, `ports`. |
+| `ssh.open`           | **Beta.** ssh2 client reached `ready` for an SSH tab. Includes `host`, `port`, `sshUser`. |
+| `ssh.close`          | **Beta.** SSH tab closed (server-side or WS torn down). Includes `durationMs`, `reason`. |
 
 Client-emitted event types (require **both** `NRCC_LOGGING=true` and the per-user toggle):
 
@@ -274,6 +287,8 @@ Client-emitted event types (require **both** `NRCC_LOGGING=true` and the per-use
 | `console.recording.stop`   | Recording finished and saved.                 |
 | `console.script.copy`      | A script tile was copied to the clipboard.    |
 | `settings.saved`           | Settings dialog saved.                        |
+| `console.ssh.open`         | **Beta.** Browser-side SSH WebSocket reached `ready`. |
+| `console.ssh.close`        | **Beta.** Browser-side SSH WebSocket closed (includes `code` or `reason`). |
 
 The file is append-only with one line per event; nothing is rotated automatically beyond the weekly filename change. Operators are expected to ship/prune the log directory the same way they would any other application log.
 
@@ -288,16 +303,40 @@ const FEATURE_FLAGS = {
   recordings:  { stage: "ga", description: "Per-VM video recording (10 fps WebM)" },
   scripts:     { stage: "ga", description: "Global script library with click-to-clipboard" },
   logging:     { stage: "ga", description: "Optional activity logging (server-gated)" },
-  settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" }
+  settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" },
+  vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
+  sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" }
 };
 ```
 
 Conventions:
 
-- **All existing features are GA** at the time of writing.
+- **All previously-shipped features are GA**; only the two beta entries above are gated.
 - A new feature lands as `{ stage: "beta" }`. UI elements that are only meaningful when the feature is on get a `data-feature="<id>"` attribute. The client's `featureFlags.refresh()` hides those elements unless `userPrefs.betaFeaturesEnabled` is true.
 - Code paths that aren't tied to a single DOM element can call `featureFlags.isEnabled("<id>")` to gate themselves.
 - Promote a feature to GA by changing `stage` to `"ga"` in the registry. Beta-only `data-feature` markers can stay; `featureFlags.refresh()` will simply leave them visible.
+
+### Beta: VM port scan + SSH consoles
+
+Two beta features (`vmPortScan` and `sshConsole`) work together so a user can open an SSH session straight from the VM list, in a tab that behaves like any other console tab (screenshots and recordings included). Both surfaces are hidden by default and only render after the user toggles **Show beta features** in Settings AND the operator has left the corresponding `NRCC_*_ENABLED` env var on.
+
+**vmPortScan** — after the VM list arrives the client batches the IPs to `POST /api/probe/ports`, in groups of 50, debounced 500 ms. The server TCP-dials each `(vm, ip, port)` tuple (default `22` and `3389`) under a global semaphore (`NRCC_PROBE_CONCURRENCY`, default 20) and caches the result for `NRCC_PROBE_CACHE_TTL_MS` (default 2 min). Open ports surface as small **SSH** / **RDP** pills next to the existing power-state pill in each VM row.
+
+**sshConsole** — when the probe saw `22/tcp` open AND `sshConsole` is enabled, a new **Open SSH** entry appears in the right-click menu. The first time it's used per VM the user is prompted for credentials (username + password OR private key + passphrase) and may tick **Remember for this browser session**; remembered creds live in browser memory only and are wiped on logout. The SSH session itself flows through:
+
+1. `POST /api/ssh/start` validates the host against the per-VM probe cache (the SSRF guard) and allocates a single-use session id.
+2. The browser opens `/ws-ssh/<id>`; the server accepts the upgrade exactly once, deletes the session entry, and pipes raw bytes between the WebSocket and `ssh2.Client.shell()` running with `xterm-256color`.
+3. The browser renders the stream with [`xterm.js`](https://github.com/xtermjs/xterm.js) and its WebGL renderer, which publishes a single `<canvas>` into the same console pane noVNC would otherwise own. The existing screenshot and recording pipelines pick that canvas up automatically.
+4. Resize is debounced 80 ms (`ResizeObserver` on the pane → `fitAddon.fit()` → `{type:"resize", cols, rows}` text frame → `stream.setWindow()`).
+
+**Caveats**
+
+- **No SSH host-key pinning yet.** v1 accepts any host key; the IP allow-list (RFC1918 + probe cache) is the primary defence. Host-key TOFU prompts will land in a follow-up.
+- **RDP is not implemented.** The plan covers SSH only; RDP is deferred until the `guacd`-or-equivalent backend is picked.
+- **L3 reachability required.** The NRCC server (or pod) must be able to TCP-dial the VM IPs directly. In Kubernetes deployments this means the pod needs network policy that permits egress to the VM subnet.
+- **Probe noise.** 2 ports × 4 IPs × N VMs is bounded by `NRCC_PROBE_CONCURRENCY` and cached for `NRCC_PROBE_CACHE_TTL_MS`. Disable per env var (`NRCC_PROBE_ENABLED=false`) if a SOC complains; the SSH endpoint refuses to start a session without a fresh probe entry, so disabling the probe also disables SSH.
+- **Process-memory state.** SSH session metadata and the probe cache live in process memory only. A self-update restart wipes both — same caveat as the chat history.
+- **xterm renderer only paints on activity** so `canvas.captureStream(10)` produces a sparse video. MediaRecorder still encodes it correctly; recorded SSH files are tiny relative to a busy VNC tab.
 
 ---
 
