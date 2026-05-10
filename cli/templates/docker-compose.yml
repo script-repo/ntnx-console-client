@@ -1,0 +1,54 @@
+# =====================================================================
+# NRCC docker-compose: same behaviour as deploy/k8s/nrcc.yaml.
+#
+# Driven by ~/.nrcc/.env (or %LOCALAPPDATA%\NRCC\.env) which the
+# installer writes; defaults work without it.
+#
+# Bring up:  docker compose up -d
+# Tail logs: docker compose logs -f --tail=200
+# Tear down: docker compose down
+# =====================================================================
+
+services:
+
+  guacd:
+    image: docker.io/guacamole/guacd:1.5.5
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4822 || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 12
+
+  nrcc:
+    image: ghcr.io/script-repo/ntnx-console-client:latest
+    depends_on:
+      guacd:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      # Single-user mode is the default for desktop installs. Flip this
+      # to "true" if you intend to share NRCC with multiple humans.
+      NRCC_MULTI_USER: "false"
+
+      PORT: "8443"
+      NRCC_TLS_CERT_DIR:    "/data/certs"
+      NRCC_SCREENSHOTS_DIR: "/data/screenshots"
+      NRCC_RECORDINGS_DIR:  "/data/recordings"
+      NRCC_SCRIPTS_DIR:     "/data/scripts"
+      NRCC_LOGS_DIR:        "/data/logs"
+      NRCC_GUACD_HOST:      "guacd"
+      NRCC_GUACD_PORT:      "4822"
+      NUTANIX_TLS_SKIP_VERIFY: "true"
+      NRCC_LOGGING:         "true"
+      # In-app self-update assumes a git checkout; with an immutable
+      # image, use `nrcc upgrade` instead.
+      NRCC_UPDATE_ENABLED:  "false"
+    ports:
+      - "${NRCC_PORT:-8443}:8443"
+    volumes:
+      - nrcc-data:/data
+
+volumes:
+  nrcc-data:
+    name: nrcc-data

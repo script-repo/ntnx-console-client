@@ -1,2 +1,17 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts that may be served via raw.githubusercontent.com and
+# piped into bash MUST use LF line endings, regardless of the OS the
+# repo was cloned on. CRLF breaks `curl ... | bash`.
+*.sh         text eol=lf
+*.command    text eol=lf
+
+# Service / template files consumed by POSIX tools.
+*.service    text eol=lf
+*.plist      text eol=lf
+*.desktop    text eol=lf
+
+# PowerShell tolerates either, but keep it deterministic.
+*.ps1        text eol=crlf
+*.cmd        text eol=crlf

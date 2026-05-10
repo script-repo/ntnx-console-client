@@ -142,6 +142,64 @@ Vanilla JS + noVNC, no build step:
 
 ---
 
+## Quickstart
+
+The fastest way to get NRCC running on a fresh machine is one copy/pasteable line. The script auto-detects whether **Docker** is installed (preferred — RDP works out of the box because it brings up `guacd` as a sidecar) and otherwise falls back to a **Node.js source install** under your home directory. In both cases it ends with:
+
+- a `nrcc` command on your PATH (subcommands: `start`, `stop`, `status`, `logs`, `open`, `upgrade`, `enable-service`, `uninstall`),
+- a desktop / Start Menu icon that starts NRCC and opens the browser,
+- the browser opened to <https://localhost:8443>.
+
+> The TLS cert is self-signed; click through the browser warning once. Nothing is installed system-wide and no `sudo` / Administrator prompt is required for the default install.
+
+### Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.sh | bash
+```
+
+### macOS
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.sh | bash
+```
+
+### Windows (PowerShell)
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/script-repo/ntnx-console-client/main/install.ps1 | iex
+```
+
+### After install
+
+```bash
+nrcc                    # start (if needed) and open the browser
+nrcc status             # is it running?
+nrcc logs               # tail server logs
+nrcc upgrade            # pull a newer build
+nrcc enable-service     # opt-in: register autostart at login
+nrcc uninstall          # stop everything and remove the install
+```
+
+### Override the defaults (optional)
+
+| Variable                | Default                                                               | Purpose                                  |
+| ----------------------- | --------------------------------------------------------------------- | ---------------------------------------- |
+| `NRCC_INSTALL_DIR`      | `~/.nrcc` (POSIX) / `%LOCALAPPDATA%\NRCC` (Windows)                   | Where the install lives                  |
+| `NRCC_BIN_DIR`          | `~/.local/bin`                                                        | Where the `nrcc` launcher symlink goes (POSIX) |
+| `NRCC_BRANCH`           | `main`                                                                | Git branch / image tag to track          |
+| `NRCC_FORCE_METHOD`     | _auto_                                                                | `docker` or `source` to skip detection   |
+| `NRCC_PORT`             | `8443`                                                                | Host port to publish                     |
+| `NRCC_NO_OPEN`          | _unset_                                                               | Set to `1` to skip launching the browser |
+
+To uninstall later, run `nrcc uninstall` (or re-fetch and pipe the matching `uninstall.sh` / `uninstall.ps1`).
+
+> **RDP / SSH note:** The Docker install ships a `guacd` sidecar so RDP and SSH consoles work immediately. The source install does **not** install `guacd`; follow the per-OS instructions in [Beta: VM port scan + SSH / RDP consoles](#beta-vm-port-scan--ssh--rdp-consoles) below.
+
+For the manual / developer flow (clone the repo, `npm install`, run from source), keep reading.
+
+---
+
 ## Installation
 
 ### Prerequisites

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NRCC
+GenericName=Nutanix Remote Console Client
+Comment=Open the NRCC web UI in your browser
+Exec=@LAUNCHER@
+Icon=@ICON@
+Terminal=false
+Categories=Network;RemoteAccess;System;
+StartupNotify=false
+Keywords=Nutanix;RDP;SSH;VNC;Console;

@@ -1,0 +1,18 @@
+[Unit]
+Description=Nutanix Remote Console Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@LAUNCHER@ start
+ExecStop=@LAUNCHER@ stop
+WorkingDirectory=@INSTALLDIR@
+Restart=on-failure
+RestartSec=5
+# Keep stdout/stderr in the journal -- `journalctl --user -u nrcc` to view.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
