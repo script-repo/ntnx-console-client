@@ -375,13 +375,14 @@ const FEATURE_FLAGS = {
   logging:     { stage: "ga", description: "Optional activity logging (server-gated)" },
   settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" },
   vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
-  sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" }
+  sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" },
+  rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" }
 };
 ```
 
 Conventions:
 
-- **All previously-shipped features are GA**; only the two beta entries above are gated.
+- **All previously-shipped features are GA**; only the three beta entries above are gated.
 - A new feature lands as `{ stage: "beta" }`. UI elements that are only meaningful when the feature is on get a `data-feature="<id>"` attribute. The client's `featureFlags.refresh()` hides those elements unless `userPrefs.betaFeaturesEnabled` is true.
 - Code paths that aren't tied to a single DOM element can call `featureFlags.isEnabled("<id>")` to gate themselves.
 - Promote a feature to GA by changing `stage` to `"ga"` in the registry. Beta-only `data-feature` markers can stay; `featureFlags.refresh()` will simply leave them visible.
