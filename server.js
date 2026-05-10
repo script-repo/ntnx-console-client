@@ -703,12 +703,15 @@ function compareUrl(remoteVersion) {
 async function fetchRemoteBuildInfo(opts) {
   const force = !!(opts && opts.force);
   if (!force && _updateCheckCache && (Date.now() - _updateCheckCache.ts) < UPDATE_CHECK_TTL_MS) {
-    // Re-stamp `current` against the live APP_VERSION in case a hot
-    // restart raced the cache; everything else is a snapshot of the
-    // most recent remote read.
+    // Re-stamp `current` against build.info on disk (not the
+    // process-startup APP_VERSION) so out-of-band file swaps
+    // (kubectl cp, manual rsync, a self-update install that
+    // restarted node, etc.) are reflected immediately. Everything
+    // else is a snapshot of the most recent remote read.
+    const liveCurrent = loadAppVersion();
     return Object.assign({}, _updateCheckCache.info, {
-      current: APP_VERSION,
-      updateAvailable: compareAppVersion(APP_VERSION, _updateCheckCache.info.latest) > 0,
+      current: liveCurrent,
+      updateAvailable: compareAppVersion(liveCurrent, _updateCheckCache.info.latest) > 0,
       cached: true,
       cacheAgeMs: Date.now() - _updateCheckCache.ts
     });
@@ -747,9 +750,12 @@ async function fetchRemoteBuildInfo(opts) {
     e.statusCode = 502;
     throw e;
   }
-  const cmp = compareAppVersion(APP_VERSION, latest);
+  // Same rationale as the cached path above: read build.info live so
+  // any post-startup file swap is reflected without a node restart.
+  const liveCurrent = loadAppVersion();
+  const cmp = compareAppVersion(liveCurrent, latest);
   const info = {
-    current: APP_VERSION,
+    current: liveCurrent,
     latest,
     updateAvailable: cmp > 0,
     repo: UPDATE_REPO,

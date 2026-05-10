@@ -1,0 +1,49 @@
+# Anything ignored by git is ignored by docker too. Keeps the build
+# context small (faster `docker build`, smaller layer transfers to
+# GHCR) and prevents secrets / user data from leaking into the image.
+
+# Dependencies (regenerated in the deps stage from package*.json)
+node_modules/
+
+# VCS + IDE noise
+.git/
+.gitignore
+.gitattributes
+.github/
+.vscode/
+.idea/
+.cursor/
+
+# Local environment + secrets
+.env
+.env.local
+.env.*.local
+
+# Runtime user data (mounted from a volume, never baked into the image)
+certs/
+screenshots/
+recordings/
+scripts/
+logs/
+
+# Logs / coverage / scratch output
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage/
+.tmp/
+tmp/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Container / orchestration definitions don't need to be inside the
+# image (kubectl applies them out-of-band).
+deploy/
+
+# Workspace artefacts that aren't shipped
+agent-transcripts/
+terminals/
+assets/

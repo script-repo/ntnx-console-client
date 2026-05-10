@@ -663,6 +663,75 @@ The library is **global**: every signed-in user can read, edit, rename, and dele
 
 ---
 
+## Container image (GHCR)
+
+NRCC ships a container image to **GitHub Container Registry** so the multi-user deployment doesn't need a `git clone` + `npm install` per pod. The image is built and pushed by `.github/workflows/publish.yml` whenever `build.info` changes on `main`.
+
+### Image tags
+
+For a `build.info` value of `0.6.0-20260510-02` the workflow publishes four tags so callers can pin at any granularity:
+
+| Tag                                                                       | Behaviour                                       |
+| ------------------------------------------------------------------------- | ----------------------------------------------- |
+| `ghcr.io/script-repo/ntnx-console-client:0.6.0-20260510-02`              | Immutable, exact build. Use in production.      |
+| `ghcr.io/script-repo/ntnx-console-client:0.6.0`                          | Rolls forward inside the 0.6.0 patch stream.    |
+| `ghcr.io/script-repo/ntnx-console-client:0.6`                            | Rolls forward inside the 0.6 minor stream.      |
+| `ghcr.io/script-repo/ntnx-console-client:latest`                         | Always the most recent successful publish.      |
+
+The workflow runs `linux/amd64` only (matches the current x86 deployment target). Add `linux/arm64` to `platforms` in `.github/workflows/publish.yml` if you need multi-arch.
+
+### Triggering a publish
+
+The workflow runs automatically when a push to `main` modifies `build.info`. The standard release flow is:
+
+```bash
+node scripts/bump-build.js              # roll today's NN
+git add package.json build.info
+git commit -m "release: $(cat build.info)"
+git push origin main
+```
+
+GitHub Actions takes ~2–3 minutes to build and push. Tail the run from the **Actions** tab.
+
+### Deploying the image to Kubernetes
+
+`deploy/k8s/nrcc.yaml` is a complete manifest (Namespace + PVC + ConfigMap + Deployment + Service) that pulls from GHCR. The first deploy:
+
+```bash
+kubectl apply -f deploy/k8s/nrcc.yaml
+```
+
+Subsequent upgrades to a specific build:
+
+```bash
+kubectl set image deployment/nrcc -n nrcc \
+  app=ghcr.io/script-repo/ntnx-console-client:0.6.0-20260510-02
+```
+
+Or, if you stayed on `:latest`, just force a re-pull:
+
+```bash
+kubectl rollout restart deployment/nrcc -n nrcc
+```
+
+User data (screenshots, recordings, scripts, certs, logs) lives on a 5 Gi PVC mounted at `/data`; the application code lives in the image, so a pod restart never loses content **and** never gets stuck waiting for a `kubectl cp`.
+
+> **Self-update is disabled in the container deployment.** The in-app Update button does a `git pull` against the source tree, which doesn't apply to an immutable image. The manifest sets `NRCC_UPDATE_ENABLED=false` so the button is hidden in the Settings panel; rolling forward is `kubectl set image` instead.
+
+### Building locally
+
+```bash
+docker build -t nrcc:dev .
+docker run --rm -p 8443:8443 \
+  -e NRCC_MULTI_USER=true \
+  -v "$(pwd)/data:/data" \
+  nrcc:dev
+```
+
+The image runs as the unprivileged `node` user (uid 1000); the bind-mounted `data/` directory must be writable by that uid.
+
+---
+
 ## Endpoints used
 
 | Purpose                | Endpoint                                                                              |

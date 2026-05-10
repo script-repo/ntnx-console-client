@@ -1,0 +1,179 @@
+# NRCC Kubernetes deployment using the GHCR-published container.
+#
+# Apply with:
+#   kubectl apply -f deploy/k8s/nrcc.yaml
+#
+# After the publish workflow ships a new build, roll forward with:
+#   kubectl set image deployment/nrcc -n nrcc \
+#     app=ghcr.io/script-repo/ntnx-console-client:0.6.0-20260510-02
+#
+# (or just keep `:latest` and run `kubectl rollout restart deployment/nrcc -n nrcc`).
+#
+# Replace `script-repo` below with your GitHub org/user if you fork
+# the repository to a different account.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nrcc
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nrcc-data
+  namespace: nrcc
+  labels:
+    app: nrcc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: nutanix-volume     # change to your cluster's default if needed
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# nginx sidecar that 301-redirects http://<host>:32088 traffic to
+# https://<host>:32444 so users who type the bare hostname always
+# end up on the TLS endpoint.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nrcc-nginx-redirect
+  namespace: nrcc
+  labels:
+    app: nrcc
+data:
+  default.conf: |
+    server {
+      listen 8080 default_server;
+      server_name _;
+      return 301 https://$host:32444$request_uri;
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nrcc
+  namespace: nrcc
+  labels:
+    app: nrcc
+spec:
+  replicas: 1
+  strategy:
+    # ReadWriteOnce on the data PVC means we can have only one pod
+    # holding the volume at a time -- Recreate avoids the rolling
+    # update getting stuck waiting for a Multi-Attach.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nrcc
+  template:
+    metadata:
+      labels:
+        app: nrcc
+    spec:
+      # The image is published as PUBLIC on GHCR per the user's
+      # answer in the setup flow, so no imagePullSecret is needed.
+      # If you flip the package to private, add:
+      #   imagePullSecrets:
+      #     - name: ghcr-pull
+      # (and create the secret with `kubectl create secret docker-registry ghcr-pull ...`)
+      containers:
+
+        # ----- guacd: Apache Guacamole proxy daemon (RDP backend) -----
+        - name: guacd
+          image: docker.io/guacamole/guacd:1.5.5
+          ports:
+            - { name: guacd, containerPort: 4822, protocol: TCP }
+          readinessProbe:
+            tcpSocket:
+              port: 4822
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 12
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 1,    memory: 512Mi }
+
+        # ----- app: NRCC node.js server -----
+        - name: app
+          image: ghcr.io/script-repo/ntnx-console-client:latest
+          imagePullPolicy: Always   # honour `:latest`; safe to keep with pinned tags too
+          ports:
+            - { name: https, containerPort: 8443, protocol: TCP }
+          env:
+            - { name: NRCC_MULTI_USER,         value: "true" }
+            - { name: PORT,                    value: "8443" }
+            - { name: NRCC_TLS_CERT_DIR,       value: "/data/certs" }
+            - { name: NRCC_SCREENSHOTS_DIR,    value: "/data/screenshots" }
+            - { name: NRCC_RECORDINGS_DIR,     value: "/data/recordings" }
+            - { name: NRCC_SCRIPTS_DIR,        value: "/data/scripts" }
+            - { name: NRCC_LOGS_DIR,           value: "/data/logs" }
+            - { name: NRCC_GUACD_HOST,         value: "127.0.0.1" }
+            - { name: NRCC_GUACD_PORT,         value: "4822" }
+            - { name: NUTANIX_TLS_SKIP_VERIFY, value: "true" }
+            # The in-app self-update flow does `git pull` against the
+            # repo on disk; that doesn't apply when the code lives in
+            # an immutable image. Disable the Update button in the UI
+            # and roll forward with `kubectl set image` instead.
+            - { name: NRCC_UPDATE_ENABLED,     value: "false" }
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 1,    memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+
+        # ----- redirect: tiny nginx that bounces :8080 to https://:32444 -----
+        - name: redirect
+          image: docker.io/library/nginx:alpine
+          ports:
+            - { name: http, containerPort: 8080, protocol: TCP }
+          volumeMounts:
+            - { name: nginx-config, mountPath: /etc/nginx/conf.d }
+          resources:
+            requests: { cpu: 10m,  memory: 16Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nrcc-data
+        - name: nginx-config
+          configMap:
+            name: nrcc-nginx-redirect
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nrcc
+  namespace: nrcc
+  labels:
+    app: nrcc
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local   # preserves client IP for logs / SSRF guard
+  selector:
+    app: nrcc
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 32088
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: 8443
+      nodePort: 32444
+      protocol: TCP
