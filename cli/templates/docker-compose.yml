@@ -27,9 +27,11 @@ services:
         condition: service_started
     restart: unless-stopped
     environment:
-      # Single-user mode is the default for desktop installs. Flip this
-      # to "true" if you intend to share NRCC with multiple humans.
-      NRCC_MULTI_USER: "false"
+      # NRCC only enables HTTPS when multi-user mode is on -- the
+      # launcher (and this compose file) publishes on https://, so we
+      # force it on. The chat / presence features come along for the
+      # ride; they're harmless on a single-user install.
+      NRCC_MULTI_USER: "true"
 
       PORT: "8443"
       NRCC_TLS_CERT_DIR:    "/data/certs"

@@ -76,6 +76,9 @@ cmd_start() {
       (
         cd "$APP_DIR"
         export PORT="$PORT"
+        # NRCC only enables HTTPS when multi-user mode is on; the
+        # launcher publishes the URL as https:// so we force it.
+        export NRCC_MULTI_USER="${NRCC_MULTI_USER:-true}"
         export NRCC_TLS_CERT_DIR="${NRCC_TLS_CERT_DIR:-$INSTALL_DIR/data/certs}"
         export NRCC_SCREENSHOTS_DIR="${NRCC_SCREENSHOTS_DIR:-$INSTALL_DIR/data/screenshots}"
         export NRCC_RECORDINGS_DIR="${NRCC_RECORDINGS_DIR:-$INSTALL_DIR/data/recordings}"

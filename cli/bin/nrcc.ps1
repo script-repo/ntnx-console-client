@@ -100,6 +100,9 @@ function Cmd-Start {
       Write-Log "Starting NRCC server (logs: $LogFile) ..."
       $envBlock = @{
         PORT                    = "$Port"
+        # NRCC only enables HTTPS when multi-user mode is on; the
+        # launcher publishes the URL as https:// so we force it.
+        NRCC_MULTI_USER         = 'true'
         NRCC_TLS_CERT_DIR       = "$InstallDir\data\certs"
         NRCC_SCREENSHOTS_DIR    = "$InstallDir\data\screenshots"
         NRCC_RECORDINGS_DIR     = "$InstallDir\data\recordings"
