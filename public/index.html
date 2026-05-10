@@ -117,19 +117,6 @@
         gap: 12px;
         box-shadow: var(--ntx-shadow-sm);
       }
-      .topbar-mark {
-        width: 26px;
-        height: 26px;
-        border-radius: 6px;
-        background: linear-gradient(135deg, #4f8dff, #1565ff);
-        display: grid;
-        place-items: center;
-        color: #fff;
-        font-weight: 700;
-        font-size: 13px;
-        letter-spacing: 0.5px;
-        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18);
-      }
       .topbar-title {
         margin: 0;
         font-size: 15px;
@@ -1623,17 +1610,6 @@
         gap: 12px;
         margin-bottom: 22px;
       }
-      .login-brand-mark {
-        /* Brand mark is the supplied transparent NRCC PNG, rendered
-           natively (no invert, no drop-shadow) so it looks like the
-           file you see in the assets folder. object-fit keeps the
-           aspect ratio if the source dimensions ever change. */
-        width: 42px;
-        height: 42px;
-        object-fit: contain;
-        user-select: none;
-        -webkit-user-drag: none;
-      }
       .login-brand-text {
         display: flex;
         flex-direction: column;
@@ -3048,12 +3024,6 @@
     <div id="loginScreen" class="login-screen">
       <div class="login-card">
         <div class="login-brand">
-          <img
-            src="/assets/nrcc-logo.png"
-            alt="NRCC"
-            class="login-brand-mark"
-            draggable="false"
-          />
           <div class="login-brand-text">
             <span class="login-brand-title">Nutanix Remote Console</span>
             <span class="login-brand-sub">NRCC</span>
@@ -3109,7 +3079,6 @@
     <!-- Main app (hidden until logged in) -->
     <div id="appShell" class="app-shell locked">
       <header class="topbar">
-        <div class="topbar-mark">N</div>
         <h1 class="topbar-title">Nutanix Remote Console Client</h1>
         <span class="topbar-sub">NRCC</span>
         <div class="topbar-spacer"></div>
