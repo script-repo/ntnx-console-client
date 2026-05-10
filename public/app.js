@@ -7248,6 +7248,49 @@ if (sidebarToggleBtn) {
 }
 
 // =====================================================================
+// Action-menu collapse toggle
+//
+// Mirror of the sidebar toggle for the right-hand action menu, so the
+// console can use the full width of the page when the user doesn't
+// need quick access to Ctrl+Alt+Del / Paste / Recordings / etc.
+// Lives inside .console-row so the chevron stays put as the page scrolls.
+// =====================================================================
+
+const ACTIONS_COLLAPSED_KEY = "nrcc.actions.collapsed";
+const consoleRow = document.querySelector(".console-row");
+const actionsToggleBtn = document.getElementById("actionsToggleBtn");
+const actionsToggleIcon = document.getElementById("actionsToggleIcon");
+
+function applyActionsCollapsed(collapsed) {
+  if (!consoleRow || !actionsToggleBtn) return;
+  consoleRow.classList.toggle("actions-collapsed", collapsed);
+  actionsToggleBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  actionsToggleBtn.title = collapsed ? "Show the action menu" : "Hide the action menu";
+  if (actionsToggleIcon) {
+    actionsToggleIcon.innerHTML = collapsed ? "&laquo;" : "&raquo;";
+  }
+}
+
+function loadActionsCollapsed() {
+  try {
+    return localStorage.getItem(ACTIONS_COLLAPSED_KEY) === "1";
+  } catch (_e) {
+    return false;
+  }
+}
+
+if (actionsToggleBtn) {
+  applyActionsCollapsed(loadActionsCollapsed());
+  actionsToggleBtn.addEventListener("click", () => {
+    const next = !consoleRow.classList.contains("actions-collapsed");
+    applyActionsCollapsed(next);
+    try {
+      localStorage.setItem(ACTIONS_COLLAPSED_KEY, next ? "1" : "0");
+    } catch (_e) { /* private mode -- ignore */ }
+  });
+}
+
+// =====================================================================
 // Boot
 // =====================================================================
 

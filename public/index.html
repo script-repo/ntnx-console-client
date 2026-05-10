@@ -171,9 +171,14 @@
         border-color: rgba(255, 200, 215, 0.6);
       }
       .container {
-        max-width: 1600px;
-        margin: 0 auto;
-        padding: 16px;
+        /* Use the full browser width so the sidebar sits flush left
+           and the action menu sits flush right -- no wasted whitespace
+           on either side of the console. Only minimal vertical padding
+           and a hairline gutter (8px) so the panel cards don't kiss
+           the screen edge on a maximised browser window. */
+        max-width: none;
+        margin: 0;
+        padding: 8px;
       }
       .panel {
         background: var(--ntx-surface);
@@ -629,6 +634,53 @@
       .console-row .console-stage {
         flex: 1;
         min-width: 0;
+      }
+      /* Collapsed action menu: zero out the .tabs-actions column the
+         same way .layout.sidebar-collapsed zeroes the sidebar. The
+         toggle button itself is a sibling of .tabs-actions so it
+         stays visible for the user to expand again. */
+      .console-row.actions-collapsed { gap: 0; }
+      .console-row.actions-collapsed .tabs-actions {
+        width: 0;
+        opacity: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      /* Mirror of .sidebar-toggle, pinned to the boundary between the
+         console stage and the action menu. Same look + size so the two
+         controls feel like a pair. */
+      .actions-toggle {
+        flex: 0 0 22px;
+        width: 22px;
+        align-self: stretch;
+        margin: 0;
+        padding: 0;
+        background: var(--ntx-surface);
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        color: var(--ntx-text-subtle);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1;
+        box-shadow: var(--ntx-shadow-sm);
+        transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+      }
+      .actions-toggle:hover {
+        background: var(--ntx-accent-soft);
+        color: var(--ntx-accent);
+        border-color: var(--ntx-accent);
+      }
+      .actions-toggle:focus-visible {
+        outline: 2px solid var(--ntx-accent);
+        outline-offset: 2px;
+      }
+      .actions-toggle-icon {
+        display: inline-block;
+        transform: translateY(-1px);
       }
       .tabs {
         display: flex;
@@ -3224,14 +3276,28 @@
                       </div>
                     </div>
                   </div>
+                  <button
+                    id="actionsToggleBtn"
+                    type="button"
+                    class="actions-toggle"
+                    title="Hide / show the action menu"
+                    aria-label="Hide or show the action menu"
+                    aria-expanded="true"
+                    aria-controls="consoleActionMenu"
+                  >
+                    <span id="actionsToggleIcon" class="actions-toggle-icon">&raquo;</span>
+                  </button>
+
                   <!--
                     Action menu (was a stack of coloured buttons).
                     Now a single white "card" of icon+label rows
                     grouped by purpose, modelled on the screenshot
                     the user supplied. Each <button>'s id is preserved
                     so app.js's enable/disable wiring keeps working.
+                    The id on the wrapper lets the toggle's
+                    aria-controls point at the thing it actually toggles.
                   -->
-                  <div class="tabs-actions action-menu">
+                  <div id="consoleActionMenu" class="tabs-actions action-menu">
                     <div class="action-section">
                       <div class="action-section-title">Input</div>
                       <button id="ctrlAltDelBtn" type="button" class="action-row" disabled
