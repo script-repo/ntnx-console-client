@@ -47,14 +47,14 @@ function Expand-Zip([string]$ZipPath, [string]$Destination) {
     return
   }
   Add-Type -AssemblyName System.IO.Compression.FileSystem
-  if (Test-Path $Destination) {
-    Get-ChildItem -LiteralPath $Destination -Recurse -Force | Remove-Item -Recurse -Force
-  } else {
+  if (-not (Test-Path $Destination)) {
     $null = New-Item -ItemType Directory -Force -Path $Destination
   }
-  [System.IO.Compression.ZipFile]::ExtractToDirectory(
-    [System.IO.Path]::GetFullPath($ZipPath),
-    [System.IO.Path]::GetFullPath($Destination))
+  # Resolve full paths -- ExtractToDirectory rejects relative paths and
+  # also rejects paths that haven't been canonicalised by .NET.
+  $zipFull = (Resolve-Path -LiteralPath $ZipPath).ProviderPath
+  $dstFull = (Resolve-Path -LiteralPath $Destination).ProviderPath
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFull, $dstFull)
 }
 
 if ([System.IntPtr]::Size -ne 8) {
