@@ -7276,7 +7276,8 @@ if (sidebarToggleBtn) {
 // =====================================================================
 
 const VMLIST_COLLAPSED_KEY = "nrcc.vmlist.collapsed";
-const vmListEl = document.getElementById("vmList");
+// vmListEl is already declared near the top of this file (the renderVmList
+// path uses it). Re-using that reference instead of re-declaring it.
 const vmListToggleBtn = document.getElementById("vmListToggleBtn");
 const vmListToggleIcon = document.getElementById("vmListToggleIcon");
 const vmListTitleRow = document.querySelector(".vmlist-title-row");
