@@ -648,21 +648,26 @@
          console can use the rest of the width:
             - the user clicks the .actions-toggle chevron
               -> .console-row.actions-collapsed
-            - the chat panel is open
-              -> body.chat-panel-open  (already toggled by app.js)
-            - the script library side panel is open
-              -> body.lib-modal-open   (already toggled by app.js)
-         When the chat / library panels close, the action menu pops
-         back to whatever the user's chevron preference was, so we
-         never lose the user's setting. Tooltips (the original
-         `title="..."` attrs on each <button>) handle naming in
-         icon-only mode. */
+            - the chat panel is open AND there is NOT enough room
+              for the FULL action menu to sit alongside it
+              -> body.chat-panel-open AND NOT body.overlay-fits
+            - the script library side panel is open AND there is NOT
+              enough room for the FULL action menu alongside it
+              -> body.script-side-open AND NOT body.overlay-fits
+         The .overlay-fits class is set by JS (updatePanelOverlayMode
+         in app.js) when the viewport is wide enough that the chat /
+         script-library panel can be pushed left of the FULL action
+         menu without obstructing it. When chat / library panels
+         close, the action menu pops back to whatever the user's
+         chevron preference was, so we never lose the user's setting.
+         Tooltips (the original `title="..."` attrs on every <button>)
+         handle naming in icon-only mode. */
       .console-row.actions-collapsed,
-      body.chat-panel-open .console-row,
-      body.lib-modal-open .console-row { gap: 6px; }
+      body.chat-panel-open:not(.overlay-fits) .console-row,
+      body.script-side-open:not(.overlay-fits) .console-row { gap: 6px; }
       .console-row.actions-collapsed .tabs-actions,
-      body.chat-panel-open .console-row .tabs-actions,
-      body.lib-modal-open .console-row .tabs-actions {
+      body.chat-panel-open:not(.overlay-fits) .console-row .tabs-actions,
+      body.script-side-open:not(.overlay-fits) .console-row .tabs-actions {
         width: 52px;
       }
       /* Hide the labels / section names / chevrons / value pills
@@ -671,39 +676,50 @@
       .console-row.actions-collapsed .action-row-chevron,
       .console-row.actions-collapsed .action-row-meta,
       .console-row.actions-collapsed .action-section-title,
-      body.chat-panel-open .console-row .action-row-label,
-      body.chat-panel-open .console-row .action-row-chevron,
-      body.chat-panel-open .console-row .action-row-meta,
-      body.chat-panel-open .console-row .action-section-title,
-      body.lib-modal-open .console-row .action-row-label,
-      body.lib-modal-open .console-row .action-row-chevron,
-      body.lib-modal-open .console-row .action-row-meta,
-      body.lib-modal-open .console-row .action-section-title {
+      body.chat-panel-open:not(.overlay-fits) .console-row .action-row-label,
+      body.chat-panel-open:not(.overlay-fits) .console-row .action-row-chevron,
+      body.chat-panel-open:not(.overlay-fits) .console-row .action-row-meta,
+      body.chat-panel-open:not(.overlay-fits) .console-row .action-section-title,
+      body.script-side-open:not(.overlay-fits) .console-row .action-row-label,
+      body.script-side-open:not(.overlay-fits) .console-row .action-row-chevron,
+      body.script-side-open:not(.overlay-fits) .console-row .action-row-meta,
+      body.script-side-open:not(.overlay-fits) .console-row .action-section-title {
         display: none;
       }
       /* Centre the icons in the narrow column. */
       .console-row.actions-collapsed .action-row,
-      body.chat-panel-open .console-row .action-row,
-      body.lib-modal-open .console-row .action-row {
+      body.chat-panel-open:not(.overlay-fits) .console-row .action-row,
+      body.script-side-open:not(.overlay-fits) .console-row .action-row {
         padding: 9px 0;
         justify-content: center;
         gap: 0;
       }
       /* Tighter section dividers without the title text taking space. */
       .console-row.actions-collapsed .action-section,
-      body.chat-panel-open .console-row .action-section,
-      body.lib-modal-open .console-row .action-section { padding: 2px 0; }
+      body.chat-panel-open:not(.overlay-fits) .console-row .action-section,
+      body.script-side-open:not(.overlay-fits) .console-row .action-section { padding: 2px 0; }
       .console-row.actions-collapsed .action-section + .action-section,
-      body.chat-panel-open .console-row .action-section + .action-section,
-      body.lib-modal-open .console-row .action-section + .action-section {
+      body.chat-panel-open:not(.overlay-fits) .console-row .action-section + .action-section,
+      body.script-side-open:not(.overlay-fits) .console-row .action-section + .action-section {
         padding-top: 4px;
       }
       /* When chat / library forces icon-only, the user toggle would be
          a no-op (CSS keeps overriding). Hide it so the chrome doesn't
          lie about being interactive. The toggle reappears as soon as
-         the overlay closes. */
-      body.chat-panel-open .actions-toggle,
-      body.lib-modal-open .actions-toggle { display: none; }
+         the overlay closes or the viewport widens enough that the
+         action menu fits beside the panel. */
+      body.chat-panel-open:not(.overlay-fits) .actions-toggle,
+      body.script-side-open:not(.overlay-fits) .actions-toggle { display: none; }
+
+      /* When the viewport has enough room for the FULL action menu to
+         sit beside the chat / script-library panel, push those panels
+         16px clear of the FULL action card (220px + 8px gutter + 16px
+         gap = 244px from the right edge) instead of leaning on the
+         icon-only column. */
+      body.chat-panel-open.overlay-fits .chat-panel,
+      body.script-side-open.overlay-fits .script-side-panel {
+        right: 244px;
+      }
       /* Mirror of .sidebar-toggle, pinned to the boundary between the
          console stage and the action menu. Same look + size so the two
          controls feel like a pair. */
@@ -2752,11 +2768,15 @@
         top: 80px;
         /* Sit to the LEFT of the icon-only action menu (52px wide,
            anchored at right: 8px by the .container gutter); same
-           76px math as .chat-panel. Action menu folds to icon-only
-           whenever this panel is open. */
+           76px math as .chat-panel. The .overlay-fits body class
+           (set by JS when the viewport has room for the FULL action
+           menu plus this panel) shifts us further left to clear the
+           full action card without forcing icon-only mode. */
         right: 76px;
         bottom: 86px;
-        width: 440px;
+        /* Same width as .chat-panel so the two right-edge surfaces
+           feel symmetrical. */
+        width: 360px;
         max-width: calc(100vw - 36px);
         background: var(--ntx-surface);
         border: 1px solid var(--ntx-border);
@@ -3371,9 +3391,14 @@
                       <button id="ctrlAltDelBtn" type="button" class="action-row" disabled
                               title="Send Ctrl+Alt+Del to the active console (unlock Windows)">
                         <span class="action-row-icon" aria-hidden="true">
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                            <rect x="2.5" y="6" width="19" height="12" rx="2"/>
-                            <path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M6 14h.01M9 14h.01M12 14h.01M15 14h.01M18 14h.01"/>
+                          <!-- Three discrete key caps so the icon-only
+                               state reads as "key combo" instead of
+                               looking like the Keyboard Layout icon
+                               below. -->
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="1" y="8" width="6.5" height="8" rx="1.5"/>
+                            <rect x="8.75" y="8" width="6.5" height="8" rx="1.5"/>
+                            <rect x="16.5" y="8" width="6.5" height="8" rx="1.5"/>
                           </svg>
                         </span>
                         <span class="action-row-label">Ctrl+Alt+Del</span>

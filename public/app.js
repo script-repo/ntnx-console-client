@@ -6489,12 +6489,19 @@ function openScriptLibrary() {
   scriptLibState.open = true;
   scriptLibraryModal.hidden = false;
   scriptLauncher.classList.add("is-open");
+  // Body class drives the icon-only auto-collapse of the action menu
+  // (see .console-row rules in index.html). Updating overlay mode here
+  // also reflows the panel's `right:` offset based on viewport width.
+  document.body.classList.add("script-side-open");
+  updatePanelOverlayMode();
   refreshScriptLibrary(scriptLibState.folder);
 }
 function closeScriptLibrary() {
   scriptLibState.open = false;
   scriptLibraryModal.hidden = true;
   scriptLauncher.classList.remove("is-open");
+  document.body.classList.remove("script-side-open");
+  updatePanelOverlayMode();
 }
 function toggleScriptLibrary() {
   if (scriptLibState.open) closeScriptLibrary();
@@ -6958,6 +6965,7 @@ function teardownChat() {
   chatPanel.hidden = true;
   chatLauncher.classList.remove("is-open");
   document.body.classList.remove("chat-panel-open");
+  updatePanelOverlayMode();
   updateChatBadge();
   renderChatHeader();
   renderChatPresence();
@@ -6973,6 +6981,10 @@ function toggleChatPanel(forceState) {
   // Lifts the script-library side panel above the chat dialog so the
   // two right-edge surfaces don't overlap (see .script-side-panel CSS).
   document.body.classList.toggle("chat-panel-open", next);
+  // Re-evaluate whether the FULL action menu fits beside the chat
+  // panel at this viewport width, so the action menu only folds to
+  // icon-only mode when it would actually be obstructed.
+  updatePanelOverlayMode();
   if (next) {
     // Clear unread for the channel we're now actively viewing.
     if (chatCurrentVmUuid) {
@@ -7287,6 +7299,71 @@ if (actionsToggleBtn) {
     try {
       localStorage.setItem(ACTIONS_COLLAPSED_KEY, next ? "1" : "0");
     } catch (_e) { /* private mode -- ignore */ }
+  });
+}
+
+// =====================================================================
+// Right-edge overlay layout (chat panel + script library side panel)
+//
+// When the chat panel or the script library side panel is open we need
+// to decide whether the FULL action menu (220px wide) can sit beside
+// the panel without being obstructed:
+//
+//   - If the viewport is wide enough -> body.overlay-fits, action menu
+//     stays in its full state, panel is shifted to right:244px so it
+//     clears the action card by 16px.
+//   - If the viewport is too narrow  -> action menu folds to its
+//     icon-only column (52px), panel sits at right:76px so it just
+//     clears the icon column.
+//
+// Both "panel widths" are 360px (chat and script library are
+// intentionally symmetric). The threshold below reserves ~600px of
+// console room (sidebar(0) + actions toggle(22) + console(~600) +
+// actions toggle(22) + action card(220) + gutter(8) + gap(16) + panel
+// (360) + gutter(8)) plus 380px when the sidebar is visible.
+// =====================================================================
+
+function updatePanelOverlayMode() {
+  const chatOpen = document.body.classList.contains("chat-panel-open");
+  const scriptOpen = document.body.classList.contains("script-side-open");
+  const overlayOpen = chatOpen || scriptOpen;
+  if (!overlayOpen) {
+    document.body.classList.remove("overlay-fits");
+    return;
+  }
+  const sidebarVisible = layoutRoot && !layoutRoot.classList.contains("sidebar-collapsed");
+  // Numbers below mirror the layout sums in the index.html CSS.
+  const sidebarBlock = sidebarVisible ? (380 + 14) : 0;
+  const actionsToggle = 22;
+  const actionCardWithGutter = 220 + 8;
+  const consoleRowGap = 12 * 2;
+  const containerPadding = 16;
+  const panelGap = 16;
+  const panelWidth = 360;
+  const minConsoleWidth = 600;
+  const required = sidebarBlock + actionsToggle + minConsoleWidth +
+                   consoleRowGap + actionCardWithGutter +
+                   panelGap + panelWidth + containerPadding;
+  document.body.classList.toggle("overlay-fits", window.innerWidth >= required);
+}
+
+// Recompute when the viewport changes (debounced via rAF so a drag-
+// resize doesn't thrash the layout).
+let _overlayResizeRaf = 0;
+window.addEventListener("resize", () => {
+  if (_overlayResizeRaf) return;
+  _overlayResizeRaf = requestAnimationFrame(() => {
+    _overlayResizeRaf = 0;
+    updatePanelOverlayMode();
+  });
+});
+
+// Recompute when the sidebar collapses/expands (changes the available
+// width budget for the action menu vs. the chat/script panel).
+if (sidebarToggleBtn) {
+  sidebarToggleBtn.addEventListener("click", () => {
+    // Click handler above flips .sidebar-collapsed before this fires.
+    updatePanelOverlayMode();
   });
 }
 
