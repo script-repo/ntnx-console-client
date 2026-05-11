@@ -324,6 +324,36 @@
         margin: 0;
         flex: 1;
       }
+      /* VM-list collapse toggle (mirrors the favorites-folder
+         chevron). The whole header is one button so the user can
+         click anywhere on "[v] VMs" to collapse / expand. */
+      .vmlist-toggle {
+        all: unset;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+        flex: 1;
+        padding: 2px 0;
+      }
+      .vmlist-toggle:focus-visible {
+        outline: 2px solid var(--ntx-accent);
+        outline-offset: 2px;
+        border-radius: 3px;
+      }
+      .vmlist-toggle-icon {
+        display: inline-flex;
+        width: 12px;
+        height: 12px;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        color: var(--ntx-text-muted);
+        transition: transform 120ms ease;
+      }
+      .vmlist-title-row.is-collapsed .vmlist-toggle-icon {
+        transform: rotate(-90deg);
+      }
       .filters {
         display: grid;
         gap: 8px;
@@ -347,22 +377,10 @@
       #vmList {
         display: grid;
         gap: 4px;
-        max-height: 320px;
-        overflow: auto;
         padding-right: 2px;
       }
-      #favoritesTree {
-        max-height: 360px;
-      }
-      #favoritesTree::-webkit-scrollbar,
-      #vmList::-webkit-scrollbar {
-        width: 8px;
-      }
-      #favoritesTree::-webkit-scrollbar-thumb,
-      #vmList::-webkit-scrollbar-thumb {
-        background: var(--ntx-border-strong);
-        border-radius: 4px;
-      }
+      /* Hidden VM list (collapsed via the section-title chevron). */
+      #vmList[hidden] { display: none; }
       .vm-row {
         display: grid;
         grid-template-columns: 30px 1fr;
@@ -404,7 +422,28 @@
         margin-top: 3px;
         color: var(--ntx-text-muted);
         font-size: 11.5px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
       }
+      .vm-meta-text {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .vm-meta-pills {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      /* Pills now live in .vm-meta, so the left margin that used to
+         offset them from the VM name in .vm-name is no longer
+         needed (the .vm-meta gap handles spacing). */
+      .vm-meta-pills .vm-port-pill { margin-left: 0; }
       .state-pill {
         display: inline-flex;
         align-items: center;
@@ -643,23 +682,15 @@
            against the console (it never floats over to the right). */
         max-width: 1600px;
       }
-      /* Collapsed (icon-only) action menu. Three triggers fold the
+      /* Collapsed (icon-only) action menu. Two triggers fold the
          action card down to a narrow vertical bar of icons so the
          console can use the rest of the width:
             - the user clicks the .actions-toggle chevron
               -> .console-row.actions-collapsed
-            - the chat panel is open AND there is NOT enough room
-              for the FULL action menu to sit alongside it
-              -> body.chat-panel-open AND NOT body.overlay-fits
-            - the script library side panel is open AND there is NOT
-              enough room for the FULL action menu alongside it
-              -> body.script-side-open AND NOT body.overlay-fits
-         The .overlay-fits class is set by JS (updatePanelOverlayMode
-         in app.js) when the viewport is wide enough that the chat /
-         script-library panel can be pushed left of the FULL action
-         menu without obstructing it. When chat / library panels
-         close, the action menu pops back to whatever the user's
-         chevron preference was, so we never lose the user's setting.
+            - the viewport is too narrow for the FULL action menu to
+              sit alongside an open chat / script-library panel
+              -> body.chat-panel-open OR body.script-side-open AND
+                 NOT body.overlay-fits
          Tooltips (the original `title="..."` attrs on every <button>)
          handle naming in icon-only mode. */
       .console-row.actions-collapsed,
@@ -705,20 +736,21 @@
       }
       /* When chat / library forces icon-only, the user toggle would be
          a no-op (CSS keeps overriding). Hide it so the chrome doesn't
-         lie about being interactive. The toggle reappears as soon as
-         the overlay closes or the viewport widens enough that the
-         action menu fits beside the panel. */
+         lie about being interactive. */
       body.chat-panel-open:not(.overlay-fits) .actions-toggle,
       body.script-side-open:not(.overlay-fits) .actions-toggle { display: none; }
 
-      /* When the viewport has enough room for the FULL action menu to
-         sit beside the chat / script-library panel, push those panels
-         16px clear of the FULL action card (220px + 8px gutter + 16px
-         gap = 244px from the right edge) instead of leaning on the
-         icon-only column. */
-      body.chat-panel-open.overlay-fits .chat-panel,
-      body.script-side-open.overlay-fits .script-side-panel {
-        right: 244px;
+      /* While the chat panel or script-library side panel is open,
+         shrink the .container's content area on the right so the rest
+         of the layout (sidebar + console + action menu) stops short of
+         where the panel sits. 8 (panel gutter) + 360 (panel width) +
+         16 (visual gap to the action menu) = 384. The chat / script
+         panels are flush right (right: 8px), so this padding leaves
+         exactly a 16px gap between the action menu and the panel and
+         no whitespace beyond the panel itself. */
+      body.chat-panel-open .container,
+      body.script-side-open .container {
+        padding-right: 384px;
       }
       /* Mirror of .sidebar-toggle, pinned to the boundary between the
          console stage and the action menu. Same look + size so the two
@@ -2766,13 +2798,10 @@
       .script-side-panel {
         position: fixed;
         top: 80px;
-        /* Sit to the LEFT of the icon-only action menu (52px wide,
-           anchored at right: 8px by the .container gutter); same
-           76px math as .chat-panel. The .overlay-fits body class
-           (set by JS when the viewport has room for the FULL action
-           menu plus this panel) shifts us further left to clear the
-           full action card without forcing icon-only mode. */
-        right: 76px;
+        /* Same flush-right anchoring as .chat-panel. The .container
+           padding-right reserves the room so we never overlap the
+           action menu. */
+        right: 8px;
         bottom: 86px;
         /* Same width as .chat-panel so the two right-edge surfaces
            feel symmetrical. */
@@ -3069,13 +3098,14 @@
       .chat-launcher-badge[hidden] { display: none; }
       .chat-panel {
         position: fixed;
-        /* Sit to the LEFT of the icon-only action menu (52px wide,
-           anchored at right: 8px by the .container gutter) -- never
-           overlap it. 8 (gutter) + 52 (icon bar) + 16 (visual gap)
-           = 76. The action menu is forced into icon-only mode while
-           the chat panel is open (see .console-row rules above), so
-           76px is enough headroom regardless of viewport size. */
-        right: 76px;
+        /* Flush against the viewport's right edge (with the same 8px
+           gutter the .container uses on the left). When this panel
+           is open, .container gets padding-right: 384px to reserve
+           room: the action menu's right edge stops at viewport.right
+           - 384, the panel's left edge starts at viewport.right - 368,
+           leaving a 16px visual gap. So no whitespace on the right of
+           the panel, and the action menu is never obscured. */
+        right: 8px;
         bottom: 86px;
         width: 360px;
         max-width: calc(100vw - 36px);
@@ -3325,7 +3355,14 @@
                   <button id="addFavFolderBtn" type="button" class="link-button" title="Add a top-level folder">+ Folder</button>
                 </div>
                 <div id="favoritesTree" class="fav-tree" data-drop-target="root"></div>
-                <div class="section-title" style="margin-top:14px">VMs</div>
+                <div class="section-title-row vmlist-title-row" style="margin-top:14px">
+                  <button id="vmListToggleBtn" type="button" class="vmlist-toggle"
+                          aria-expanded="true" aria-controls="vmList"
+                          title="Show / hide the VM list">
+                    <span id="vmListToggleIcon" class="vmlist-toggle-icon" aria-hidden="true">&#9662;</span>
+                    <span class="section-title">VMs</span>
+                  </button>
+                </div>
                 <div id="vmList"></div>
               </div>
             </section>

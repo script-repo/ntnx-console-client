@@ -767,11 +767,17 @@ function createVmRow(vm, opts = {}) {
     if (portStatus.rdp) parts.push(`<span class="vm-port-pill" data-protocol="rdp" title="RDP (port 3389) reachable">RDP</span>`);
     portPills = `<span data-feature="vmPortScan">${parts.join("")}</span>`;
   }
+  const metaText = metaLine(vm) || (isLive ? "" : "Updating from Prism Central...");
   row.innerHTML = `
     <button class="star ${fav ? "is-fav" : ""}" title="${fav ? "Remove favorite" : "Add favorite"}">${fav ? "★" : "☆"}</button>
     <div class="vm-item ${isLive ? "" : "is-loading"}">
-      <div class="vm-name">${escapeHtml(vm.name || vm.uuid)}<span class="state-pill" data-state="${escapeHtml(normPower)}">${escapeHtml(pillLabel)}</span>${portPills}</div>
-      <div class="vm-meta">${escapeHtml(metaLine(vm) || (isLive ? "" : "Updating from Prism Central..."))}</div>
+      <div class="vm-name">${escapeHtml(vm.name || vm.uuid)}</div>
+      <div class="vm-meta">
+        <span class="vm-meta-text">${escapeHtml(metaText)}</span>
+        <span class="vm-meta-pills">
+          <span class="state-pill" data-state="${escapeHtml(normPower)}">${escapeHtml(pillLabel)}</span>${portPills}
+        </span>
+      </div>
     </div>
   `;
   const starBtn = row.querySelector(".star");
@@ -7260,6 +7266,56 @@ if (sidebarToggleBtn) {
 }
 
 // =====================================================================
+// VM-list collapse toggle
+//
+// Mirrors how the favorites tree collapses individual folders: the
+// "VMs" section title is itself a button with a rotating chevron.
+// Persists across reloads via localStorage so the user's preference
+// sticks. Hides the entire #vmList while collapsed (the favorites
+// section is unaffected).
+// =====================================================================
+
+const VMLIST_COLLAPSED_KEY = "nrcc.vmlist.collapsed";
+const vmListEl = document.getElementById("vmList");
+const vmListToggleBtn = document.getElementById("vmListToggleBtn");
+const vmListToggleIcon = document.getElementById("vmListToggleIcon");
+const vmListTitleRow = document.querySelector(".vmlist-title-row");
+
+function applyVmListCollapsed(collapsed) {
+  if (!vmListEl || !vmListToggleBtn) return;
+  vmListEl.hidden = !!collapsed;
+  vmListToggleBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  vmListToggleBtn.title = collapsed ? "Show the VM list" : "Hide the VM list";
+  if (vmListTitleRow) {
+    vmListTitleRow.classList.toggle("is-collapsed", !!collapsed);
+  }
+  if (vmListToggleIcon) {
+    // Triangle rotates via CSS (.is-collapsed); the glyph itself
+    // stays the same so screen readers don't see a wobbly label.
+    vmListToggleIcon.innerHTML = "&#9662;";
+  }
+}
+
+function loadVmListCollapsed() {
+  try {
+    return localStorage.getItem(VMLIST_COLLAPSED_KEY) === "1";
+  } catch (_e) {
+    return false;
+  }
+}
+
+if (vmListToggleBtn) {
+  applyVmListCollapsed(loadVmListCollapsed());
+  vmListToggleBtn.addEventListener("click", () => {
+    const next = !vmListEl.hidden;
+    applyVmListCollapsed(next);
+    try {
+      localStorage.setItem(VMLIST_COLLAPSED_KEY, next ? "1" : "0");
+    } catch (_e) { /* private mode -- ignore */ }
+  });
+}
+
+// =====================================================================
 // Action-menu collapse toggle
 //
 // Mirror of the sidebar toggle for the right-hand action menu, so the
@@ -7331,19 +7387,25 @@ function updatePanelOverlayMode() {
     document.body.classList.remove("overlay-fits");
     return;
   }
+  // The .container reserves 384px on the right when overlay is open
+  // (see CSS: 8 panel gutter + 360 panel width + 16 visual gap).
+  // We just need to know whether the remaining content area can fit
+  // the FULL action menu plus a usable console; if not, we mark the
+  // overlay as "doesn't fit" so the action menu folds to its 52px
+  // icon column.
   const sidebarVisible = layoutRoot && !layoutRoot.classList.contains("sidebar-collapsed");
-  // Numbers below mirror the layout sums in the index.html CSS.
-  const sidebarBlock = sidebarVisible ? (380 + 14) : 0;
-  const actionsToggle = 22;
-  const actionCardWithGutter = 220 + 8;
-  const consoleRowGap = 12 * 2;
-  const containerPadding = 16;
-  const panelGap = 16;
-  const panelWidth = 360;
+  const containerPadLeft = 8;
+  const containerPadRight = 384;
+  // Layout flex chrome: sidebar + sidebar-toggle + 2 layout gaps (when
+  // sidebar visible). Numbers mirror index.html CSS.
+  const sidebarBlock = sidebarVisible ? (380 + 14 + 14) : 0;
+  const sidebarToggle = 22;
+  // Console-row chrome: 2 gaps + actions-toggle + full action card.
+  const consoleRowChrome = 12 * 2 + 22 + 220;
   const minConsoleWidth = 600;
-  const required = sidebarBlock + actionsToggle + minConsoleWidth +
-                   consoleRowGap + actionCardWithGutter +
-                   panelGap + panelWidth + containerPadding;
+  const required = containerPadLeft + containerPadRight +
+                   sidebarBlock + sidebarToggle +
+                   minConsoleWidth + consoleRowChrome;
   document.body.classList.toggle("overlay-fits", window.innerWidth >= required);
 }
 
