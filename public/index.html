@@ -634,18 +634,76 @@
       .console-row .console-stage {
         flex: 1;
         min-width: 0;
+        /* Cap the console at 1600px no matter how wide the viewport
+           is. Any extra horizontal space is left BLANK on the right
+           side of the action menu (the action menu sits flush against
+           the console, not against the viewport edge). When the
+           sidebar is hidden, the console moves LEFT into the vacated
+           space; when the action menu is collapsed it shrinks left
+           against the console (it never floats over to the right). */
+        max-width: 1600px;
       }
-      /* Collapsed action menu: zero out the .tabs-actions column the
-         same way .layout.sidebar-collapsed zeroes the sidebar. The
-         toggle button itself is a sibling of .tabs-actions so it
-         stays visible for the user to expand again. */
-      .console-row.actions-collapsed { gap: 0; }
-      .console-row.actions-collapsed .tabs-actions {
-        width: 0;
-        opacity: 0;
-        overflow: hidden;
-        pointer-events: none;
+      /* Collapsed (icon-only) action menu. Three triggers fold the
+         action card down to a narrow vertical bar of icons so the
+         console can use the rest of the width:
+            - the user clicks the .actions-toggle chevron
+              -> .console-row.actions-collapsed
+            - the chat panel is open
+              -> body.chat-panel-open  (already toggled by app.js)
+            - the script library side panel is open
+              -> body.lib-modal-open   (already toggled by app.js)
+         When the chat / library panels close, the action menu pops
+         back to whatever the user's chevron preference was, so we
+         never lose the user's setting. Tooltips (the original
+         `title="..."` attrs on each <button>) handle naming in
+         icon-only mode. */
+      .console-row.actions-collapsed,
+      body.chat-panel-open .console-row,
+      body.lib-modal-open .console-row { gap: 6px; }
+      .console-row.actions-collapsed .tabs-actions,
+      body.chat-panel-open .console-row .tabs-actions,
+      body.lib-modal-open .console-row .tabs-actions {
+        width: 52px;
       }
+      /* Hide the labels / section names / chevrons / value pills
+         while in icon-only mode -- only the icon survives. */
+      .console-row.actions-collapsed .action-row-label,
+      .console-row.actions-collapsed .action-row-chevron,
+      .console-row.actions-collapsed .action-row-meta,
+      .console-row.actions-collapsed .action-section-title,
+      body.chat-panel-open .console-row .action-row-label,
+      body.chat-panel-open .console-row .action-row-chevron,
+      body.chat-panel-open .console-row .action-row-meta,
+      body.chat-panel-open .console-row .action-section-title,
+      body.lib-modal-open .console-row .action-row-label,
+      body.lib-modal-open .console-row .action-row-chevron,
+      body.lib-modal-open .console-row .action-row-meta,
+      body.lib-modal-open .console-row .action-section-title {
+        display: none;
+      }
+      /* Centre the icons in the narrow column. */
+      .console-row.actions-collapsed .action-row,
+      body.chat-panel-open .console-row .action-row,
+      body.lib-modal-open .console-row .action-row {
+        padding: 9px 0;
+        justify-content: center;
+        gap: 0;
+      }
+      /* Tighter section dividers without the title text taking space. */
+      .console-row.actions-collapsed .action-section,
+      body.chat-panel-open .console-row .action-section,
+      body.lib-modal-open .console-row .action-section { padding: 2px 0; }
+      .console-row.actions-collapsed .action-section + .action-section,
+      body.chat-panel-open .console-row .action-section + .action-section,
+      body.lib-modal-open .console-row .action-section + .action-section {
+        padding-top: 4px;
+      }
+      /* When chat / library forces icon-only, the user toggle would be
+         a no-op (CSS keeps overriding). Hide it so the chrome doesn't
+         lie about being interactive. The toggle reappears as soon as
+         the overlay closes. */
+      body.chat-panel-open .actions-toggle,
+      body.lib-modal-open .actions-toggle { display: none; }
       /* Mirror of .sidebar-toggle, pinned to the boundary between the
          console stage and the action menu. Same look + size so the two
          controls feel like a pair. */
@@ -2692,7 +2750,11 @@
       .script-side-panel {
         position: fixed;
         top: 80px;
-        right: 18px;
+        /* Sit to the LEFT of the icon-only action menu (52px wide,
+           anchored at right: 8px by the .container gutter); same
+           76px math as .chat-panel. Action menu folds to icon-only
+           whenever this panel is open. */
+        right: 76px;
         bottom: 86px;
         width: 440px;
         max-width: calc(100vw - 36px);
@@ -2987,7 +3049,13 @@
       .chat-launcher-badge[hidden] { display: none; }
       .chat-panel {
         position: fixed;
-        right: 18px;
+        /* Sit to the LEFT of the icon-only action menu (52px wide,
+           anchored at right: 8px by the .container gutter) -- never
+           overlap it. 8 (gutter) + 52 (icon bar) + 16 (visual gap)
+           = 76. The action menu is forced into icon-only mode while
+           the chat panel is open (see .console-row rules above), so
+           76px is enough headroom regardless of viewport size. */
+        right: 76px;
         bottom: 86px;
         width: 360px;
         max-width: calc(100vw - 36px);
