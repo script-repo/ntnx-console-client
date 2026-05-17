@@ -211,6 +211,20 @@ const RDP_SECURITY = String(process.env.NRCC_RDP_SECURITY || "any").trim().toLow
 const RDP_IGNORE_CERT = String(process.env.NRCC_RDP_IGNORE_CERT || "true").toLowerCase() !== "false";
 
 // =====================================================================
+// VM folders (beta feature: vmFolders)
+// =====================================================================
+//
+// Group VMs into folders backed by Prism categories under the
+// reserved key "NTNXFolderPath" (dot-delimited paths, e.g.
+// "Production.Linux.Web"). Reads come for free off the categories
+// array that parseVmList already attaches to every VM; writes go
+// back to Prism via v4 category-association with a v3 metadata-PUT
+// fallback. Disable with NRCC_VM_FOLDERS_ENABLED=false on locked-
+// down installs that don't want NRCC mutating cluster category
+// state.
+const VM_FOLDERS_ENABLED = String(process.env.NRCC_VM_FOLDERS_ENABLED || "true").toLowerCase() !== "false";
+
+// =====================================================================
 // Feature-flag registry
 // =====================================================================
 //
@@ -232,7 +246,8 @@ const FEATURE_FLAGS = {
   // NRCC_RDP_ENABLED).
   vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
   sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" },
-  rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" }
+  rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" },
+  vmFolders:   { stage: "beta", description: "Group VMs into Prism-category-backed folders (NTNXFolderPath)" }
 };
 
 // Strict UUID match used everywhere we accept a VM UUID from the client.
@@ -692,7 +707,11 @@ app.get("/api/config", (req, res) => {
       defaultWidth: RDP_DEFAULT_WIDTH,
       defaultHeight: RDP_DEFAULT_HEIGHT,
       defaultDpi: RDP_DEFAULT_DPI
-    }
+    },
+    // VM folders (beta: vmFolders). The client also gates on the
+    // featureFlags entry above; this server-side switch is the
+    // operator's kill switch independent of the beta opt-in.
+    vmFoldersEnabled: VM_FOLDERS_ENABLED
   });
 });
 
@@ -2996,6 +3015,121 @@ function parseGenericEntityList(response) {
   return Array.isArray(list) ? list : [];
 }
 
+// =====================================================================
+// VM folder helpers (beta feature: vmFolders)
+// =====================================================================
+//
+// Folders are backed by a single reserved Prism category key. Each
+// folder is a category VALUE; nesting uses dot-delimited paths
+// (e.g. "Production.Linux.Web"). Validation matches the reference
+// impl byte-for-byte so paths created by either tool interoperate.
+const FOLDER_CATEGORY_KEY = "NTNXFolderPath";
+const FOLDER_MAX_PATH_LEN = 64;
+const FOLDER_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_ -]{0,62}[A-Za-z0-9]$|^[A-Za-z0-9]$/;
+const FOLDER_FORBIDDEN_CHARS_RE = /[/,!'"#%() *+:;=?`|[\]^&]/;
+
+function normalizeFolderPath(value) {
+  return String(value == null ? "" : value).trim();
+}
+
+function validateFolderPath(value) {
+  const path = normalizeFolderPath(value);
+  if (!path) return { ok: false, error: "Folder path is required." };
+  if (path.length > FOLDER_MAX_PATH_LEN) {
+    return {
+      ok: false,
+      error: `Folder path must be ${FOLDER_MAX_PATH_LEN} characters or less.`
+    };
+  }
+  if (FOLDER_FORBIDDEN_CHARS_RE.test(path)) {
+    return {
+      ok: false,
+      error: "Folder path contains characters Prism categories do not allow."
+    };
+  }
+  const segments = path.split(".");
+  if (segments.some((s) => !s.trim())) {
+    return { ok: false, error: "Folder path cannot contain empty segments." };
+  }
+  for (const segment of segments) {
+    if (!FOLDER_SEGMENT_RE.test(segment)) {
+      return { ok: false, error: `Invalid folder segment: ${segment}` };
+    }
+  }
+  return { ok: true, value: path };
+}
+
+function validateFolderName(value) {
+  const name = String(value == null ? "" : value).trim();
+  if (!name) return { ok: false, error: "Folder name is required." };
+  if (name.includes(".")) {
+    return {
+      ok: false,
+      error: "Folder name cannot contain dots; use the parent selector for nesting."
+    };
+  }
+  if (FOLDER_FORBIDDEN_CHARS_RE.test(name)) {
+    return {
+      ok: false,
+      error: "Folder name contains characters Prism categories do not allow."
+    };
+  }
+  if (!FOLDER_SEGMENT_RE.test(name)) {
+    return {
+      ok: false,
+      error: "Folder name must start and end with a letter or number."
+    };
+  }
+  return { ok: true, value: name };
+}
+
+function composeFolderPath(parentPath, name) {
+  const parent = normalizeFolderPath(parentPath);
+  const nameValidation = validateFolderName(name);
+  if (!nameValidation.ok) return nameValidation;
+  const path = parent ? `${parent}.${nameValidation.value}` : nameValidation.value;
+  const pathValidation = validateFolderPath(path);
+  if (!pathValidation.ok) return pathValidation;
+  return { ok: true, value: pathValidation.value };
+}
+
+// Given the ["key:value", ...] array that parseVmList already attaches
+// to every VM, return the NTNXFolderPath value (or "" when unset).
+function folderPathFromCategories(categories) {
+  if (!Array.isArray(categories)) return "";
+  const prefix = `${FOLDER_CATEGORY_KEY}:`;
+  for (const entry of categories) {
+    if (typeof entry !== "string") continue;
+    if (entry.startsWith(prefix)) {
+      return normalizeFolderPath(entry.slice(prefix.length));
+    }
+  }
+  return "";
+}
+
+// True for a folder path that is a descendant of (or equal to) `root`.
+// Used by rename / move / delete to walk subtrees.
+function folderPathIsAtOrBelow(path, root) {
+  const p = normalizeFolderPath(path);
+  const r = normalizeFolderPath(root);
+  if (!r) return false;
+  return p === r || p.startsWith(`${r}.`);
+}
+
+// Replace the `from` prefix with `to` on a path that's known to be at
+// or below `from`. Caller is responsible for the subtree check.
+function rewriteFolderPathPrefix(path, from, to) {
+  const p = normalizeFolderPath(path);
+  const f = normalizeFolderPath(from);
+  const t = normalizeFolderPath(to);
+  if (p === f) return t;
+  if (p.startsWith(`${f}.`)) {
+    const tail = p.slice(f.length); // includes leading dot
+    return `${t}${tail}`;
+  }
+  return p;
+}
+
 function _mapControllerEntityToVm(entity) {
   const name =
     entity?.name ||
@@ -4885,6 +5019,719 @@ async function setVmPowerAction(client, vmUuid, action) {
   }
   throw lastError || new Error(`No supported power-${action} endpoint found.`);
 }
+
+// =====================================================================
+// VM folders -- Prism API helpers (beta feature: vmFolders)
+// =====================================================================
+//
+// All folder operations go through Prism categories under the
+// reserved key NTNXFolderPath. Reads come from a v4 categories
+// listing with v3 fallback; writes are a v4 POST /config/categories
+// (duplicate-as-success) with a v3 PUT fallback. Per-VM membership
+// changes prefer the v4 associate-categories action when a category
+// extId is available, falling back to a clean v3 metadata PUT.
+//
+// All of these throw when Prism rejects the call -- the routes below
+// translate that into a 4xx/5xx with formatAxiosError() details.
+
+const V4_CATEGORY_LIST_VARIANTS = [
+  "/api/prism/v4.1/config/categories",
+  "/api/prism/v4.0/config/categories"
+];
+
+// Best-effort: list every Prism category value under the folder key.
+// Returns Array<{ value, extId? }> -- extId is included when Prism
+// surfaces it (v4 only), so /associate-categories can target by id.
+async function listFolderCategories(client) {
+  // 1) v4 with $filter. Some PC versions reject the $filter syntax;
+  //    on any failure we fall back to v4 without the filter and pick
+  //    the matching key client-side.
+  for (const base of V4_CATEGORY_LIST_VARIANTS) {
+    try {
+      const out = [];
+      let page = 0;
+      const limit = 200;
+      while (page < 50) {
+        const url =
+          `${base}?$limit=${limit}&$page=${page}&` +
+          `$filter=${encodeURIComponent(`key eq '${FOLDER_CATEGORY_KEY}'`)}`;
+        const resp = await client.get(url, { timeout: PRISM_HTTP_TIMEOUT_MS });
+        const list = resp.data?.data || resp.data?.entities || [];
+        if (!Array.isArray(list) || list.length === 0) break;
+        for (const c of list) {
+          const key = c?.key || c?.category_key || c?.name;
+          const value = c?.value || c?.category_value;
+          if (String(key) !== FOLDER_CATEGORY_KEY || !value) continue;
+          out.push({ value: normalizeFolderPath(value), extId: c?.extId || c?.id || null });
+        }
+        if (list.length < limit) break;
+        page += 1;
+      }
+      if (out.length || page > 0) {
+        return dedupeFolderCategories(out);
+      }
+      // Empty result with first page; try the no-filter path.
+    } catch (_err) {
+      // Filter rejected or endpoint missing — try next variant / no-filter.
+    }
+
+    // 1b) v4 without filter — same base — page through and grep key=folder.
+    try {
+      const out = [];
+      let page = 0;
+      const limit = 200;
+      while (page < 50) {
+        const resp = await client.get(
+          `${base}?$limit=${limit}&$page=${page}`,
+          { timeout: PRISM_HTTP_TIMEOUT_MS }
+        );
+        const list = resp.data?.data || resp.data?.entities || [];
+        if (!Array.isArray(list) || list.length === 0) break;
+        for (const c of list) {
+          const key = c?.key || c?.category_key || c?.name;
+          const value = c?.value || c?.category_value;
+          if (String(key) !== FOLDER_CATEGORY_KEY || !value) continue;
+          out.push({ value: normalizeFolderPath(value), extId: c?.extId || c?.id || null });
+        }
+        if (list.length < limit) break;
+        page += 1;
+      }
+      if (out.length || page > 0) {
+        return dedupeFolderCategories(out);
+      }
+    } catch (_err) {
+      // Move on to v3.
+    }
+  }
+
+  // 2) v3 per-key list: PUT /api/nutanix/v3/categories/<key>/list with paging.
+  try {
+    const out = [];
+    let offset = 0;
+    const length = 200;
+    while (offset < 5000) {
+      const resp = await client.post(
+        `/api/nutanix/v3/categories/${encodeURIComponent(FOLDER_CATEGORY_KEY)}/list`,
+        { kind: "category", offset, length }
+      );
+      const entities = resp.data?.entities || resp.data?.data || [];
+      if (!Array.isArray(entities) || entities.length === 0) break;
+      for (const c of entities) {
+        const value = c?.value || c?.name;
+        if (!value) continue;
+        out.push({ value: normalizeFolderPath(value), extId: null });
+      }
+      if (entities.length < length) break;
+      offset += length;
+    }
+    return dedupeFolderCategories(out);
+  } catch (_err) {
+    // v3 PUT method on this path; some clusters expect PUT not POST.
+    try {
+      const resp = await client.put(
+        `/api/nutanix/v3/categories/${encodeURIComponent(FOLDER_CATEGORY_KEY)}/list`,
+        { kind: "category", offset: 0, length: 500 }
+      );
+      const entities = resp.data?.entities || resp.data?.data || [];
+      const out = [];
+      for (const c of (Array.isArray(entities) ? entities : [])) {
+        const value = c?.value || c?.name;
+        if (!value) continue;
+        out.push({ value: normalizeFolderPath(value), extId: null });
+      }
+      return dedupeFolderCategories(out);
+    } catch (_err2) {
+      // Nothing else to try; surface the original (most informative) error.
+      throw _err;
+    }
+  }
+}
+
+function dedupeFolderCategories(arr) {
+  const seen = new Map();
+  for (const item of arr) {
+    if (!item.value) continue;
+    if (!seen.has(item.value)) {
+      seen.set(item.value, item);
+    } else if (!seen.get(item.value).extId && item.extId) {
+      seen.set(item.value, item);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.value.localeCompare(b.value));
+}
+
+// Ensure the category value exists in Prism. Duplicate / already-
+// exists errors are treated as success (matches the reference impl).
+// Returns { extId? } so the caller can use the v4 association path.
+async function ensureFolderCategory(client, folderPath) {
+  const validation = validateFolderPath(folderPath);
+  if (!validation.ok) {
+    const e = new Error(validation.error);
+    e.userFacing = true;
+    e.status = 400;
+    throw e;
+  }
+  const value = validation.value;
+
+  // 1) v4 POST /config/categories
+  for (const base of V4_CATEGORY_LIST_VARIANTS) {
+    try {
+      const resp = await client.post(base, {
+        key: FOLDER_CATEGORY_KEY,
+        value
+      });
+      const ext =
+        resp.data?.data?.extId ||
+        resp.data?.extId ||
+        resp.data?.data?.id ||
+        resp.data?.id ||
+        null;
+      return { extId: ext };
+    } catch (error) {
+      const status = error.response?.status;
+      const msg = JSON.stringify(error.response?.data || error.message || "").toLowerCase();
+      // 409 / already-exists / duplicate -> success.
+      if (status === 409 || msg.includes("already") || msg.includes("duplicate") || msg.includes("exists")) {
+        return { extId: null };
+      }
+      // Not-found endpoint -> try next variant.
+      if (status === 404 || msg.includes("no api path")) {
+        continue;
+      }
+      // Fall back to v3 on anything else too -- some clusters reject
+      // v4 category creation with 400 for the same content v3 accepts.
+      break;
+    }
+  }
+
+  // 2) v3 fallback: ensure key, then create value.
+  try {
+    await client.put(
+      `/api/nutanix/v3/categories/${encodeURIComponent(FOLDER_CATEGORY_KEY)}`,
+      { name: FOLDER_CATEGORY_KEY, description: "NRCC VM folder paths" }
+    );
+  } catch (_keyErr) {
+    // Key may already exist; ignore.
+  }
+  try {
+    await client.put(
+      `/api/nutanix/v3/categories/${encodeURIComponent(FOLDER_CATEGORY_KEY)}/${encodeURIComponent(value)}`,
+      { value, description: "" }
+    );
+    return { extId: null };
+  } catch (error) {
+    const status = error.response?.status;
+    const msg = JSON.stringify(error.response?.data || error.message || "").toLowerCase();
+    if (status === 409 || msg.includes("already") || msg.includes("duplicate") || msg.includes("exists")) {
+      return { extId: null };
+    }
+    throw error;
+  }
+}
+
+// Best-effort delete a category value (the leaf folder). Failures
+// are swallowed: stale category values are filtered out client-side
+// once all VMs in the subtree have been cleared, and there's no
+// reliable v3 delete on every PC build. Returns true on success.
+async function deleteFolderCategoryValue(client, folderPath) {
+  // v4 first.
+  for (const base of V4_CATEGORY_LIST_VARIANTS) {
+    try {
+      // Find the extId for {key=<folder key>, value=<path>}.
+      const url =
+        `${base}?$limit=10&` +
+        `$filter=${encodeURIComponent(
+          `key eq '${FOLDER_CATEGORY_KEY}' and value eq '${folderPath}'`
+        )}`;
+      const resp = await client.get(url, { timeout: PRISM_HTTP_TIMEOUT_MS });
+      const list = resp.data?.data || resp.data?.entities || [];
+      const match = (Array.isArray(list) ? list : []).find((c) => {
+        const key = c?.key || c?.category_key;
+        const value = c?.value || c?.category_value;
+        return String(key) === FOLDER_CATEGORY_KEY && normalizeFolderPath(value) === folderPath;
+      });
+      if (match && (match.extId || match.id)) {
+        await client.delete(`${base}/${encodeURIComponent(match.extId || match.id)}`);
+        return true;
+      }
+    } catch (_err) { /* try next */ }
+  }
+  // v3 fallback.
+  try {
+    await client.delete(
+      `/api/nutanix/v3/categories/${encodeURIComponent(FOLDER_CATEGORY_KEY)}/${encodeURIComponent(folderPath)}`
+    );
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+// Update a single VM's NTNXFolderPath category. `folderPath` of ""
+// (or null) clears the folder assignment. Uses v3 metadata PUT
+// which is the most-supported path across PC versions and works on
+// both AHV VMs and the v3 view of CVMs.
+async function setVmFolderPath(client, vmUuid, folderPath) {
+  if (!VM_UUID_REGEX.test(String(vmUuid || ""))) {
+    const e = new Error("vmUuid is not a valid UUID.");
+    e.userFacing = true;
+    e.status = 400;
+    throw e;
+  }
+  const target = folderPath ? normalizeFolderPath(folderPath) : "";
+  if (target) {
+    const v = validateFolderPath(target);
+    if (!v.ok) {
+      const e = new Error(v.error);
+      e.userFacing = true;
+      e.status = 400;
+      throw e;
+    }
+  }
+
+  // GET the v3 VM spec, mutate categories, PUT back a clean payload.
+  const getResp = await client.get(`/api/nutanix/v3/vms/${vmUuid}`);
+  const vm = getResp.data || {};
+  const metadata = { ...(vm.metadata || {}) };
+  const spec = vm.spec || {};
+  const apiVersion = vm.api_version || "3.1";
+
+  // Preserve every other category; only touch NTNXFolderPath.
+  const oldMapping = metadata.categories_mapping
+    ? { ...metadata.categories_mapping }
+    : {};
+  const oldDirect = metadata.categories ? { ...metadata.categories } : {};
+  if (target) {
+    oldMapping[FOLDER_CATEGORY_KEY] = [target];
+    oldDirect[FOLDER_CATEGORY_KEY] = target;
+  } else {
+    delete oldMapping[FOLDER_CATEGORY_KEY];
+    delete oldDirect[FOLDER_CATEGORY_KEY];
+  }
+  metadata.categories_mapping = oldMapping;
+  metadata.categories = oldDirect;
+  // use_categories_mapping must be true so Prism honours the field.
+  metadata.use_categories_mapping = true;
+
+  // Stamp metadata.uuid (required by some PC versions on PUT).
+  if (!metadata.uuid) metadata.uuid = vmUuid;
+
+  const payload = {
+    api_version: apiVersion,
+    metadata,
+    spec
+  };
+  await client.put(`/api/nutanix/v3/vms/${vmUuid}`, payload);
+  return { folderPath: target };
+}
+
+// Move every VM matching `predicate(vm.folderPath)` to the
+// corresponding target via `rewrite(oldPath) -> newPath`. Used by
+// folder rename / move / delete. Returns an array describing what
+// happened per VM so the caller can log + return progress.
+async function moveVmsAcrossFolders(client, predicate, rewrite, includeHidden = true) {
+  // Reuse the existing v4 list pathway so we see the full inventory
+  // (including hidden / CVM-categorized VMs). Skip page caps in the
+  // caller; selectVmListVariant + paging is shared with /api/vms.
+  const selected = await selectVmListVariant(client, 100, includeHidden);
+  const variant = selected.variant;
+  const all = [];
+  for (let i = 0; i < 50; i += 1) {
+    const resp = i === 0
+      ? selected.firstResponse
+      : await client.get(buildVmListUrl(100, i * 100, variant), { timeout: PRISM_HTTP_TIMEOUT_MS });
+    const page = parseVmList(resp);
+    all.push(...page);
+    const info = extractV4PageInfo(resp);
+    if (!info.totalAvailableResults || all.length >= info.totalAvailableResults || page.length < 100) break;
+  }
+
+  const results = [];
+  for (const vm of all) {
+    const oldPath = folderPathFromCategories(vm.categories);
+    if (!predicate(oldPath)) continue;
+    const newPath = rewrite(oldPath);
+    try {
+      await setVmFolderPath(client, vm.uuid, newPath);
+      results.push({ vmUuid: vm.uuid, name: vm.name, oldPath, newPath, ok: true });
+    } catch (err) {
+      const detail = err.response?.data || err.message;
+      results.push({
+        vmUuid: vm.uuid,
+        name: vm.name,
+        oldPath,
+        newPath,
+        ok: false,
+        error: typeof detail === "string" ? detail : JSON.stringify(detail).slice(0, 500)
+      });
+    }
+  }
+  return results;
+}
+
+function ensureVmFoldersEnabled(req, res) {
+  if (!VM_FOLDERS_ENABLED) {
+    res.status(503).json({
+      error:
+        "VM folders are disabled on this NRCC server (NRCC_VM_FOLDERS_ENABLED=false)."
+    });
+    return false;
+  }
+  return true;
+}
+
+// =====================================================================
+// VM folder routes
+// =====================================================================
+
+// List every folder Prism currently knows about under NTNXFolderPath.
+// Body carries the standard {pcHost,username,password,tlsSkipVerify}
+// triple via resolveAuth -- matches /api/vms.
+app.post("/api/folders", async (req, res) => {
+  if (!ensureVmFoldersEnabled(req, res)) return;
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({
+        error: "pcHost, username, and password are required."
+      });
+    }
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    const cats = await listFolderCategories(client);
+
+    // Expand the value set into a folder tree -- every intermediate
+    // segment must show up even when no leaf value sits directly at
+    // it (e.g. only "Apps.Linux.Web" exists; "Apps" and "Apps.Linux"
+    // are still real folders for navigation).
+    const all = new Set();
+    for (const c of cats) {
+      const path = normalizeFolderPath(c.value);
+      if (!path) continue;
+      const parts = path.split(".");
+      for (let i = 1; i <= parts.length; i += 1) {
+        all.add(parts.slice(0, i).join("."));
+      }
+    }
+    const folders = Array.from(all)
+      .map((p) => {
+        const parts = p.split(".");
+        return {
+          id: p,
+          path: p,
+          name: parts[parts.length - 1],
+          parentPath: parts.length > 1 ? parts.slice(0, -1).join(".") : ""
+        };
+      })
+      .sort((a, b) => a.path.localeCompare(b.path));
+
+    res.json({ categoryKey: FOLDER_CATEGORY_KEY, folders });
+  } catch (error) {
+    const { status, details } = formatAxiosError(error);
+    console.error("[vm-folders] list failed:", details);
+    res.status(status).json({
+      error: "Failed to list VM folders.",
+      details
+    });
+  }
+});
+
+// Create a folder by ensuring the corresponding category value.
+// Duplicate-as-success matches the reference impl.
+app.post("/api/folders/create", async (req, res) => {
+  if (!ensureVmFoldersEnabled(req, res)) return;
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({ error: "pcHost, username, and password are required." });
+    }
+    const parentPath = normalizeFolderPath(req.body.parentPath || "");
+    const name = String(req.body.name || "").trim();
+    const composed = composeFolderPath(parentPath, name);
+    if (!composed.ok) return res.status(400).json({ error: composed.error });
+    const path = composed.value;
+
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    const { extId } = await ensureFolderCategory(client, path);
+
+    appendLogForReq(req, {
+      type: "folder.create",
+      details: { folderPath: path, parentPath, name }
+    });
+
+    res.json({
+      ok: true,
+      folder: { key: FOLDER_CATEGORY_KEY, value: path, extId }
+    });
+  } catch (error) {
+    if (error.userFacing) {
+      return res.status(error.status || 400).json({ error: error.message });
+    }
+    const { status, details } = formatAxiosError(error);
+    console.error("[vm-folders] create failed:", details);
+    res.status(status).json({ error: "Failed to create folder.", details });
+  }
+});
+
+// Rename a folder's leaf segment. Walks the entire subtree, ensures
+// every rewritten category exists in Prism, then moves every VM
+// inside it via setVmFolderPath. Subfolders are implicit -- once the
+// VMs are moved, the empty parent categories will be filtered out
+// of /api/folders next time it's listed.
+app.post("/api/folders/rename", async (req, res) => {
+  if (!ensureVmFoldersEnabled(req, res)) return;
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({ error: "pcHost, username, and password are required." });
+    }
+    const path = normalizeFolderPath(req.body.path || "");
+    const newName = String(req.body.newName || "").trim();
+    const pathValidation = validateFolderPath(path);
+    if (!pathValidation.ok) return res.status(400).json({ error: pathValidation.error });
+
+    const parts = path.split(".");
+    const parentPath = parts.length > 1 ? parts.slice(0, -1).join(".") : "";
+    const composed = composeFolderPath(parentPath, newName);
+    if (!composed.ok) return res.status(400).json({ error: composed.error });
+    const newPath = composed.value;
+
+    if (newPath === path) {
+      return res.json({ ok: true, path, newPath, moved: [] });
+    }
+
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+
+    // Ensure the renamed root category up front; per-VM ensure happens
+    // implicitly via the v3 metadata PUT.
+    await ensureFolderCategory(client, newPath);
+
+    const moved = await moveVmsAcrossFolders(
+      client,
+      (p) => folderPathIsAtOrBelow(p, path),
+      (p) => rewriteFolderPathPrefix(p, path, newPath),
+      true
+    );
+
+    // Best-effort cleanup of the now-empty old leaf category.
+    await deleteFolderCategoryValue(client, path);
+
+    appendLogForReq(req, {
+      type: "folder.rename",
+      details: {
+        oldPath: path,
+        newPath,
+        vmCount: moved.length,
+        succeeded: moved.filter((m) => m.ok).length,
+        failed: moved.filter((m) => !m.ok).length
+      }
+    });
+
+    res.json({ ok: true, path, newPath, moved });
+  } catch (error) {
+    if (error.userFacing) {
+      return res.status(error.status || 400).json({ error: error.message });
+    }
+    const { status, details } = formatAxiosError(error);
+    console.error("[vm-folders] rename failed:", details);
+    res.status(status).json({ error: "Failed to rename folder.", details });
+  }
+});
+
+// Move a folder subtree under a new parent.
+app.post("/api/folders/move", async (req, res) => {
+  if (!ensureVmFoldersEnabled(req, res)) return;
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({ error: "pcHost, username, and password are required." });
+    }
+    const path = normalizeFolderPath(req.body.path || "");
+    const newParentPath = normalizeFolderPath(req.body.newParentPath || "");
+    const pathValidation = validateFolderPath(path);
+    if (!pathValidation.ok) return res.status(400).json({ error: pathValidation.error });
+    if (newParentPath) {
+      const parentValidation = validateFolderPath(newParentPath);
+      if (!parentValidation.ok) return res.status(400).json({ error: parentValidation.error });
+      if (folderPathIsAtOrBelow(newParentPath, path)) {
+        return res.status(400).json({
+          error: "Cannot move a folder into itself or one of its descendants."
+        });
+      }
+    }
+    const leaf = path.split(".").pop();
+    const newPath = newParentPath ? `${newParentPath}.${leaf}` : leaf;
+    if (newPath === path) {
+      return res.json({ ok: true, path, newPath, moved: [] });
+    }
+    const newValidation = validateFolderPath(newPath);
+    if (!newValidation.ok) return res.status(400).json({ error: newValidation.error });
+
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    await ensureFolderCategory(client, newPath);
+
+    const moved = await moveVmsAcrossFolders(
+      client,
+      (p) => folderPathIsAtOrBelow(p, path),
+      (p) => rewriteFolderPathPrefix(p, path, newPath),
+      true
+    );
+
+    await deleteFolderCategoryValue(client, path);
+
+    appendLogForReq(req, {
+      type: "folder.move",
+      details: {
+        oldPath: path,
+        newPath,
+        newParentPath,
+        vmCount: moved.length,
+        succeeded: moved.filter((m) => m.ok).length,
+        failed: moved.filter((m) => !m.ok).length
+      }
+    });
+
+    res.json({ ok: true, path, newPath, moved });
+  } catch (error) {
+    if (error.userFacing) {
+      return res.status(error.status || 400).json({ error: error.message });
+    }
+    const { status, details } = formatAxiosError(error);
+    console.error("[vm-folders] move failed:", details);
+    res.status(status).json({ error: "Failed to move folder.", details });
+  }
+});
+
+// Delete a folder subtree: clear NTNXFolderPath on every VM at or
+// below `path`, then best-effort drop the matching category values.
+// VMs themselves are NOT touched beyond losing the folder category.
+app.post("/api/folders/delete", async (req, res) => {
+  if (!ensureVmFoldersEnabled(req, res)) return;
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({ error: "pcHost, username, and password are required." });
+    }
+    const path = normalizeFolderPath(req.body.path || "");
+    const pathValidation = validateFolderPath(path);
+    if (!pathValidation.ok) return res.status(400).json({ error: pathValidation.error });
+
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    const moved = await moveVmsAcrossFolders(
+      client,
+      (p) => folderPathIsAtOrBelow(p, path),
+      () => "",
+      true
+    );
+
+    // Drop every category value at or below `path`. Pull a fresh
+    // list rather than relying on the subtree we computed locally
+    // so we also catch empty intermediate categories.
+    const cats = await listFolderCategories(client).catch(() => []);
+    const targets = cats
+      .map((c) => normalizeFolderPath(c.value))
+      .filter((p) => folderPathIsAtOrBelow(p, path));
+    const dedup = Array.from(new Set([path, ...targets]));
+    const deletedCategories = [];
+    for (const p of dedup) {
+      const ok = await deleteFolderCategoryValue(client, p);
+      if (ok) deletedCategories.push(p);
+    }
+
+    appendLogForReq(req, {
+      type: "folder.delete",
+      details: {
+        path,
+        vmCount: moved.length,
+        succeeded: moved.filter((m) => m.ok).length,
+        failed: moved.filter((m) => !m.ok).length,
+        deletedCategories
+      }
+    });
+
+    res.json({ ok: true, path, moved, deletedCategories });
+  } catch (error) {
+    if (error.userFacing) {
+      return res.status(error.status || 400).json({ error: error.message });
+    }
+    const { status, details } = formatAxiosError(error);
+    console.error("[vm-folders] delete failed:", details);
+    res.status(status).json({ error: "Failed to delete folder.", details });
+  }
+});
+
+// Move a single VM into a folder. Ensures the target category exists
+// first so a fresh folder works on the very first drop.
+app.post("/api/vms/folder", async (req, res) => {
+  if (!ensureVmFoldersEnabled(req, res)) return;
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({ error: "pcHost, username, and password are required." });
+    }
+    const vmUuid = String(req.body.vmUuid || "").trim();
+    const folderPath = normalizeFolderPath(req.body.folderPath || "");
+    if (!VM_UUID_REGEX.test(vmUuid)) {
+      return res.status(400).json({ error: "vmUuid is not a valid UUID." });
+    }
+    if (!folderPath) {
+      return res.status(400).json({
+        error: "folderPath is required (use /api/vms/folder/clear to uncategorize)."
+      });
+    }
+    const validation = validateFolderPath(folderPath);
+    if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    await ensureFolderCategory(client, folderPath);
+    const result = await setVmFolderPath(client, vmUuid, folderPath);
+
+    appendLogForReq(req, {
+      type: "vm.folder-move",
+      vmUuid,
+      details: { folderPath }
+    });
+
+    res.json({ ok: true, vmUuid, folderPath: result.folderPath });
+  } catch (error) {
+    if (error.userFacing) {
+      return res.status(error.status || 400).json({ error: error.message });
+    }
+    const { status, details } = formatAxiosError(error);
+    console.error("[vm-folders] vm move failed:", details);
+    res.status(status).json({ error: "Failed to move VM to folder.", details });
+  }
+});
+
+// Clear a single VM's NTNXFolderPath category.
+app.post("/api/vms/folder/clear", async (req, res) => {
+  if (!ensureVmFoldersEnabled(req, res)) return;
+  try {
+    const { pcHost, username, password, tlsSkipVerify } = resolveAuth(req.body);
+    if (!pcHost || !username || !password) {
+      return res.status(400).json({ error: "pcHost, username, and password are required." });
+    }
+    const vmUuid = String(req.body.vmUuid || "").trim();
+    if (!VM_UUID_REGEX.test(vmUuid)) {
+      return res.status(400).json({ error: "vmUuid is not a valid UUID." });
+    }
+    const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
+    const result = await setVmFolderPath(client, vmUuid, "");
+
+    appendLogForReq(req, {
+      type: "vm.folder-clear",
+      vmUuid
+    });
+
+    res.json({ ok: true, vmUuid, folderPath: result.folderPath });
+  } catch (error) {
+    if (error.userFacing) {
+      return res.status(error.status || 400).json({ error: error.message });
+    }
+    const { status, details } = formatAxiosError(error);
+    console.error("[vm-folders] vm clear failed:", details);
+    res.status(status).json({ error: "Failed to clear VM folder.", details });
+  }
+});
 
 app.post("/api/vm-power", async (req, res) => {
   try {

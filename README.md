@@ -303,6 +303,7 @@ copy .env.example .env       # Windows
 | `NRCC_SSH_IDLE_TIMEOUT_MS`| `900000` (15 min)  | **Beta.** How long an unused SSH session id is kept (the WS upgrade typically arrives within seconds; this only protects against orphaned `start` calls). |
 | `NRCC_SSH_MAX_SESSIONS`   | `64`               | **Beta.** Hard cap on simultaneous SSH sessions per server process. |
 | `NRCC_SSH_READY_TIMEOUT_MS`| `15000`           | **Beta.** How long `ssh2` waits for the remote handshake before giving up. |
+| `NRCC_VM_FOLDERS_ENABLED` | `true`             | **Beta.** Master switch for VM folders (Prism categories under `NTNXFolderPath`). Set to `false` to hide the sidebar folder pane and refuse the `/api/folders/*` and `/api/vms/folder*` endpoints (returns `503`). |
 
 ### Run
 
@@ -434,6 +435,12 @@ Server-emitted event types (always written when the master switch is on):
 | `probe.scan`         | **Beta.** `/api/probe/ports` issued at least one new probe (cached results don't log). Includes `vmCount`, `scannedNow`, `ports`. |
 | `ssh.open`           | **Beta.** ssh2 client reached `ready` for an SSH tab. Includes `host`, `port`, `sshUser`. |
 | `ssh.close`          | **Beta.** SSH tab closed (server-side or WS torn down). Includes `durationMs`, `reason`. |
+| `folder.create`      | **Beta.** A VM folder was created. Includes `folderPath`, `parentPath`, `name`. |
+| `folder.rename`      | **Beta.** A VM folder was renamed. Includes `oldPath`, `newPath`, `vmCount`, `succeeded`, `failed`. |
+| `folder.move`        | **Beta.** A VM folder subtree was moved. Includes `oldPath`, `newPath`, `newParentPath`, `vmCount`, `succeeded`, `failed`. |
+| `folder.delete`      | **Beta.** A VM folder subtree was deleted (VMs uncategorized, category values removed best-effort). Includes `path`, `vmCount`, `deletedCategories`. |
+| `vm.folder-move`     | **Beta.** A VM was assigned to (or moved between) folders. Includes `vmUuid`, `folderPath`. |
+| `vm.folder-clear`    | **Beta.** A VM's `NTNXFolderPath` category was cleared. Includes `vmUuid`. |
 
 Client-emitted event types (require **both** `NRCC_LOGGING=true` and the per-user toggle):
 
@@ -484,13 +491,14 @@ const FEATURE_FLAGS = {
   settings:    { stage: "ga", description: "User preferences dialog (theme, idle timeout)" },
   vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
   sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" },
-  rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" }
+  rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" },
+  vmFolders:   { stage: "beta", description: "Group VMs into Prism-category-backed folders (NTNXFolderPath)" }
 };
 ```
 
 Conventions:
 
-- **All previously-shipped features are GA**; only the three beta entries above are gated.
+- **All previously-shipped features are GA**; only the four beta entries above are gated.
 - A new feature lands as `{ stage: "beta" }`. UI elements that are only meaningful when the feature is on get a `data-feature="<id>"` attribute. The client's `featureFlags.refresh()` hides those elements unless `userPrefs.betaFeaturesEnabled` is true.
 - Code paths that aren't tied to a single DOM element can call `featureFlags.isEnabled("<id>")` to gate themselves.
 - Promote a feature to GA by changing `stage` to `"ga"` in the registry. Beta-only `data-feature` markers can stay; `featureFlags.refresh()` will simply leave them visible.
@@ -547,6 +555,48 @@ If `guacd` lives on a different host or port, point NRCC at it with `NRCC_GUACD_
 - **Process-memory state.** SSH / RDP session metadata and the probe cache live in process memory only. A self-update restart wipes both — same caveat as the chat history.
 - **xterm renderer only paints on activity** so `canvas.captureStream(10)` produces a sparse video. MediaRecorder still encodes it correctly; recorded SSH files are tiny relative to a busy VNC tab. The RDP recording path uses the same per-fps capture tick so a static guest desktop still produces a smooth playback file.
 - **Audio / printer / drive redirection are off.** The `audio`/`video` capability arrays we send to guacd are empty, and the connect parameters explicitly disable printer / drive sharing. The browser console is rendering-only.
+
+### Beta: VM folders
+
+A fourth beta feature (`vmFolders`) layers a vCenter-style folder tree on top of NRCC's sidebar VM list. Folders are backed by a single reserved Prism category key — **`NTNXFolderPath`** — and nesting uses dot-delimited paths (`Production.Linux.Web`). The folder tree is rendered directly from Prism's category catalog, so the membership is shared across users, survives an NRCC reinstall, and is visible in the Prism UI's category browser too.
+
+The whole pane is hidden until the user enables **Show beta features** in Settings AND the operator has left `NRCC_VM_FOLDERS_ENABLED=true` on the server. Everything else NRCC has shipped before — favorites, search, power-state filter, port-scan pills, the SSH/RDP right-click items, drag into favorites folders, console tabs — continues to work unchanged.
+
+**What you see**
+
+A **Folders** section appears in the sidebar between the existing **Favorites** tree and the flat **VMs** list. The header has **Refresh** (re-pull the catalog from Prism) and **+ Folder** (create a top-level folder). The tree is preceded by two pseudo-rows:
+
+- **All VMs** — selects the full inventory; the bottom VM list is unchanged from today.
+- **Uncategorized** — VMs that have no `NTNXFolderPath` category. Drop a VM here to clear its folder.
+
+Selecting a real folder narrows the VM list to that folder *and every subfolder* (so picking `Production` shows everything under `Production.*`). Selecting a folder also clears the search box, so you get the whole subtree without having to remove a stale filter first. The count next to each folder is the subtree-inclusive VM count, computed locally from the current `vmCache`.
+
+**What you can do**
+
+- **Drag a VM onto a folder** to move it. The same drag payload format (`text/x-nrcc-item` = `vm:<uuid>`) is reused — dropping on a favorites folder still bookmarks the VM (existing behaviour); dropping on a VM-folder row Prism-categorizes it (new behaviour). The two trees are differentiated at the drop target via `data-vm-folder-path`.
+- **Right-click a VM** for **Move to folder...** (opens a small picker prompt) and, when the VM has a folder, **Remove from folder**.
+- **Right-click a folder** for **New subfolder**, **Rename**, **Move**, **Delete**. Delete only removes the category and uncategorizes every VM in the subtree — **VMs themselves are never deleted by NRCC**.
+- **Optimistic UI.** Moves, creates, renames, and deletes appear instantly and are reconciled (or rolled back with a toast) after the server call returns.
+
+**Endpoints (all gated on the server-side master switch)**
+
+| Endpoint | Purpose |
+| -------- | ------- |
+| `POST /api/folders`         | List every Prism category value under `NTNXFolderPath`, returned as `{folders: [{path, name, parentPath}]}`. |
+| `POST /api/folders/create`  | Body `{parentPath, name}`. Composes the path, ensures the Prism category exists (v4 `POST /api/prism/v4.x/config/categories` with v3 `PUT /api/nutanix/v3/categories/...` fallback, duplicate-as-success). |
+| `POST /api/folders/rename`  | Body `{path, newName}`. Rewrites the leaf, walks the subtree of VMs, and re-categorizes each. |
+| `POST /api/folders/move`    | Body `{path, newParentPath}`. Like rename but rewrites the prefix; refuses self/descendant destinations. |
+| `POST /api/folders/delete`  | Body `{path}`. Clears `NTNXFolderPath` on every VM in the subtree, then best-effort deletes the category values. |
+| `POST /api/vms/folder`      | Body `{vmUuid, folderPath}`. Single-VM move; ensures the destination category exists, then v3 metadata PUT. |
+| `POST /api/vms/folder/clear`| Body `{vmUuid}`. Drops `NTNXFolderPath` from the VM's categories. |
+
+**Trust model & caveats**
+
+- **NRCC writes to Prism.** This is the first surface where NRCC mutates the cluster's category catalog. The category key is reserved (`NTNXFolderPath`) so we don't collide with categories you already use. Disable entirely with `NRCC_VM_FOLDERS_ENABLED=false`.
+- **All signed-in users share one tree.** Same trust model as the rest of multi-user mode — every authenticated user can create, rename, move, and delete folders, and re-categorize any VM. There is no per-user namespacing.
+- **Prism is the source of truth.** NRCC keeps no folder/assignment overlay on disk; if Prism's category catalog is reset out-of-band, NRCC's folder tree resets with it. The current selection + collapsed map are per-browser (`localStorage` key `ntnxConsoleVmFolderPrefs.v1`).
+- **Validation matches Prism's category rules.** Each path segment must start and end with a letter or number; max 64 characters total; the usual forbidden category characters (`/,!'"#%() *+:;=?` `` ` `` `|[]^&`) are refused client- and server-side.
+- **Folder rename / move walks every affected VM** via `GET /api/nutanix/v3/vms/<uuid>` + `PUT` with a clean `{api_version, metadata, spec}` payload. For folders with hundreds of VMs this is sequential and can take a few seconds; we deliberately keep it simple in v1 and may add a small concurrency budget if customers hit it.
 
 ---
 
@@ -1094,6 +1144,9 @@ The PVC's underlying storage class (`Delete` reclaim policy on `nutanix-volume`)
 | Script CRUD (NRCC)               | `POST /api/scripts` body `{folder, label, body, language?, description?}`; `PUT /api/scripts/file` body `{folder, filename, label?, body?, ...}`; `DELETE /api/scripts/file?folder=<rel>&filename=...` |
 | Script folder ops (NRCC)         | `POST` / `DELETE /api/scripts/folders` body `{path}`; `POST /api/scripts/move` body `{fromFolder, toFolder, fromName, toName}` |
 | Multi-user chat (NRCC)           | `WS(S) /ws-chat` — protocol: `join`/`msg`/`ping`/`leave` (multi-user mode only) |
+| VM folders list (NRCC)           | `POST /api/folders` body `{pcHost, username, password, tlsSkipVerify}` -> `{categoryKey, folders[]}` (beta: vmFolders) |
+| VM folder lifecycle (NRCC)       | `POST /api/folders/create` body `{parentPath, name}`; `POST /api/folders/rename` body `{path, newName}`; `POST /api/folders/move` body `{path, newParentPath}`; `POST /api/folders/delete` body `{path}` (beta: vmFolders) |
+| VM folder assignment (NRCC)      | `POST /api/vms/folder` body `{vmUuid, folderPath}`; `POST /api/vms/folder/clear` body `{vmUuid}` (beta: vmFolders) |
 
 All requests carry per-call `NTNX-Request-Id` / `X-Request-Id` headers (UUIDv4) — required by Nutanix v4 APIs.
 

@@ -91,6 +91,15 @@ const consoleGridOverlay = document.getElementById("consoleGridOverlay");
 const consoleGridEl = document.getElementById("consoleGrid");
 const ctxMenu = document.getElementById("ctxMenu");
 
+// Beta: VM folders. May be missing on older index.html bundles; every
+// downstream use guards on truthiness so the absence simply disables
+// the feature without breaking the rest of the app.
+const vmFoldersPane = document.getElementById("vmFoldersPane");
+const vmFolderTreeEl = document.getElementById("vmFolderTree");
+const vmFolderRefreshBtn = document.getElementById("vmFolderRefreshBtn");
+const vmFolderAddBtn = document.getElementById("vmFolderAddBtn");
+const vmFolderCtxMenu = document.getElementById("vmFolderCtxMenu");
+
 const peCredsModal = document.getElementById("peCredsModal");
 const peCredsHostLabel = document.getElementById("peCredsHost");
 const peCredsHostInput = document.getElementById("peCredsHostInput");
@@ -227,6 +236,56 @@ const favStore = {
   ordering: { __root: [] },
   collapsed: {}
 };
+
+// =====================================================================
+// VM folders state (beta: vmFolders)
+// =====================================================================
+//
+// Folders are backed by Prism categories under NTNXFolderPath. The
+// canonical list lives on Prism; we mirror it into vmFolderTree as a
+// snapshot so the UI doesn't flicker between refreshes. Selection +
+// collapsed state are per-browser (localStorage).
+//
+//   vmFolderTree:      [{path, name, parentPath}]
+//   vmFolderSelected:  null = "All VMs", "" = "Uncategorized",
+//                      "<path>" = a specific folder
+//   vmFolderCollapsed: { [path]: true }
+//   vmFolderPending.folders[path]: "creating"|"renaming"|"moving"|"deleting"
+//   vmFolderPending.vms[uuid]:     target folder path (string)
+const VM_FOLDER_CATEGORY_KEY = "NTNXFolderPath";
+const VM_FOLDER_PREFS_KEY = "ntnxConsoleVmFolderPrefs.v1";
+
+let vmFolderTree = [];
+let vmFolderSelected = null;
+let vmFolderCollapsed = {};
+const vmFolderPending = { folders: {}, vms: {} };
+
+function loadVmFolderPrefs() {
+  try {
+    const raw = localStorage.getItem(VM_FOLDER_PREFS_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      if (parsed.collapsed && typeof parsed.collapsed === "object") {
+        vmFolderCollapsed = { ...parsed.collapsed };
+      }
+      if (parsed.selected === null || typeof parsed.selected === "string") {
+        vmFolderSelected = parsed.selected;
+      }
+    }
+  } catch (_e) { /* best-effort */ }
+}
+
+function saveVmFolderPrefs() {
+  try {
+    localStorage.setItem(
+      VM_FOLDER_PREFS_KEY,
+      JSON.stringify({ collapsed: vmFolderCollapsed, selected: vmFolderSelected })
+    );
+  } catch (_e) { /* best-effort */ }
+}
+
+loadVmFolderPrefs();
 
 // Open console sessions
 let consoleSessions = [];
@@ -689,6 +748,13 @@ function normalizePowerState(raw) {
 function applyFilters(vms) {
   const search = nameFilterInput.value.trim().toLowerCase();
   const power = powerStateFilter.value;
+  // Beta: when vmFolders is on AND the user has selected a specific
+  // folder (or Uncategorized), narrow the visible set accordingly.
+  // null means "All VMs" (no folder filter) and is also the value
+  // when the beta feature is disabled, so the early no-op below
+  // keeps the GA experience unchanged.
+  const folderFilterActive =
+    vmFoldersAvailable() && vmFolderSelected !== null;
   return vms.filter((vm) => {
     const norm = normalizePowerState(vm.powerState);
     const haystack = [
@@ -705,7 +771,11 @@ function applyFilters(vms) {
       .toLowerCase();
     const nameOk = !search || haystack.includes(search);
     const powerOk = !power || norm === power;
-    return nameOk && powerOk;
+    if (!(nameOk && powerOk)) return false;
+    if (!folderFilterActive) return true;
+    const vmPath = getVmFolderPath(vm);
+    if (vmFolderSelected === "") return !vmPath; // Uncategorized
+    return vmPath === vmFolderSelected || vmPath.startsWith(`${vmFolderSelected}.`);
   });
 }
 
@@ -744,6 +814,101 @@ function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
+}
+
+// =====================================================================
+// VM folders helpers (beta: vmFolders)
+// =====================================================================
+//
+// All read paths rely on the `categories` array that the server's
+// parseVmList already attaches to every VM. Server-side mutation
+// goes through /api/folders/* and /api/vms/folder*.
+
+// Validators must match server.js byte-for-byte so client-side feedback
+// matches what the server would accept.
+const VM_FOLDER_MAX_PATH_LEN = 64;
+const VM_FOLDER_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_ -]{0,62}[A-Za-z0-9]$|^[A-Za-z0-9]$/;
+const VM_FOLDER_FORBIDDEN_CHARS_RE = /[/,!'"#%() *+:;=?`|[\]^&]/;
+
+function normalizeFolderPath(value) {
+  return String(value == null ? "" : value).trim();
+}
+
+function validateFolderName(value) {
+  const name = String(value == null ? "" : value).trim();
+  if (!name) return { ok: false, error: "Folder name is required." };
+  if (name.includes(".")) {
+    return {
+      ok: false,
+      error: "Folder name cannot contain dots; nest by creating inside a parent."
+    };
+  }
+  if (VM_FOLDER_FORBIDDEN_CHARS_RE.test(name)) {
+    return {
+      ok: false,
+      error: "Folder name contains characters Prism categories do not allow."
+    };
+  }
+  if (!VM_FOLDER_SEGMENT_RE.test(name)) {
+    return {
+      ok: false,
+      error: "Folder name must start and end with a letter or number."
+    };
+  }
+  return { ok: true, value: name };
+}
+
+function validateFolderPath(value) {
+  const path = normalizeFolderPath(value);
+  if (!path) return { ok: false, error: "Folder path is required." };
+  if (path.length > VM_FOLDER_MAX_PATH_LEN) {
+    return {
+      ok: false,
+      error: `Folder path must be ${VM_FOLDER_MAX_PATH_LEN} characters or less.`
+    };
+  }
+  if (VM_FOLDER_FORBIDDEN_CHARS_RE.test(path)) {
+    return {
+      ok: false,
+      error: "Folder path contains characters Prism categories do not allow."
+    };
+  }
+  const segments = path.split(".");
+  if (segments.some((s) => !s.trim())) {
+    return { ok: false, error: "Folder path cannot contain empty segments." };
+  }
+  for (const segment of segments) {
+    if (!VM_FOLDER_SEGMENT_RE.test(segment)) {
+      return { ok: false, error: `Invalid folder segment: ${segment}` };
+    }
+  }
+  return { ok: true, value: path };
+}
+
+function getVmFolderPath(vm) {
+  if (!vm) return "";
+  // Optimistic override: while a move is in flight, render the VM as
+  // already at its destination. The server reconciles this on success
+  // and rolls back on failure.
+  if (vmFolderPending.vms[vm.uuid] !== undefined) {
+    return vmFolderPending.vms[vm.uuid];
+  }
+  const cats = Array.isArray(vm.categories) ? vm.categories : [];
+  const prefix = `${VM_FOLDER_CATEGORY_KEY}:`;
+  for (const entry of cats) {
+    if (typeof entry !== "string") continue;
+    if (entry.startsWith(prefix)) {
+      return normalizeFolderPath(entry.slice(prefix.length));
+    }
+  }
+  return "";
+}
+
+function folderPathIsAtOrBelow(path, root) {
+  const p = normalizeFolderPath(path);
+  const r = normalizeFolderPath(root);
+  if (!r) return false;
+  return p === r || p.startsWith(`${r}.`);
 }
 
 function createVmRow(vm, opts = {}) {
@@ -1073,6 +1238,699 @@ favoritesTreeEl.addEventListener("drop", () => {
 });
 
 // =====================================================================
+// VM folders (beta: vmFolders) -- tree rendering, DnD, mutations
+// =====================================================================
+//
+// The folder pane in the sidebar is parallel to (not a replacement for)
+// the favorites tree. Both are sourced from independent state:
+//   favorites tree   -- localStorage, per-browser, lives in favStore
+//   vm folders tree  -- Prism categories under NTNXFolderPath
+//
+// Visibility is gated via the [data-feature="vmFolders"] wrapper, so
+// turning the beta flag off hides the whole block automatically.
+
+function vmFoldersAvailable() {
+  if (typeof featureFlags === "undefined") return false;
+  if (!featureFlags.isEnabled("vmFolders")) return false;
+  if (appConfig && appConfig.vmFoldersEnabled === false) return false;
+  return !!vmFolderTreeEl;
+}
+
+function selectVmFolder(value) {
+  vmFolderSelected = value;
+  saveVmFolderPrefs();
+  // Selecting a folder clears the free-text search so the user can see
+  // every VM in that folder without having to manually clear the box.
+  if (nameFilterInput && nameFilterInput.value) {
+    nameFilterInput.value = "";
+  }
+  renderVmFolderTree();
+  renderVmList();
+}
+
+function isVmFolderCollapsed(path) {
+  return !!vmFolderCollapsed[path];
+}
+
+function setVmFolderCollapsed(path, collapsed) {
+  if (collapsed) {
+    vmFolderCollapsed[path] = true;
+  } else {
+    delete vmFolderCollapsed[path];
+  }
+  saveVmFolderPrefs();
+}
+
+// Aggregate the per-folder VM count (subtree inclusive) so the
+// sidebar shows a meaningful number next to each folder.
+function computeFolderCounts() {
+  const counts = { __all: 0, __uncategorized: 0 };
+  const subtreeCounts = new Map();
+  for (const vm of vmCache) {
+    counts.__all += 1;
+    const path = getVmFolderPath(vm);
+    if (!path) {
+      counts.__uncategorized += 1;
+      continue;
+    }
+    const parts = path.split(".");
+    for (let i = 1; i <= parts.length; i += 1) {
+      const p = parts.slice(0, i).join(".");
+      subtreeCounts.set(p, (subtreeCounts.get(p) || 0) + 1);
+    }
+  }
+  return { counts, subtreeCounts };
+}
+
+// Build the visible folder set from Prism's snapshot + any pending
+// optimistic operations the user has fired. Pending paths render as
+// real folders while the server call is in flight.
+function effectiveVmFolderPaths() {
+  const paths = new Set();
+  for (const folder of vmFolderTree) {
+    if (vmFolderPending.folders[folder.path] === "deleting") continue;
+    paths.add(folder.path);
+  }
+  // Include pending-create paths.
+  for (const [path, state] of Object.entries(vmFolderPending.folders)) {
+    if (state === "creating" || state === "renaming" || state === "moving") {
+      paths.add(path);
+    }
+  }
+  // Ensure every intermediate segment of every path is present.
+  const out = new Set();
+  for (const path of paths) {
+    const parts = path.split(".");
+    for (let i = 1; i <= parts.length; i += 1) {
+      out.add(parts.slice(0, i).join("."));
+    }
+  }
+  return Array.from(out).sort((a, b) => a.localeCompare(b));
+}
+
+function buildChildIndex(paths) {
+  const children = new Map();
+  for (const p of paths) {
+    const parts = p.split(".");
+    const parent = parts.length > 1 ? parts.slice(0, -1).join(".") : "";
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(p);
+  }
+  for (const arr of children.values()) arr.sort((a, b) => a.localeCompare(b));
+  return children;
+}
+
+function renderVmFolderTree() {
+  if (!vmFolderTreeEl) return;
+  vmFolderTreeEl.innerHTML = "";
+  if (!vmFoldersAvailable()) return;
+
+  const { counts, subtreeCounts } = computeFolderCounts();
+
+  // "All VMs" pseudo-row.
+  vmFolderTreeEl.appendChild(
+    createVmFolderSpecialRow({
+      label: "All VMs",
+      count: counts.__all,
+      isSelected: vmFolderSelected === null,
+      onClick: () => selectVmFolder(null)
+    })
+  );
+  // "Uncategorized" pseudo-row.
+  vmFolderTreeEl.appendChild(
+    createVmFolderSpecialRow({
+      label: "Uncategorized",
+      count: counts.__uncategorized,
+      isSelected: vmFolderSelected === "",
+      isDropTarget: true,
+      dropPath: "",
+      onClick: () => selectVmFolder("")
+    })
+  );
+
+  const paths = effectiveVmFolderPaths();
+  const childIndex = buildChildIndex(paths);
+
+  const roots = childIndex.get("") || [];
+  for (const root of roots) {
+    const el = createVmFolderRow(root, 0, childIndex, subtreeCounts);
+    if (el) vmFolderTreeEl.appendChild(el);
+  }
+}
+
+function createVmFolderSpecialRow({ label, count, isSelected, onClick, isDropTarget, dropPath }) {
+  const wrap = document.createElement("div");
+  wrap.className = "fav-folder";
+  const header = document.createElement("div");
+  header.className = "fav-folder-header";
+  if (isSelected) header.classList.add("active");
+  header.innerHTML = `
+    <span class="fav-folder-toggle" aria-hidden="true">&middot;</span>
+    <span class="fav-folder-name" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
+    <span class="state-pill" data-state="${count > 0 ? "ON" : ""}" style="margin-left:auto">${count}</span>
+  `;
+  // The toggle slot is just a bullet to keep the row visually aligned
+  // with real folders -- there's no expand/collapse for the pseudo
+  // rows.
+  header.style.cursor = "pointer";
+  header.addEventListener("click", () => onClick());
+  wrap.appendChild(header);
+
+  if (isDropTarget) {
+    attachVmFolderDropTarget(header, dropPath, header);
+  }
+  return wrap;
+}
+
+function createVmFolderRow(path, depth, childIndex, subtreeCounts) {
+  const wrap = document.createElement("div");
+  wrap.className = "fav-folder";
+  wrap.dataset.vmFolderPath = path;
+  if (isVmFolderCollapsed(path)) wrap.classList.add("collapsed");
+  if (vmFolderPending.folders[path]) wrap.classList.add("is-loading");
+
+  const parts = path.split(".");
+  const name = parts[parts.length - 1];
+  const count = subtreeCounts.get(path) || 0;
+  const collapsed = isVmFolderCollapsed(path);
+  const isSelected = vmFolderSelected === path;
+
+  const header = document.createElement("div");
+  header.className = "fav-folder-header";
+  if (isSelected) header.classList.add("active");
+  header.innerHTML = `
+    <button class="fav-folder-toggle" title="Expand / collapse">${collapsed ? "▸" : "▾"}</button>
+    <span class="fav-folder-name" title="${escapeHtml(path)}">${escapeHtml(name)}</span>
+    <span class="state-pill" data-state="${count > 0 ? "ON" : ""}" style="margin-left:auto">${count}</span>
+  `;
+  wrap.appendChild(header);
+
+  const childrenEl = document.createElement("div");
+  childrenEl.className = "fav-folder-children";
+  childrenEl.dataset.vmFolderPath = path;
+  wrap.appendChild(childrenEl);
+
+  // Render child folders.
+  const kids = childIndex.get(path) || [];
+  for (const child of kids) {
+    const childEl = createVmFolderRow(child, depth + 1, childIndex, subtreeCounts);
+    if (childEl) childrenEl.appendChild(childEl);
+  }
+
+  // Toggle expand/collapse without selecting the folder.
+  const toggleBtn = header.querySelector(".fav-folder-toggle");
+  toggleBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const willCollapse = !wrap.classList.contains("collapsed");
+    wrap.classList.toggle("collapsed", willCollapse);
+    toggleBtn.textContent = willCollapse ? "▸" : "▾";
+    setVmFolderCollapsed(path, willCollapse);
+  });
+
+  // Click anywhere else on the header -> select folder.
+  header.addEventListener("click", (event) => {
+    if (event.target === toggleBtn) return;
+    selectVmFolder(path);
+  });
+
+  // Right-click -> folder context menu.
+  header.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    showVmFolderContextMenu(event.clientX, event.clientY, path);
+  });
+
+  // Drop target: dropping a VM here moves it into this folder.
+  attachVmFolderDropTarget(header, path, header);
+  attachVmFolderDropTarget(childrenEl, path, header);
+
+  return wrap;
+}
+
+function attachVmFolderDropTarget(el, targetPath, highlightEl) {
+  el.addEventListener("dragenter", (event) => {
+    if (!hasNrccItem(event)) return;
+    event.preventDefault();
+    if (highlightEl) highlightEl.classList.add("drag-over");
+  });
+  el.addEventListener("dragover", (event) => {
+    if (!hasNrccItem(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    if (highlightEl) highlightEl.classList.add("drag-over");
+  });
+  el.addEventListener("dragleave", () => {
+    if (highlightEl) highlightEl.classList.remove("drag-over");
+  });
+  el.addEventListener("drop", (event) => {
+    if (!hasNrccItem(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (highlightEl) highlightEl.classList.remove("drag-over");
+    const item = event.dataTransfer.getData("text/x-nrcc-item");
+    if (!item) return;
+    const [type, id] = item.split(":");
+    if (type !== "vm" || !id) return;
+    moveVmToFolderOptimistic(id, targetPath);
+  });
+}
+
+// =====================================================================
+// VM folders -- API calls + optimistic mutations
+// =====================================================================
+
+function vmFolderAuthBody(extra = {}) {
+  return {
+    pcHost: session.pcHost,
+    username: session.username,
+    password: session.password,
+    tlsSkipVerify: session.tlsSkipVerify,
+    ...extra
+  };
+}
+
+async function refreshVmFolderTree({ silent = false } = {}) {
+  if (!vmFoldersAvailable()) return;
+  if (!session.loggedIn) return;
+  try {
+    const resp = await fetch("/api/folders", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(vmFolderAuthBody())
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Failed to list folders.");
+    vmFolderTree = Array.isArray(data.folders) ? data.folders : [];
+    // If the previously-selected folder was deleted out from under us,
+    // fall back to "All VMs".
+    if (vmFolderSelected && !vmFolderTree.some((f) => f.path === vmFolderSelected)) {
+      vmFolderSelected = null;
+      saveVmFolderPrefs();
+    }
+    renderVmFolderTree();
+    renderVmList();
+  } catch (error) {
+    if (!silent) {
+      showToast(`Folders: ${error.message}`);
+    }
+  }
+}
+
+async function createVmFolder(parentPath, name) {
+  const composed = composeFolderPathClient(parentPath, name);
+  if (!composed.ok) {
+    showToast(composed.error);
+    return false;
+  }
+  const path = composed.value;
+  vmFolderPending.folders[path] = "creating";
+  renderVmFolderTree();
+  try {
+    const resp = await fetch("/api/folders/create", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(vmFolderAuthBody({ parentPath: parentPath || "", name }))
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Failed to create folder.");
+    delete vmFolderPending.folders[path];
+    await refreshVmFolderTree({ silent: true });
+    showToast(`Folder "${path}" created.`);
+    return true;
+  } catch (error) {
+    delete vmFolderPending.folders[path];
+    renderVmFolderTree();
+    showToast(`Create failed: ${error.message}`);
+    return false;
+  }
+}
+
+function composeFolderPathClient(parent, name) {
+  const nameValidation = validateFolderName(name);
+  if (!nameValidation.ok) return nameValidation;
+  const parentNorm = normalizeFolderPath(parent);
+  const path = parentNorm ? `${parentNorm}.${nameValidation.value}` : nameValidation.value;
+  return validateFolderPath(path);
+}
+
+async function renameVmFolder(path, newName) {
+  const parts = path.split(".");
+  const parentPath = parts.length > 1 ? parts.slice(0, -1).join(".") : "";
+  const composed = composeFolderPathClient(parentPath, newName);
+  if (!composed.ok) {
+    showToast(composed.error);
+    return false;
+  }
+  const newPath = composed.value;
+  if (newPath === path) return true;
+  vmFolderPending.folders[path] = "renaming";
+  vmFolderPending.folders[newPath] = "renaming";
+  // Optimistically remap every VM whose path is at or below the rename root.
+  const rollback = stashOptimisticVmMoves((p) => folderPathIsAtOrBelow(p, path),
+                                          (p) => p === path ? newPath : `${newPath}${p.slice(path.length)}`);
+  renderVmFolderTree();
+  renderVmList();
+  try {
+    const resp = await fetch("/api/folders/rename", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(vmFolderAuthBody({ path, newName }))
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Failed to rename folder.");
+    delete vmFolderPending.folders[path];
+    delete vmFolderPending.folders[newPath];
+    rollback.commit();
+    if (vmFolderSelected === path) {
+      vmFolderSelected = newPath;
+      saveVmFolderPrefs();
+    }
+    await refreshVmFolderTree({ silent: true });
+    await refreshVmsInBackground();
+    showToast(`Renamed to "${newPath}".`);
+    return true;
+  } catch (error) {
+    delete vmFolderPending.folders[path];
+    delete vmFolderPending.folders[newPath];
+    rollback.rollback();
+    renderVmFolderTree();
+    renderVmList();
+    showToast(`Rename failed: ${error.message}`);
+    return false;
+  }
+}
+
+async function moveVmFolder(path, newParentPath) {
+  const newParent = normalizeFolderPath(newParentPath || "");
+  if (newParent && folderPathIsAtOrBelow(newParent, path)) {
+    showToast("Cannot move a folder into itself or one of its descendants.");
+    return false;
+  }
+  const leaf = path.split(".").pop();
+  const newPath = newParent ? `${newParent}.${leaf}` : leaf;
+  if (newPath === path) return true;
+  const newPathValidation = validateFolderPath(newPath);
+  if (!newPathValidation.ok) {
+    showToast(newPathValidation.error);
+    return false;
+  }
+  vmFolderPending.folders[path] = "moving";
+  vmFolderPending.folders[newPath] = "moving";
+  const rollback = stashOptimisticVmMoves(
+    (p) => folderPathIsAtOrBelow(p, path),
+    (p) => p === path ? newPath : `${newPath}${p.slice(path.length)}`
+  );
+  renderVmFolderTree();
+  renderVmList();
+  try {
+    const resp = await fetch("/api/folders/move", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(vmFolderAuthBody({ path, newParentPath: newParent }))
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Failed to move folder.");
+    delete vmFolderPending.folders[path];
+    delete vmFolderPending.folders[newPath];
+    rollback.commit();
+    if (vmFolderSelected === path) {
+      vmFolderSelected = newPath;
+      saveVmFolderPrefs();
+    }
+    await refreshVmFolderTree({ silent: true });
+    await refreshVmsInBackground();
+    showToast(`Moved to "${newPath}".`);
+    return true;
+  } catch (error) {
+    delete vmFolderPending.folders[path];
+    delete vmFolderPending.folders[newPath];
+    rollback.rollback();
+    renderVmFolderTree();
+    renderVmList();
+    showToast(`Move failed: ${error.message}`);
+    return false;
+  }
+}
+
+async function deleteVmFolder(path) {
+  vmFolderPending.folders[path] = "deleting";
+  // Optimistically uncategorize every VM in the subtree.
+  const rollback = stashOptimisticVmMoves(
+    (p) => folderPathIsAtOrBelow(p, path),
+    () => ""
+  );
+  renderVmFolderTree();
+  renderVmList();
+  try {
+    const resp = await fetch("/api/folders/delete", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(vmFolderAuthBody({ path }))
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Failed to delete folder.");
+    delete vmFolderPending.folders[path];
+    rollback.commit();
+    if (vmFolderSelected === path || (vmFolderSelected && folderPathIsAtOrBelow(vmFolderSelected, path))) {
+      vmFolderSelected = null;
+      saveVmFolderPrefs();
+    }
+    await refreshVmFolderTree({ silent: true });
+    await refreshVmsInBackground();
+    const moved = Array.isArray(data.moved) ? data.moved.length : 0;
+    showToast(`Deleted "${path}" (${moved} VM${moved === 1 ? "" : "s"} uncategorized).`);
+    return true;
+  } catch (error) {
+    delete vmFolderPending.folders[path];
+    rollback.rollback();
+    renderVmFolderTree();
+    renderVmList();
+    showToast(`Delete failed: ${error.message}`);
+    return false;
+  }
+}
+
+async function moveVmToFolderOptimistic(vmUuid, folderPath) {
+  if (!vmUuid) return;
+  const target = normalizeFolderPath(folderPath);
+  if (target) {
+    const v = validateFolderPath(target);
+    if (!v.ok) {
+      showToast(v.error);
+      return;
+    }
+  }
+  vmFolderPending.vms[vmUuid] = target;
+  renderVmFolderTree();
+  renderVmList();
+  try {
+    const url = target ? "/api/vms/folder" : "/api/vms/folder/clear";
+    const body = target
+      ? vmFolderAuthBody({ vmUuid, folderPath: target })
+      : vmFolderAuthBody({ vmUuid });
+    const resp = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Failed to move VM.");
+    delete vmFolderPending.vms[vmUuid];
+    // Refresh the VM list so categories[] is authoritative again.
+    await refreshVmsInBackground();
+    await refreshVmFolderTree({ silent: true });
+    showToast(target ? `Moved to "${target}".` : "VM uncategorized.");
+  } catch (error) {
+    delete vmFolderPending.vms[vmUuid];
+    renderVmFolderTree();
+    renderVmList();
+    showToast(`Move failed: ${error.message}`);
+  }
+}
+
+// Stash + later commit/rollback for optimistic VM remapping. Used by
+// folder rename / move / delete to make every affected VM appear in
+// its new folder immediately, then either confirm (no-op) or roll
+// back (restore the previous pending map) on server failure.
+function stashOptimisticVmMoves(matcher, rewrite) {
+  const prev = { ...vmFolderPending.vms };
+  for (const vm of vmCache) {
+    const path = getVmFolderPath(vm);
+    if (matcher(path)) {
+      vmFolderPending.vms[vm.uuid] = rewrite(path);
+    }
+  }
+  return {
+    commit() {
+      // Clear the optimistic entries we set; the next vm-list refresh
+      // is authoritative.
+      for (const vm of vmCache) {
+        if (matcher(getVmFolderPath(vm))) {
+          delete vmFolderPending.vms[vm.uuid];
+        }
+      }
+    },
+    rollback() {
+      vmFolderPending.vms = { ...prev };
+    }
+  };
+}
+
+// =====================================================================
+// VM folders -- context menu and dialogs
+// =====================================================================
+
+function hideVmFolderContextMenu() {
+  if (vmFolderCtxMenu) vmFolderCtxMenu.classList.remove("open");
+}
+
+function showVmFolderContextMenu(x, y, path) {
+  if (!vmFolderCtxMenu || !vmFoldersAvailable()) return;
+  vmFolderCtxMenu.innerHTML = "";
+  const header = document.createElement("div");
+  header.className = "ctx-menu-header";
+  header.textContent = path;
+  vmFolderCtxMenu.appendChild(header);
+
+  const items = [
+    {
+      label: "New subfolder...",
+      onClick: () => promptCreateVmFolder(path)
+    },
+    {
+      label: "Rename...",
+      onClick: () => promptRenameVmFolder(path)
+    },
+    {
+      label: "Move...",
+      onClick: () => promptMoveVmFolder(path)
+    },
+    { sep: true },
+    {
+      label: "Delete...",
+      danger: true,
+      onClick: () => promptDeleteVmFolder(path)
+    }
+  ];
+
+  for (const item of items) {
+    if (item.sep) {
+      const sep = document.createElement("div");
+      sep.className = "ctx-menu-sep";
+      vmFolderCtxMenu.appendChild(sep);
+      continue;
+    }
+    const row = document.createElement("div");
+    row.className = "ctx-menu-item";
+    if (item.danger) row.classList.add("power-off");
+    row.innerHTML = `<span class="ctx-icon">${item.danger ? "×" : "•"}</span><span>${escapeHtml(item.label)}</span>`;
+    row.addEventListener("click", () => {
+      hideVmFolderContextMenu();
+      item.onClick();
+    });
+    vmFolderCtxMenu.appendChild(row);
+  }
+
+  vmFolderCtxMenu.style.left = `${x}px`;
+  vmFolderCtxMenu.style.top = `${y}px`;
+  vmFolderCtxMenu.classList.add("open");
+  const rect = vmFolderCtxMenu.getBoundingClientRect();
+  if (rect.right > window.innerWidth - 4) {
+    vmFolderCtxMenu.style.left = `${Math.max(4, window.innerWidth - rect.width - 4)}px`;
+  }
+  if (rect.bottom > window.innerHeight - 4) {
+    vmFolderCtxMenu.style.top = `${Math.max(4, window.innerHeight - rect.height - 4)}px`;
+  }
+}
+
+if (vmFolderCtxMenu) {
+  document.addEventListener("click", (event) => {
+    if (!vmFolderCtxMenu.contains(event.target)) hideVmFolderContextMenu();
+  });
+  document.addEventListener("contextmenu", (event) => {
+    if (!vmFolderCtxMenu.contains(event.target)) hideVmFolderContextMenu();
+  });
+  window.addEventListener("scroll", hideVmFolderContextMenu, true);
+  window.addEventListener("blur", hideVmFolderContextMenu);
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hideVmFolderContextMenu();
+  });
+}
+
+function promptCreateVmFolder(parentPath) {
+  const label = parentPath ? `New folder under "${parentPath}":` : "New top-level folder name:";
+  const name = window.prompt(label, "");
+  if (name === null) return;
+  const trimmed = String(name).trim();
+  if (!trimmed) return;
+  createVmFolder(parentPath || "", trimmed);
+}
+
+function promptRenameVmFolder(path) {
+  const current = path.split(".").pop();
+  const next = window.prompt(`Rename folder "${path}":`, current);
+  if (next === null) return;
+  const trimmed = String(next).trim();
+  if (!trimmed || trimmed === current) return;
+  renameVmFolder(path, trimmed);
+}
+
+function promptMoveVmFolder(path) {
+  const current = path.split(".").slice(0, -1).join(".");
+  const help =
+    "Enter the new PARENT folder path (empty for top-level).\n" +
+    "Examples: \"Production\", \"Production.Linux\".";
+  const next = window.prompt(`${help}\n\nCurrent parent: "${current}"`, current);
+  if (next === null) return;
+  moveVmFolder(path, String(next).trim());
+}
+
+function promptDeleteVmFolder(path) {
+  const { subtreeCounts } = computeFolderCounts();
+  const vmCount = subtreeCounts.get(path) || 0;
+  const tail = vmCount
+    ? `\n\n${vmCount} VM${vmCount === 1 ? " is" : "s are"} in this folder (and any subfolders). They will be UNCATEGORIZED, not deleted.`
+    : "";
+  const ok = window.confirm(`Delete folder "${path}"?${tail}`);
+  if (!ok) return;
+  deleteVmFolder(path);
+}
+
+// Pick-a-folder modal (lightweight: a window.prompt with the current
+// folder pre-filled, mirroring the move-folder flow). Reuses the
+// existing validators so the user can't ship a malformed path.
+function promptMoveVmToFolder(vmUuid) {
+  if (!vmFoldersAvailable()) return;
+  const liveVm = getVmByUuid(vmUuid);
+  if (!liveVm) {
+    showToast("VM not found in the current list.");
+    return;
+  }
+  const current = getVmFolderPath(liveVm);
+  const help =
+    "Enter the destination folder path.\n" +
+    "Examples: \"Production\", \"Production.Linux.Web\".\n" +
+    "Leave blank to uncategorize.";
+  const dest = window.prompt(`${help}\n\nCurrent: ${current || "(uncategorized)"}`, current);
+  if (dest === null) return;
+  moveVmToFolderOptimistic(vmUuid, String(dest).trim());
+}
+
+// Button wiring for the folder pane header.
+if (vmFolderAddBtn) {
+  vmFolderAddBtn.addEventListener("click", () => promptCreateVmFolder(""));
+}
+if (vmFolderRefreshBtn) {
+  vmFolderRefreshBtn.addEventListener("click", () => refreshVmFolderTree());
+}
+
+// =====================================================================
 // Authentication: login / logout
 // =====================================================================
 
@@ -1140,6 +1998,11 @@ async function login(event) {
     // VM list arrives.
     renderAll();
 
+    // Beta: pull the Prism folder catalog in the background. Safe to
+    // call even when the feature is disabled -- it short-circuits via
+    // vmFoldersAvailable().
+    refreshVmFolderTree({ silent: true });
+
     // Kick off the VM list load in the background. Don't await -- the
     // app stays interactive while it streams in.
     refreshVmsInBackground();
@@ -1174,7 +2037,14 @@ function logout() {
   // Clear in-memory VM cache so the next login starts fresh.
   vmCache = [];
   isLoadingVms = false;
+  // Beta: drop the in-memory folder snapshot too, but keep the
+  // user's last selection in localStorage so the next sign-in
+  // remembers where they were.
+  vmFolderTree = [];
+  for (const k of Object.keys(vmFolderPending.folders)) delete vmFolderPending.folders[k];
+  for (const k of Object.keys(vmFolderPending.vms)) delete vmFolderPending.vms[k];
   renderAll();
+  renderVmFolderTree();
   closeShowAll();
   hideContextMenu();
   updateConsoleControls();
@@ -1210,6 +2080,9 @@ function applyVmListResult(data) {
   fillFilterOptions();
   refreshFavoriteSnapshots();
   renderAll();
+  // Beta: refresh the folder pane so per-folder VM counts reflect
+  // the freshly-loaded inventory. Safe no-op when vmFolders is off.
+  renderVmFolderTree();
   // Beta: schedule a TCP port scan over the freshly-loaded VM IPs so
   // the SSH/RDP availability pills (and the "Open SSH" right-click
   // item) light up. The scanner is a no-op when the beta feature is
@@ -2467,6 +3340,43 @@ function showVmContextMenu(x, y, vmUuid) {
     }
   }
 
+  // Beta: VM folders. Move to folder... is always offered when the
+  // beta is on (use the picker to type or select a destination).
+  // Remove from folder appears only when the VM currently has an
+  // NTNXFolderPath category. Both items carry data-feature so
+  // featureFlags.refresh() can hide them en masse.
+  if (vmFoldersAvailable()) {
+    if (!ctxMenu.lastChild || !ctxMenu.lastChild.classList || !ctxMenu.lastChild.classList.contains("ctx-menu-sep")) {
+      const sep = document.createElement("div");
+      sep.className = "ctx-menu-sep";
+      sep.dataset.feature = "vmFolders";
+      ctxMenu.appendChild(sep);
+    }
+    const moveItem = document.createElement("div");
+    moveItem.className = "ctx-menu-item";
+    moveItem.dataset.feature = "vmFolders";
+    moveItem.innerHTML = '<span class="ctx-icon">▸</span><span>Move to folder...</span>';
+    moveItem.addEventListener("click", () => {
+      hideContextMenu();
+      promptMoveVmToFolder(vmUuid);
+    });
+    ctxMenu.appendChild(moveItem);
+
+    const liveVmForFolder = getVmByUuid(vmUuid);
+    const currentFolder = liveVmForFolder ? getVmFolderPath(liveVmForFolder) : "";
+    if (currentFolder) {
+      const clearItem = document.createElement("div");
+      clearItem.className = "ctx-menu-item";
+      clearItem.dataset.feature = "vmFolders";
+      clearItem.innerHTML = `<span class="ctx-icon">○</span><span>Remove from folder (${escapeHtml(currentFolder)})</span>`;
+      clearItem.addEventListener("click", () => {
+        hideContextMenu();
+        moveVmToFolderOptimistic(vmUuid, "");
+      });
+      ctxMenu.appendChild(clearItem);
+    }
+  }
+
   // Position, then clamp to viewport
   ctxMenu.style.left = `${x}px`;
   ctxMenu.style.top = `${y}px`;
@@ -2813,7 +3723,12 @@ const appConfig = {
   featureFlags: {},
   appVersion: "",
   updateAvailable: false,
-  rdp: { enabled: false, defaultWidth: 1280, defaultHeight: 800, defaultDpi: 96 }
+  rdp: { enabled: false, defaultWidth: 1280, defaultHeight: 800, defaultDpi: 96 },
+  // Beta: server-side kill switch (NRCC_VM_FOLDERS_ENABLED). Defaults
+  // to true so a missing field on an older server doesn't hide the
+  // feature gratuitously; the master gate is still featureFlags +
+  // user's Show beta features toggle.
+  vmFoldersEnabled: true
 };
 
 async function loadAppConfig() {
@@ -2839,6 +3754,9 @@ async function loadAppConfig() {
     appConfig.updateAvailable = Boolean(data.updateAvailable);
     if (data.rdp && typeof data.rdp === "object") {
       appConfig.rdp = { ...appConfig.rdp, ...data.rdp };
+    }
+    if (typeof data.vmFoldersEnabled === "boolean") {
+      appConfig.vmFoldersEnabled = data.vmFoldersEnabled;
     }
     if (appConfig.multiUser) {
       chatRoot.hidden = false;
@@ -3004,6 +3922,20 @@ const featureFlags = {
       const enabled = featureFlags.isEnabled(id);
       el.hidden = !enabled;
     });
+    // Beta: re-render the VM-folder pane and VM list when the
+    // vmFolders flag toggles. When it just flipped ON we also pull
+    // the latest folder catalog from Prism so the pane isn't empty.
+    if (typeof renderVmFolderTree === "function") {
+      try {
+        renderVmFolderTree();
+        if (featureFlags.isEnabled("vmFolders") &&
+            session && session.loggedIn &&
+            (!vmFolderTree || vmFolderTree.length === 0)) {
+          refreshVmFolderTree({ silent: true });
+        }
+        if (typeof renderVmList === "function") renderVmList();
+      } catch (_e) { /* ignore */ }
+    }
   }
 };
 

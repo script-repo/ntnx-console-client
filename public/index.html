@@ -3355,6 +3355,20 @@
                   <button id="addFavFolderBtn" type="button" class="link-button" title="Add a top-level folder">+ Folder</button>
                 </div>
                 <div id="favoritesTree" class="fav-tree" data-drop-target="root"></div>
+
+                <!-- Beta: VM folders. Visible only when Show beta features
+                     is on AND the server has NRCC_VM_FOLDERS_ENABLED=true.
+                     featureFlags.refresh() flips this entire block on/off
+                     via the data-feature attribute. -->
+                <div data-feature="vmFolders" id="vmFoldersPane" hidden>
+                  <div class="section-title-row" style="margin-top:14px">
+                    <div class="section-title">Folders</div>
+                    <button id="vmFolderRefreshBtn" type="button" class="link-button" title="Refresh folder tree from Prism">Refresh</button>
+                    <button id="vmFolderAddBtn" type="button" class="link-button" title="Add a top-level folder">+ Folder</button>
+                  </div>
+                  <div id="vmFolderTree" class="fav-tree" data-drop-target="vm-folder-root"></div>
+                </div>
+
                 <div class="section-title-row vmlist-title-row" style="margin-top:14px">
                   <button id="vmListToggleBtn" type="button" class="vmlist-toggle"
                           aria-expanded="true" aria-controls="vmList"
@@ -4133,6 +4147,9 @@
 
     <!-- Right-click context menu (single global instance) -->
     <div id="ctxMenu" class="ctx-menu" role="menu"></div>
+    <!-- Folder-row context menu (beta: vmFolders). Re-uses .ctx-menu
+         styles so no new CSS is required. -->
+    <div id="vmFolderCtxMenu" class="ctx-menu" role="menu" data-feature="vmFolders"></div>
 
     <script type="module" src="/app.js"></script>
   </body>
