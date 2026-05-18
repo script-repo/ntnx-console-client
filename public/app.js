@@ -1364,6 +1364,16 @@ function setVmFolderCollapsed(path, collapsed) {
   saveVmFolderPrefs();
 }
 
+function expandVmFolderPath(path) {
+  const normalized = normalizeFolderPath(path);
+  if (!normalized) return;
+  const parts = normalized.split(".");
+  for (let i = 1; i <= parts.length; i += 1) {
+    delete vmFolderCollapsed[parts.slice(0, i).join(".")];
+  }
+  saveVmFolderPrefs();
+}
+
 // Aggregate the per-folder VM count (subtree inclusive) so the
 // sidebar shows a meaningful number next to each folder.
 function computeFolderCounts() {
@@ -1420,6 +1430,12 @@ function buildChildIndex(paths) {
   }
   for (const arr of children.values()) arr.sort((a, b) => a.localeCompare(b));
   return children;
+}
+
+function directVmsForVmFolder(path) {
+  return vmCache
+    .filter((vm) => getVmFolderPath(vm) === path)
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
 }
 
 function renderVmFolderTree() {
@@ -1516,6 +1532,17 @@ function createVmFolderRow(path, depth, childIndex, subtreeCounts) {
   for (const child of kids) {
     const childEl = createVmFolderRow(child, depth + 1, childIndex, subtreeCounts);
     if (childEl) childrenEl.appendChild(childEl);
+  }
+
+  // Render direct VM children so a move is visible in the target
+  // VM folder immediately. getVmFolderPath() includes pending
+  // optimistic assignments, so rows appear here before Prism
+  // confirms and remain here after refresh when categories_mapping
+  // has reconciled.
+  for (const vm of directVmsForVmFolder(path)) {
+    const vmEl = createVmRow(vm, { draggable: true });
+    vmEl.classList.add("is-vm-folder-child");
+    childrenEl.appendChild(vmEl);
   }
 
   // Toggle expand/collapse without selecting the folder.
@@ -1818,6 +1845,7 @@ async function moveVmToFolderOptimistic(vmUuid, folderPath) {
     }
   }
   vmFolderPending.vms[vmUuid] = target;
+  if (target) expandVmFolderPath(target);
   // Optimistic highlight: light up the destination folder row (and
   // every ancestor in the subtree count) so the user sees where the
   // VM will land while the Prism call is still in flight. Cleared
@@ -1848,11 +1876,13 @@ async function moveVmToFolderOptimistic(vmUuid, folderPath) {
     // actually see it pulse even on a fast Prism response.
     const elapsed = Date.now() - t0;
     if (elapsed < 600) await new Promise((r) => setTimeout(r, 600 - elapsed));
-    delete vmFolderPending.vms[vmUuid];
-    if (target) bumpVmFolderReceiving(target, -1);
     // Refresh the VM list so categories[] is authoritative again.
     await refreshVmsInBackground();
     await refreshVmFolderTree({ silent: true });
+    delete vmFolderPending.vms[vmUuid];
+    if (target) bumpVmFolderReceiving(target, -1);
+    renderVmFolderTree();
+    renderVmList();
     showToast(target ? `Moved to "${target}".` : "VM uncategorized.");
   } catch (error) {
     delete vmFolderPending.vms[vmUuid];
@@ -1884,12 +1914,15 @@ async function moveVmsToFolderOptimistic(vmUuids, folderPath) {
   for (const id of ids) {
     vmFolderPending.vms[id] = target;
   }
+  if (target) expandVmFolderPath(target);
   if (target) bumpVmFolderReceiving(target, ids.length);
   renderVmFolderTree();
   renderVmList();
   const t0 = Date.now();
   let ok = 0;
   let failed = 0;
+  const okIds = new Set();
+  const failedIds = new Set();
   // Concurrency 4: balances throughput vs Prism load. Each call
   // walks a v3 metadata PUT, so we don't want to swarm the cluster.
   const queue = ids.slice();
@@ -1914,12 +1947,11 @@ async function moveVmsToFolderOptimistic(vmUuids, folderPath) {
         throw new Error((data && data.error) || `HTTP ${resp.status}${detail}`);
       }
       ok += 1;
+      okIds.add(id);
     } catch (error) {
       failed += 1;
+      failedIds.add(id);
       console.error("[vm-folders] bulk move failed for", id, error);
-    } finally {
-      delete vmFolderPending.vms[id];
-      if (target) bumpVmFolderReceiving(target, -1);
     }
   };
   for (let i = 0; i < Math.min(4, queue.length); i += 1) {
@@ -1938,6 +1970,11 @@ async function moveVmsToFolderOptimistic(vmUuids, folderPath) {
   if (elapsed < 600) await new Promise((r) => setTimeout(r, 600 - elapsed));
   await refreshVmsInBackground();
   await refreshVmFolderTree({ silent: true });
+  for (const id of okIds) delete vmFolderPending.vms[id];
+  for (const id of failedIds) delete vmFolderPending.vms[id];
+  if (target) bumpVmFolderReceiving(target, -ids.length);
+  renderVmFolderTree();
+  renderVmList();
   if (failed === 0) {
     showToast(target
       ? `Moved ${ok} VM${ok === 1 ? "" : "s"} to "${target}".`
@@ -1949,9 +1986,7 @@ async function moveVmsToFolderOptimistic(vmUuids, folderPath) {
     showToast(`Moved ${ok}, failed ${failed}. See console for details.`);
     // Drop the successes from the selection; keep the failures so
     // the user can retry without ticking them again.
-    for (const id of ids) {
-      if (vmFolderPending.vms[id] === undefined) vmSelection.delete(id);
-    }
+    for (const id of okIds) vmSelection.delete(id);
     refreshVmSelectionBar();
   }
 }

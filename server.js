@@ -2931,6 +2931,47 @@ function logIpCoverage(vms, variant, withCvm) {
   console.log(`[ip-coverage] variant=${variant || "default"} cvm-pass=${withCvm} total=${vms.length} withIp=${withIp} withoutIp=${withoutIp} samples=[${samples.join(", ")}]`);
 }
 
+function normalizeVmCategoryEntries(...sources) {
+  const out = [];
+  const add = (key, value) => {
+    if (!key || value == null) return;
+    if (Array.isArray(value)) {
+      for (const item of value) add(key, item);
+      return;
+    }
+    const v = String(value).trim();
+    if (v) out.push(`${String(key).trim()}:${v}`);
+  };
+  for (const source of sources) {
+    if (!source) continue;
+    if (Array.isArray(source)) {
+      for (const item of source) {
+        if (typeof item === "string") {
+          out.push(item);
+        } else if (item && typeof item === "object") {
+          const key =
+            item.key ||
+            item.name ||
+            item.categoryKey ||
+            item.category_key ||
+            item.categoryName ||
+            item.category_name;
+          const value =
+            item.value ||
+            item.categoryValue ||
+            item.category_value ||
+            item.categoryValueName ||
+            item.category_value_name;
+          add(key, value);
+        }
+      }
+    } else if (source && typeof source === "object") {
+      for (const [key, value] of Object.entries(source)) add(key, value);
+    }
+  }
+  return Array.from(new Set(out));
+}
+
 function parseVmList(vmResponse) {
   const list =
     vmResponse?.data?.data?.entities ||
@@ -2942,21 +2983,23 @@ function parseVmList(vmResponse) {
   const vms = Array.isArray(list) ? list : [];
   return vms
     .map((vm) => {
-      const categoriesRaw =
-        vm?.categories ||
-        vm?.metadata?.categories ||
-        vm?.status?.resources?.categories ||
-        vm?.spec?.resources?.categories ||
-        vm?.spec?.categories ||
-        {};
-      let categories = [];
-      if (Array.isArray(categoriesRaw)) {
-        categories = categoriesRaw.map((item) => String(item));
-      } else if (categoriesRaw && typeof categoriesRaw === "object") {
-        categories = Object.entries(categoriesRaw).map(
-          ([key, value]) => `${key}:${value}`
-        );
-      }
+      const categories = normalizeVmCategoryEntries(
+        vm?.categories,
+        vm?.categories_mapping,
+        vm?.categoriesMapping,
+        vm?.metadata?.categories,
+        vm?.metadata?.categories_mapping,
+        vm?.metadata?.categoriesMapping,
+        vm?.status?.resources?.categories,
+        vm?.status?.resources?.categories_mapping,
+        vm?.status?.resources?.categoriesMapping,
+        vm?.spec?.resources?.categories,
+        vm?.spec?.resources?.categories_mapping,
+        vm?.spec?.resources?.categoriesMapping,
+        vm?.spec?.categories,
+        vm?.spec?.categories_mapping,
+        vm?.spec?.categoriesMapping
+      );
 
       const resolvedName =
         vm?.name ||

@@ -82,6 +82,15 @@ spec:
       labels:
         app: nrcc
     spec:
+      # Pin the pod to the worker whose NodePort IP is bookmarked
+      # by users. externalTrafficPolicy: Local on the Service below
+      # means traffic only flows on the node hosting the pod, so a
+      # rollout that lands the pod on a different worker silently
+      # breaks the bookmark. nodeSelector keeps the pod stuck to
+      # one worker; remove (or change to a different hostname) if
+      # you want a free-floating deployment.
+      nodeSelector:
+        kubernetes.io/hostname: cankp-primary-md-0-jjv7q-xs8gz-xwv99
       # The image is published as PUBLIC on GHCR per the user's
       # answer in the setup flow, so no imagePullSecret is needed.
       # If you flip the package to private, add:

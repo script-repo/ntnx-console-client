@@ -394,6 +394,13 @@
       body.vm-folders-on .vm-row {
         grid-template-columns: 22px 30px 1fr;
       }
+      /* VM rows rendered inside the VM-folder tree are there to show
+         membership/optimistic placement, not to provide another
+         checkbox surface. Keep them aligned like the legacy two-column
+         VM row even while vmFolders is enabled. */
+      body.vm-folders-on #vmFolderTree .vm-row {
+        grid-template-columns: 30px 1fr;
+      }
       .vm-row .vm-select-cell {
         display: none;
         align-items: center;
@@ -401,6 +408,9 @@
       }
       body.vm-folders-on .vm-row .vm-select-cell {
         display: flex;
+      }
+      body.vm-folders-on #vmFolderTree .vm-row .vm-select-cell {
+        display: none;
       }
       .vm-row .vm-select-cell input[type="checkbox"] {
         margin: 0;
