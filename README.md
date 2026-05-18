@@ -572,10 +572,11 @@ Selecting a real folder narrows the VM list to that folder *and every subfolder*
 
 **What you can do**
 
-- **Drag a VM onto a folder** to move it. The same drag payload format (`text/x-nrcc-item` = `vm:<uuid>`) is reused — dropping on a favorites folder still bookmarks the VM (existing behaviour); dropping on a VM-folder row Prism-categorizes it (new behaviour). The two trees are differentiated at the drop target via `data-vm-folder-path`.
-- **Right-click a VM** for **Move to folder...** (opens an inline **dropdown picker** listing every known folder, indented to reflect nesting, plus an `(Uncategorize)` and a `(New folder...)` escape hatch) and, when the VM has a folder, **Remove from folder**.
+- **Drag a VM onto a folder** to move it. The drop target covers the entire folder row (header + child container) so you can let go anywhere on it. The same drag payload format (`text/x-nrcc-item` = `vm:<uuid>`) is reused — dropping on a favorites folder still bookmarks the VM (existing behaviour); dropping on a VM-folder row Prism-categorizes it (new behaviour).
+- **Multi-select with checkboxes.** When the beta is on, every VM row in the main list grows a small checkbox on the left. Tick two or more and a sticky toolbar appears above the list (`N VMs selected · Move to folder... · Clear`) which moves the entire selection in one batch (capped at concurrency 4 against Prism). Dragging any selected VM onto a folder also moves the full set. Right-clicking a selected VM swaps the menu's `Move to folder...` for `Move N selected to folder...`.
+- **Right-click a VM** for **Move to folder...** which opens an inline **dropdown picker** listing every known folder, indented to reflect nesting, with the VM's current folder pre-selected and an `(Uncategorize)` / `(New folder...)` escape hatch. When the VM has a folder, **Remove from folder** is also offered.
 - **Right-click a folder** for **New subfolder**, **Rename**, **Move**, **Delete**. Delete only removes the category and uncategorizes every VM in the subtree — **VMs themselves are never deleted by NRCC**.
-- **Optimistic UI with pending highlighting.** Moves, creates, renames, and deletes appear instantly. The destination folder row (and the moving VM row) pulses with an accent-soft highlight until Prism Central confirms the change — on failure the highlight clears and a rollback toast is shown.
+- **Optimistic UI with pending highlighting.** Moves, creates, renames, and deletes appear instantly. The destination folder row pulses with an accent-soft highlight for at least ~0.6 s (so it stays visible even on a sub-100 ms cluster response) until Prism Central confirms the change — on failure the highlight clears and a toast surfaces the underlying error.
 
 **Endpoints (all gated on the server-side master switch)**
 

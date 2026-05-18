@@ -99,6 +99,11 @@ const vmFolderTreeEl = document.getElementById("vmFolderTree");
 const vmFolderRefreshBtn = document.getElementById("vmFolderRefreshBtn");
 const vmFolderAddBtn = document.getElementById("vmFolderAddBtn");
 const vmFolderCtxMenu = document.getElementById("vmFolderCtxMenu");
+// Beta: vmFolders multi-select toolbar.
+const vmSelectionBar = document.getElementById("vmSelectionBar");
+const vmSelectionCountEl = document.getElementById("vmSelectionCount");
+const vmSelectionMoveBtn = document.getElementById("vmSelectionMoveBtn");
+const vmSelectionClearBtn = document.getElementById("vmSelectionClearBtn");
 
 const peCredsModal = document.getElementById("peCredsModal");
 const peCredsHostLabel = document.getElementById("peCredsHost");
@@ -271,6 +276,42 @@ function bumpVmFolderReceiving(path, delta) {
   const next = (vmFolderPending.receiving[path] || 0) + delta;
   if (next <= 0) delete vmFolderPending.receiving[path];
   else vmFolderPending.receiving[path] = next;
+}
+
+// Beta: vmFolders multi-select. UUIDs the user has ticked in the
+// main VM list. Cleared on logout, after a successful bulk move,
+// and whenever the user hits the Clear button. Drag-and-drop of any
+// selected VM moves the whole set; dragging an unselected VM only
+// moves that one (the selection is preserved).
+const vmSelection = new Set();
+
+function isVmSelected(uuid) { return vmSelection.has(uuid); }
+
+function setVmSelected(uuid, on) {
+  if (!uuid) return;
+  if (on) vmSelection.add(uuid);
+  else vmSelection.delete(uuid);
+  refreshVmSelectionBar();
+}
+
+function clearVmSelection() {
+  if (!vmSelection.size) return;
+  vmSelection.clear();
+  refreshVmSelectionBar();
+  if (typeof renderVmList === "function") renderVmList();
+}
+
+function refreshVmSelectionBar() {
+  if (!vmSelectionBar || !vmSelectionCountEl) return;
+  const n = vmSelection.size;
+  const featureOn = typeof featureFlags === "object"
+    && featureFlags && featureFlags.isEnabled("vmFolders");
+  if (!featureOn || n === 0) {
+    vmSelectionBar.hidden = true;
+    return;
+  }
+  vmSelectionBar.hidden = false;
+  vmSelectionCountEl.textContent = `${n} VM${n === 1 ? "" : "s"} selected`;
 }
 
 function loadVmFolderPrefs() {
@@ -940,6 +981,7 @@ function createVmRow(vm, opts = {}) {
   if (vmFolderPending.vms[vm.uuid] !== undefined) {
     row.classList.add("is-pending-move");
   }
+  if (isVmSelected(vm.uuid)) row.classList.add("is-selected");
   const isLive = !!getVmByUuid(vm.uuid);
   const fav = isFavorite(vm.uuid);
   const normPower = normalizePowerState(vm.powerState);
@@ -957,7 +999,15 @@ function createVmRow(vm, opts = {}) {
     portPills = `<span data-feature="vmPortScan">${parts.join("")}</span>`;
   }
   const metaText = metaLine(vm) || (isLive ? "" : "Updating from Prism Central...");
+  // Beta: vmFolders multi-select. The checkbox cell only renders
+  // visually when body.vm-folders-on is set by featureFlags.refresh,
+  // so GA-mode users see the unchanged 30px + 1fr grid.
+  const checked = isVmSelected(vm.uuid);
   row.innerHTML = `
+    <div class="vm-select-cell" data-feature="vmFolders">
+      <input type="checkbox" class="vm-select-checkbox"
+             aria-label="Select VM" ${checked ? "checked" : ""}>
+    </div>
     <button class="star ${fav ? "is-fav" : ""}" title="${fav ? "Remove favorite" : "Add favorite"}">${fav ? "★" : "☆"}</button>
     <div class="vm-item ${isLive ? "" : "is-loading"}">
       <div class="vm-name">${escapeHtml(vm.name || vm.uuid)}</div>
@@ -969,6 +1019,15 @@ function createVmRow(vm, opts = {}) {
       </div>
     </div>
   `;
+  const checkboxEl = row.querySelector(".vm-select-checkbox");
+  if (checkboxEl) {
+    checkboxEl.addEventListener("click", (event) => event.stopPropagation());
+    checkboxEl.addEventListener("change", (event) => {
+      event.stopPropagation();
+      setVmSelected(vm.uuid, event.target.checked);
+      row.classList.toggle("is-selected", event.target.checked);
+    });
+  }
   const starBtn = row.querySelector(".star");
   const vmItem = row.querySelector(".vm-item");
   starBtn.addEventListener("click", (event) => {
@@ -1482,7 +1541,11 @@ function createVmFolderRow(path, depth, childIndex, subtreeCounts) {
     showVmFolderContextMenu(event.clientX, event.clientY, path);
   });
 
-  // Drop target: dropping a VM here moves it into this folder.
+  // Drop target: dropping a VM anywhere on the folder row (or on
+  // its child container, even when empty) moves it into this folder.
+  // Three attach points so we never miss a hit between the
+  // header/children gap.
+  attachVmFolderDropTarget(wrap, path, header);
   attachVmFolderDropTarget(header, path, header);
   attachVmFolderDropTarget(childrenEl, path, header);
 
@@ -1513,7 +1576,14 @@ function attachVmFolderDropTarget(el, targetPath, highlightEl) {
     if (!item) return;
     const [type, id] = item.split(":");
     if (type !== "vm" || !id) return;
-    moveVmToFolderOptimistic(id, targetPath);
+    // If the dragged VM is part of the multi-select set, move the
+    // whole selection. Otherwise just move the single VM (the
+    // checkbox set is preserved either way).
+    if (vmSelection.size > 1 && vmSelection.has(id)) {
+      moveVmsToFolderOptimistic(Array.from(vmSelection), targetPath);
+    } else {
+      moveVmToFolderOptimistic(id, targetPath);
+    }
   });
 }
 
@@ -1755,6 +1825,7 @@ async function moveVmToFolderOptimistic(vmUuid, folderPath) {
   if (target) bumpVmFolderReceiving(target, 1);
   renderVmFolderTree();
   renderVmList();
+  const t0 = Date.now();
   try {
     const url = target ? "/api/vms/folder" : "/api/vms/folder/clear";
     const body = target
@@ -1766,8 +1837,17 @@ async function moveVmToFolderOptimistic(vmUuid, folderPath) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || "Failed to move VM.");
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const detail = data && data.details
+        ? ` (${typeof data.details === "string" ? data.details : JSON.stringify(data.details)})`
+        : "";
+      throw new Error((data && data.error) || `HTTP ${resp.status}${detail}`);
+    }
+    // Hold the optimistic highlight long enough that the user can
+    // actually see it pulse even on a fast Prism response.
+    const elapsed = Date.now() - t0;
+    if (elapsed < 600) await new Promise((r) => setTimeout(r, 600 - elapsed));
     delete vmFolderPending.vms[vmUuid];
     if (target) bumpVmFolderReceiving(target, -1);
     // Refresh the VM list so categories[] is authoritative again.
@@ -1780,6 +1860,99 @@ async function moveVmToFolderOptimistic(vmUuid, folderPath) {
     renderVmFolderTree();
     renderVmList();
     showToast(`Move failed: ${error.message}`);
+    console.error("[vm-folders] move failed", { vmUuid, target, error });
+  }
+}
+
+// Multi-VM bulk move. Runs the single-VM mutation per UUID with a
+// small concurrency budget so we don't overwhelm Prism. Optimistic
+// state is applied upfront for the whole batch so the destination
+// folder count + highlight reflect the full move immediately; on
+// per-VM failure that VM's optimistic entry is rolled back and the
+// failure is reported via toast.
+async function moveVmsToFolderOptimistic(vmUuids, folderPath) {
+  const ids = Array.from(new Set((vmUuids || []).filter(Boolean)));
+  if (!ids.length) return;
+  const target = normalizeFolderPath(folderPath);
+  if (target) {
+    const v = validateFolderPath(target);
+    if (!v.ok) {
+      showToast(v.error);
+      return;
+    }
+  }
+  for (const id of ids) {
+    vmFolderPending.vms[id] = target;
+  }
+  if (target) bumpVmFolderReceiving(target, ids.length);
+  renderVmFolderTree();
+  renderVmList();
+  const t0 = Date.now();
+  let ok = 0;
+  let failed = 0;
+  // Concurrency 4: balances throughput vs Prism load. Each call
+  // walks a v3 metadata PUT, so we don't want to swarm the cluster.
+  const queue = ids.slice();
+  const workers = [];
+  const runOne = async (id) => {
+    try {
+      const url = target ? "/api/vms/folder" : "/api/vms/folder/clear";
+      const body = target
+        ? vmFolderAuthBody({ vmUuid: id, folderPath: target })
+        : vmFolderAuthBody({ vmUuid: id });
+      const resp = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data && data.details
+          ? ` (${typeof data.details === "string" ? data.details : JSON.stringify(data.details)})`
+          : "";
+        throw new Error((data && data.error) || `HTTP ${resp.status}${detail}`);
+      }
+      ok += 1;
+    } catch (error) {
+      failed += 1;
+      console.error("[vm-folders] bulk move failed for", id, error);
+    } finally {
+      delete vmFolderPending.vms[id];
+      if (target) bumpVmFolderReceiving(target, -1);
+    }
+  };
+  for (let i = 0; i < Math.min(4, queue.length); i += 1) {
+    workers.push((async function worker() {
+      while (queue.length) {
+        const id = queue.shift();
+        if (!id) return;
+        await runOne(id);
+      }
+    })());
+  }
+  await Promise.all(workers);
+  // Hold the highlight long enough that the user actually sees it
+  // pulse even on a fast cluster.
+  const elapsed = Date.now() - t0;
+  if (elapsed < 600) await new Promise((r) => setTimeout(r, 600 - elapsed));
+  await refreshVmsInBackground();
+  await refreshVmFolderTree({ silent: true });
+  if (failed === 0) {
+    showToast(target
+      ? `Moved ${ok} VM${ok === 1 ? "" : "s"} to "${target}".`
+      : `Uncategorized ${ok} VM${ok === 1 ? "" : "s"}.`);
+    clearVmSelection();
+  } else if (ok === 0) {
+    showToast(`Move failed for all ${failed} VM${failed === 1 ? "" : "s"}.`);
+  } else {
+    showToast(`Moved ${ok}, failed ${failed}. See console for details.`);
+    // Drop the successes from the selection; keep the failures so
+    // the user can retry without ticking them again.
+    for (const id of ids) {
+      if (vmFolderPending.vms[id] === undefined) vmSelection.delete(id);
+    }
+    refreshVmSelectionBar();
   }
 }
 
@@ -1937,20 +2110,41 @@ function promptDeleteVmFolder(path) {
 // plus an "(Uncategorize)" item and a "(New folder...)" escape hatch
 // that falls back to the existing prompt-driven flow.
 function promptMoveVmToFolder(vmUuid, anchor) {
+  promptMoveVmsToFolder([vmUuid], anchor);
+}
+
+function promptMoveVmsToFolder(vmUuids, anchor) {
   if (!vmFoldersAvailable()) return;
-  const liveVm = getVmByUuid(vmUuid);
-  if (!liveVm) {
-    showToast("VM not found in the current list.");
+  const ids = Array.isArray(vmUuids) ? vmUuids.filter(Boolean) : [];
+  if (!ids.length) return;
+  // Resolve a representative VM for header/labelling and figure
+  // out whether every VM shares the same current folder (so the
+  // picker can show "current" correctly).
+  const liveVms = ids.map((u) => getVmByUuid(u)).filter(Boolean);
+  if (!liveVms.length) {
+    showToast("Selected VMs are no longer visible.");
     return;
   }
-  const current = getVmFolderPath(liveVm);
+  const liveVm = liveVms[0];
+  const headerLabel = ids.length === 1
+    ? `Move "${liveVm.name || ids[0]}" to...`
+    : `Move ${ids.length} VMs to...`;
+  const currents = new Set(liveVms.map((vm) => getVmFolderPath(vm)));
+  const current = currents.size === 1 ? Array.from(currents)[0] : "";
   const paths = effectiveVmFolderPaths();
+  const submit = (target) => {
+    if (ids.length === 1) {
+      moveVmToFolderOptimistic(ids[0], target);
+    } else {
+      moveVmsToFolderOptimistic(ids, target);
+    }
+  };
 
   ctxMenu.innerHTML = "";
 
   const header = document.createElement("div");
   header.className = "ctx-menu-header";
-  header.textContent = `Move "${liveVm.name || vmUuid}" to...`;
+  header.textContent = headerLabel;
   ctxMenu.appendChild(header);
 
   const addItem = (label, opts) => {
@@ -1961,7 +2155,11 @@ function promptMoveVmToFolder(vmUuid, anchor) {
     const indent = opts && opts.depth ? "&nbsp;".repeat(opts.depth * 3) : "";
     item.innerHTML = `<span class="ctx-icon">${icon}</span><span>${indent}${escapeHtml(label)}</span>`;
     if (!opts || !opts.disabled) {
-      item.addEventListener("click", () => {
+      item.addEventListener("click", (event) => {
+        // stopPropagation defends against the document-level outside-
+        // click handler racing with hideContextMenu() and re-hiding
+        // the menu while the click is still bubbling.
+        event.stopPropagation();
         hideContextMenu();
         opts && opts.onClick && opts.onClick();
       });
@@ -1972,7 +2170,16 @@ function promptMoveVmToFolder(vmUuid, anchor) {
   if (current) {
     addItem(`(Uncategorize — currently in "${current}")`, {
       icon: "○",
-      onClick: () => moveVmToFolderOptimistic(vmUuid, "")
+      onClick: () => submit("")
+    });
+    const sep = document.createElement("div");
+    sep.className = "ctx-menu-sep";
+    ctxMenu.appendChild(sep);
+  } else if (ids.length > 1 && currents.size > 1) {
+    // Mixed source folders -- still offer a way to uncategorize them all.
+    addItem("(Uncategorize all)", {
+      icon: "○",
+      onClick: () => submit("")
     });
     const sep = document.createElement("div");
     sep.className = "ctx-menu-sep";
@@ -1989,7 +2196,7 @@ function promptMoveVmToFolder(vmUuid, anchor) {
         icon: isCurrent ? "✓" : "▸",
         depth,
         disabled: isCurrent,
-        onClick: () => moveVmToFolderOptimistic(vmUuid, p)
+        onClick: () => submit(p)
       });
     }
   }
@@ -2007,7 +2214,7 @@ function promptMoveVmToFolder(vmUuid, anchor) {
       if (next === null) return;
       const path = String(next).trim();
       if (!path) return;
-      moveVmToFolderOptimistic(vmUuid, path);
+      submit(path);
     }
   });
 
@@ -2153,6 +2360,8 @@ function logout() {
   for (const k of Object.keys(vmFolderPending.folders)) delete vmFolderPending.folders[k];
   for (const k of Object.keys(vmFolderPending.vms)) delete vmFolderPending.vms[k];
   for (const k of Object.keys(vmFolderPending.receiving)) delete vmFolderPending.receiving[k];
+  vmSelection.clear();
+  refreshVmSelectionBar();
   renderAll();
   renderVmFolderTree();
   closeShowAll();
@@ -3465,13 +3674,27 @@ function showVmContextMenu(x, y, vmUuid) {
     const moveItem = document.createElement("div");
     moveItem.className = "ctx-menu-item";
     moveItem.dataset.feature = "vmFolders";
-    moveItem.innerHTML = '<span class="ctx-icon">▸</span><span>Move to folder...</span>';
-    moveItem.addEventListener("click", () => {
+    // If the right-clicked VM is part of a multi-select set, offer
+    // a bulk-move action that targets the entire selection.
+    const bulk = vmSelection.size > 1 && vmSelection.has(vmUuid);
+    const moveLabel = bulk
+      ? `Move ${vmSelection.size} selected to folder...`
+      : "Move to folder...";
+    moveItem.innerHTML = `<span class="ctx-icon">▸</span><span>${escapeHtml(moveLabel)}</span>`;
+    moveItem.addEventListener("click", (event) => {
       // Re-open the same menu in folder-picker mode at the same
-      // anchor point so the dropdown appears in place. hideContextMenu()
-      // here would race with the picker rendering, so promptMoveVmToFolder
-      // does its own innerHTML reset.
-      promptMoveVmToFolder(vmUuid, { x, y });
+      // anchor. CRITICAL: stop the click from bubbling to the
+      // document-level "outside click" handler below -- otherwise
+      // that handler runs AFTER we replace ctxMenu.innerHTML with
+      // the picker, sees its original event.target detached from
+      // the DOM, decides the click was "outside" the menu, and
+      // promptly hides the picker we just opened.
+      event.stopPropagation();
+      if (bulk) {
+        promptMoveVmsToFolder(Array.from(vmSelection), { x, y });
+      } else {
+        promptMoveVmToFolder(vmUuid, { x, y });
+      }
     });
     ctxMenu.appendChild(moveItem);
 
@@ -4040,8 +4263,15 @@ const featureFlags = {
     // the latest folder catalog from Prism so the pane isn't empty.
     if (typeof renderVmFolderTree === "function") {
       try {
+        // Toggle a body class so CSS can widen the VM-row grid to
+        // make room for the multi-select checkbox column without
+        // affecting GA mode.
+        const on = featureFlags.isEnabled("vmFolders");
+        document.body.classList.toggle("vm-folders-on", !!on);
+        if (!on) clearVmSelection();
         renderVmFolderTree();
-        if (featureFlags.isEnabled("vmFolders") &&
+        refreshVmSelectionBar();
+        if (on &&
             session && session.loggedIn &&
             (!vmFolderTree || vmFolderTree.length === 0)) {
           refreshVmFolderTree({ silent: true });
@@ -4051,6 +4281,23 @@ const featureFlags = {
     }
   }
 };
+
+// Wire the multi-select toolbar buttons once at startup. The bar
+// itself stays hidden via data-feature="vmFolders" + the hidden
+// attribute until at least one VM is checked.
+if (vmSelectionClearBtn) {
+  vmSelectionClearBtn.addEventListener("click", () => clearVmSelection());
+}
+if (vmSelectionMoveBtn) {
+  vmSelectionMoveBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!vmSelection.size) return;
+    const ids = Array.from(vmSelection);
+    // Anchor near the button so the picker pops near the action.
+    const rect = vmSelectionMoveBtn.getBoundingClientRect();
+    promptMoveVmsToFolder(ids, { x: rect.left, y: rect.bottom + 4 });
+  });
+}
 
 // =====================================================================
 // Settings dialog
