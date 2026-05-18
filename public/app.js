@@ -1720,15 +1720,17 @@ async function renameVmFolder(path, newName) {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Failed to rename folder.");
-    delete vmFolderPending.folders[path];
-    delete vmFolderPending.folders[newPath];
-    rollback.commit();
     if (vmFolderSelected === path) {
       vmFolderSelected = newPath;
       saveVmFolderPrefs();
     }
     await refreshVmFolderTree({ silent: true });
     await refreshVmsInBackground();
+    delete vmFolderPending.folders[path];
+    delete vmFolderPending.folders[newPath];
+    rollback.commit();
+    renderVmFolderTree();
+    renderVmList();
     showToast(`Renamed to "${newPath}".`);
     return true;
   } catch (error) {
@@ -1773,15 +1775,17 @@ async function moveVmFolder(path, newParentPath) {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Failed to move folder.");
-    delete vmFolderPending.folders[path];
-    delete vmFolderPending.folders[newPath];
-    rollback.commit();
     if (vmFolderSelected === path) {
       vmFolderSelected = newPath;
       saveVmFolderPrefs();
     }
     await refreshVmFolderTree({ silent: true });
     await refreshVmsInBackground();
+    delete vmFolderPending.folders[path];
+    delete vmFolderPending.folders[newPath];
+    rollback.commit();
+    renderVmFolderTree();
+    renderVmList();
     showToast(`Moved to "${newPath}".`);
     return true;
   } catch (error) {
@@ -1813,14 +1817,16 @@ async function deleteVmFolder(path) {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Failed to delete folder.");
-    delete vmFolderPending.folders[path];
-    rollback.commit();
     if (vmFolderSelected === path || (vmFolderSelected && folderPathIsAtOrBelow(vmFolderSelected, path))) {
       vmFolderSelected = null;
       saveVmFolderPrefs();
     }
     await refreshVmFolderTree({ silent: true });
     await refreshVmsInBackground();
+    delete vmFolderPending.folders[path];
+    rollback.commit();
+    renderVmFolderTree();
+    renderVmList();
     const moved = Array.isArray(data.moved) ? data.moved.length : 0;
     showToast(`Deleted "${path}" (${moved} VM${moved === 1 ? "" : "s"} uncategorized).`);
     return true;
@@ -1997,21 +2003,19 @@ async function moveVmsToFolderOptimistic(vmUuids, folderPath) {
 // back (restore the previous pending map) on server failure.
 function stashOptimisticVmMoves(matcher, rewrite) {
   const prev = { ...vmFolderPending.vms };
+  const touched = new Set();
   for (const vm of vmCache) {
     const path = getVmFolderPath(vm);
     if (matcher(path)) {
       vmFolderPending.vms[vm.uuid] = rewrite(path);
+      touched.add(vm.uuid);
     }
   }
   return {
     commit() {
       // Clear the optimistic entries we set; the next vm-list refresh
       // is authoritative.
-      for (const vm of vmCache) {
-        if (matcher(getVmFolderPath(vm))) {
-          delete vmFolderPending.vms[vm.uuid];
-        }
-      }
+      for (const uuid of touched) delete vmFolderPending.vms[uuid];
     },
     rollback() {
       vmFolderPending.vms = { ...prev };

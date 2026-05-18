@@ -5470,6 +5470,7 @@ async function moveVmsAcrossFolders(client, predicate, rewrite, includeHidden = 
     const info = extractV4PageInfo(resp);
     if (!info.totalAvailableResults || all.length >= info.totalAvailableResults || page.length < 100) break;
   }
+  await hydrateVmFolderCategories(client, all);
 
   const results = [];
   for (const vm of all) {
