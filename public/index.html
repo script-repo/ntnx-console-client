@@ -1589,8 +1589,18 @@
 
       /* Settings modal: a wider variant of the standard modal with
          section dividers and grid-aligned label/control rows. */
-      .settings-modal { width: 520px; }
-      .settings-modal-body { gap: 0; padding: 0; }
+      .settings-modal {
+        width: 520px;
+        max-height: calc(100vh - 32px);
+        display: flex;
+        flex-direction: column;
+      }
+      .settings-modal-body {
+        gap: 0;
+        padding: 0;
+        min-height: 0;
+        overflow-y: auto;
+      }
       .settings-section {
         padding: 16px 18px;
         border-bottom: 1px solid var(--ntx-border);
