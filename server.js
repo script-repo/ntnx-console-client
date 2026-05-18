@@ -45,10 +45,14 @@ const VM_INVENTORY_CACHE_TTL_MS = Math.max(
   5_000,
   Number(process.env.NRCC_VM_INVENTORY_CACHE_TTL_MS || 30_000)
 );
-const VM_INVENTORY_PAGE_SIZE = Math.max(
+const VM_INVENTORY_REQUESTED_PAGE_SIZE = Math.max(
   100,
   Number(process.env.NRCC_VM_INVENTORY_PAGE_SIZE || 200)
 );
+// Prism VMM v4 rejects $limit > 100 on some builds. Keep the requested
+// knob for future-compatible clusters, but cap the effective value so
+// VM enumeration never fails during the variant probe sweep.
+const VM_INVENTORY_PAGE_SIZE = Math.min(VM_INVENTORY_REQUESTED_PAGE_SIZE, 100);
 const vmInventoryCache = new Map();
 const vmInventoryEnrichmentJobs = new Map();
 
