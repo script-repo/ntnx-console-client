@@ -558,25 +558,24 @@ If `guacd` lives on a different host or port, point NRCC at it with `NRCC_GUACD_
 
 ### Beta: VM folders
 
-A fourth beta feature (`vmFolders`) layers a vCenter-style folder tree on top of NRCC's sidebar VM list. Folders are backed by a single reserved Prism category key — **`NTNXFolderPath`** — and nesting uses dot-delimited paths (`Production.Linux.Web`). The folder tree is rendered directly from Prism's category catalog, so the membership is shared across users, survives an NRCC reinstall, and is visible in the Prism UI's category browser too.
+A fourth beta feature (`vmFolders`) layers a vCenter-style folder tree on top of NRCC's sidebar VM list. **VM folders are server-side, persisted in Prism Central's `categories_mapping` under a single reserved key — `NTNXFolderPath` — and nesting uses dot-delimited paths (`Production.Linux.Web`).** Because the tree lives in Prism's category catalog it is shared across users, survives an NRCC reinstall, and is visible in the Prism UI's category browser too. (This is intentionally different from **Favorites**, which remain a per-browser construct managed by NRCC alone and never touch Prism.)
 
 The whole pane is hidden until the user enables **Show beta features** in Settings AND the operator has left `NRCC_VM_FOLDERS_ENABLED=true` on the server. Everything else NRCC has shipped before — favorites, search, power-state filter, port-scan pills, the SSH/RDP right-click items, drag into favorites folders, console tabs — continues to work unchanged.
 
 **What you see**
 
-A **Folders** section appears in the sidebar between the existing **Favorites** tree and the flat **VMs** list. The header has **Refresh** (re-pull the catalog from Prism) and **+ Folder** (create a top-level folder). The tree is preceded by two pseudo-rows:
+A **VM Folders** section appears in the sidebar between the existing **Favorites** tree and the flat **VMs** list. The header has **Refresh** (re-pull the catalog from Prism) and **+ Folder** (create a top-level folder). The tree is preceded by one pseudo-row:
 
-- **All VMs** — selects the full inventory; the bottom VM list is unchanged from today.
-- **Uncategorized** — VMs that have no `NTNXFolderPath` category. Drop a VM here to clear its folder.
+- **Unfiled** — VMs that have no `NTNXFolderPath` category. This is the default view and **the main VM list shows only these VMs**; once a VM is moved into a folder it disappears from the main list and only shows up when that folder (or one of its ancestors) is selected. Drop a VM here to clear its folder.
 
 Selecting a real folder narrows the VM list to that folder *and every subfolder* (so picking `Production` shows everything under `Production.*`). Selecting a folder also clears the search box, so you get the whole subtree without having to remove a stale filter first. The count next to each folder is the subtree-inclusive VM count, computed locally from the current `vmCache`.
 
 **What you can do**
 
 - **Drag a VM onto a folder** to move it. The same drag payload format (`text/x-nrcc-item` = `vm:<uuid>`) is reused — dropping on a favorites folder still bookmarks the VM (existing behaviour); dropping on a VM-folder row Prism-categorizes it (new behaviour). The two trees are differentiated at the drop target via `data-vm-folder-path`.
-- **Right-click a VM** for **Move to folder...** (opens a small picker prompt) and, when the VM has a folder, **Remove from folder**.
+- **Right-click a VM** for **Move to folder...** (opens an inline **dropdown picker** listing every known folder, indented to reflect nesting, plus an `(Uncategorize)` and a `(New folder...)` escape hatch) and, when the VM has a folder, **Remove from folder**.
 - **Right-click a folder** for **New subfolder**, **Rename**, **Move**, **Delete**. Delete only removes the category and uncategorizes every VM in the subtree — **VMs themselves are never deleted by NRCC**.
-- **Optimistic UI.** Moves, creates, renames, and deletes appear instantly and are reconciled (or rolled back with a toast) after the server call returns.
+- **Optimistic UI with pending highlighting.** Moves, creates, renames, and deletes appear instantly. The destination folder row (and the moving VM row) pulses with an accent-soft highlight until Prism Central confirms the change — on failure the highlight clears and a rollback toast is shown.
 
 **Endpoints (all gated on the server-side master switch)**
 

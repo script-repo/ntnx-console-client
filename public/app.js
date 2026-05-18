@@ -247,18 +247,31 @@ const favStore = {
 // collapsed state are per-browser (localStorage).
 //
 //   vmFolderTree:      [{path, name, parentPath}]
-//   vmFolderSelected:  null = "All VMs", "" = "Uncategorized",
-//                      "<path>" = a specific folder
+//   vmFolderSelected:  null = "Unfiled" (default), "<path>" = a folder.
+//                      Legacy value "" is treated identically to null
+//                      so pre-existing localStorage entries keep
+//                      working.
 //   vmFolderCollapsed: { [path]: true }
 //   vmFolderPending.folders[path]: "creating"|"renaming"|"moving"|"deleting"
 //   vmFolderPending.vms[uuid]:     target folder path (string)
+//   vmFolderPending.receiving[path]: Set-like count of VM moves
+//                      currently in flight targeting <path>. Drives
+//                      the optimistic "receiving" highlight on the
+//                      destination folder row until PC confirms.
 const VM_FOLDER_CATEGORY_KEY = "NTNXFolderPath";
 const VM_FOLDER_PREFS_KEY = "ntnxConsoleVmFolderPrefs.v1";
 
 let vmFolderTree = [];
 let vmFolderSelected = null;
 let vmFolderCollapsed = {};
-const vmFolderPending = { folders: {}, vms: {} };
+const vmFolderPending = { folders: {}, vms: {}, receiving: {} };
+
+function bumpVmFolderReceiving(path, delta) {
+  if (!path) return;
+  const next = (vmFolderPending.receiving[path] || 0) + delta;
+  if (next <= 0) delete vmFolderPending.receiving[path];
+  else vmFolderPending.receiving[path] = next;
+}
 
 function loadVmFolderPrefs() {
   try {
@@ -270,7 +283,10 @@ function loadVmFolderPrefs() {
         vmFolderCollapsed = { ...parsed.collapsed };
       }
       if (parsed.selected === null || typeof parsed.selected === "string") {
-        vmFolderSelected = parsed.selected;
+        // Legacy "" (the old "Uncategorized" pseudo-row) is now merged
+        // into the default "Unfiled" view -- coerce back to null so
+        // the active highlight lands on the right row.
+        vmFolderSelected = parsed.selected === "" ? null : parsed.selected;
       }
     }
   } catch (_e) { /* best-effort */ }
@@ -748,13 +764,13 @@ function normalizePowerState(raw) {
 function applyFilters(vms) {
   const search = nameFilterInput.value.trim().toLowerCase();
   const power = powerStateFilter.value;
-  // Beta: when vmFolders is on AND the user has selected a specific
-  // folder (or Uncategorized), narrow the visible set accordingly.
-  // null means "All VMs" (no folder filter) and is also the value
-  // when the beta feature is disabled, so the early no-op below
-  // keeps the GA experience unchanged.
-  const folderFilterActive =
-    vmFoldersAvailable() && vmFolderSelected !== null;
+  // Beta: when vmFolders is on the main list never shows foldered
+  // VMs unless the user explicitly selects a folder. The default
+  // (vmFolderSelected === null, the "Unfiled" pseudo-row) collapses
+  // to the same semantics as the legacy "Uncategorized" row.
+  // When the beta feature is off, folder state is ignored entirely
+  // so the GA experience is unchanged.
+  const foldersOn = vmFoldersAvailable();
   return vms.filter((vm) => {
     const norm = normalizePowerState(vm.powerState);
     const haystack = [
@@ -772,9 +788,11 @@ function applyFilters(vms) {
     const nameOk = !search || haystack.includes(search);
     const powerOk = !power || norm === power;
     if (!(nameOk && powerOk)) return false;
-    if (!folderFilterActive) return true;
+    if (!foldersOn) return true;
     const vmPath = getVmFolderPath(vm);
-    if (vmFolderSelected === "") return !vmPath; // Uncategorized
+    // Default view ("Unfiled") and the legacy "" key both mean
+    // "VMs not assigned to any folder".
+    if (vmFolderSelected === null || vmFolderSelected === "") return !vmPath;
     return vmPath === vmFolderSelected || vmPath.startsWith(`${vmFolderSelected}.`);
   });
 }
@@ -916,6 +934,12 @@ function createVmRow(vm, opts = {}) {
   row.className = "vm-row";
   row.dataset.vmUuid = vm.uuid;
   row.draggable = !!opts.draggable;
+  // Beta: vmFolders. Highlight rows whose folder move is still
+  // waiting for Prism confirmation. The class is harmless when the
+  // beta is off because vmFolderPending stays empty.
+  if (vmFolderPending.vms[vm.uuid] !== undefined) {
+    row.classList.add("is-pending-move");
+  }
   const isLive = !!getVmByUuid(vm.uuid);
   const fav = isFavorite(vm.uuid);
   const normPower = normalizePowerState(vm.powerState);
@@ -1284,10 +1308,9 @@ function setVmFolderCollapsed(path, collapsed) {
 // Aggregate the per-folder VM count (subtree inclusive) so the
 // sidebar shows a meaningful number next to each folder.
 function computeFolderCounts() {
-  const counts = { __all: 0, __uncategorized: 0 };
+  const counts = { __uncategorized: 0 };
   const subtreeCounts = new Map();
   for (const vm of vmCache) {
-    counts.__all += 1;
     const path = getVmFolderPath(vm);
     if (!path) {
       counts.__uncategorized += 1;
@@ -1347,24 +1370,19 @@ function renderVmFolderTree() {
 
   const { counts, subtreeCounts } = computeFolderCounts();
 
-  // "All VMs" pseudo-row.
+  // Single "Unfiled" pseudo-row: selecting it (the default) shows
+  // every VM that hasn't been assigned to a folder. Foldered VMs
+  // never appear in the main VM list except when their folder is
+  // explicitly selected. It also doubles as a drop target so
+  // dragging a VM here uncategorizes it.
   vmFolderTreeEl.appendChild(
     createVmFolderSpecialRow({
-      label: "All VMs",
-      count: counts.__all,
-      isSelected: vmFolderSelected === null,
-      onClick: () => selectVmFolder(null)
-    })
-  );
-  // "Uncategorized" pseudo-row.
-  vmFolderTreeEl.appendChild(
-    createVmFolderSpecialRow({
-      label: "Uncategorized",
+      label: "Unfiled",
       count: counts.__uncategorized,
-      isSelected: vmFolderSelected === "",
+      isSelected: vmFolderSelected === null || vmFolderSelected === "",
       isDropTarget: true,
       dropPath: "",
-      onClick: () => selectVmFolder("")
+      onClick: () => selectVmFolder(null)
     })
   );
 
@@ -1407,7 +1425,11 @@ function createVmFolderRow(path, depth, childIndex, subtreeCounts) {
   wrap.className = "fav-folder";
   wrap.dataset.vmFolderPath = path;
   if (isVmFolderCollapsed(path)) wrap.classList.add("collapsed");
-  if (vmFolderPending.folders[path]) wrap.classList.add("is-loading");
+  // Pending Prism operations on the folder itself (create / rename /
+  // move / delete) and any in-flight VM moves into it both light up
+  // the row until PC confirms.
+  if (vmFolderPending.folders[path]) wrap.classList.add("is-pending");
+  if (vmFolderPending.receiving[path]) wrap.classList.add("is-receiving");
 
   const parts = path.split(".");
   const name = parts[parts.length - 1];
@@ -1523,7 +1545,7 @@ async function refreshVmFolderTree({ silent = false } = {}) {
     if (!resp.ok) throw new Error(data.error || "Failed to list folders.");
     vmFolderTree = Array.isArray(data.folders) ? data.folders : [];
     // If the previously-selected folder was deleted out from under us,
-    // fall back to "All VMs".
+    // fall back to the default "Unfiled" view.
     if (vmFolderSelected && !vmFolderTree.some((f) => f.path === vmFolderSelected)) {
       vmFolderSelected = null;
       saveVmFolderPrefs();
@@ -1726,6 +1748,11 @@ async function moveVmToFolderOptimistic(vmUuid, folderPath) {
     }
   }
   vmFolderPending.vms[vmUuid] = target;
+  // Optimistic highlight: light up the destination folder row (and
+  // every ancestor in the subtree count) so the user sees where the
+  // VM will land while the Prism call is still in flight. Cleared
+  // in both the success and failure paths below.
+  if (target) bumpVmFolderReceiving(target, 1);
   renderVmFolderTree();
   renderVmList();
   try {
@@ -1742,12 +1769,14 @@ async function moveVmToFolderOptimistic(vmUuid, folderPath) {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Failed to move VM.");
     delete vmFolderPending.vms[vmUuid];
+    if (target) bumpVmFolderReceiving(target, -1);
     // Refresh the VM list so categories[] is authoritative again.
     await refreshVmsInBackground();
     await refreshVmFolderTree({ silent: true });
     showToast(target ? `Moved to "${target}".` : "VM uncategorized.");
   } catch (error) {
     delete vmFolderPending.vms[vmUuid];
+    if (target) bumpVmFolderReceiving(target, -1);
     renderVmFolderTree();
     renderVmList();
     showToast(`Move failed: ${error.message}`);
@@ -1902,10 +1931,12 @@ function promptDeleteVmFolder(path) {
   deleteVmFolder(path);
 }
 
-// Pick-a-folder modal (lightweight: a window.prompt with the current
-// folder pre-filled, mirroring the move-folder flow). Reuses the
-// existing validators so the user can't ship a malformed path.
-function promptMoveVmToFolder(vmUuid) {
+// Pick-a-folder dropdown: opens the shared ctxMenu in "folder picker"
+// mode at a screen-anchored position. Each item is one of the known
+// folder paths (subtree-flattened, indented to reflect nesting),
+// plus an "(Uncategorize)" item and a "(New folder...)" escape hatch
+// that falls back to the existing prompt-driven flow.
+function promptMoveVmToFolder(vmUuid, anchor) {
   if (!vmFoldersAvailable()) return;
   const liveVm = getVmByUuid(vmUuid);
   if (!liveVm) {
@@ -1913,13 +1944,91 @@ function promptMoveVmToFolder(vmUuid) {
     return;
   }
   const current = getVmFolderPath(liveVm);
-  const help =
-    "Enter the destination folder path.\n" +
-    "Examples: \"Production\", \"Production.Linux.Web\".\n" +
-    "Leave blank to uncategorize.";
-  const dest = window.prompt(`${help}\n\nCurrent: ${current || "(uncategorized)"}`, current);
-  if (dest === null) return;
-  moveVmToFolderOptimistic(vmUuid, String(dest).trim());
+  const paths = effectiveVmFolderPaths();
+
+  ctxMenu.innerHTML = "";
+
+  const header = document.createElement("div");
+  header.className = "ctx-menu-header";
+  header.textContent = `Move "${liveVm.name || vmUuid}" to...`;
+  ctxMenu.appendChild(header);
+
+  const addItem = (label, opts) => {
+    const item = document.createElement("div");
+    item.className = "ctx-menu-item";
+    if (opts && opts.disabled) item.classList.add("disabled");
+    const icon = opts && opts.icon ? opts.icon : "·";
+    const indent = opts && opts.depth ? "&nbsp;".repeat(opts.depth * 3) : "";
+    item.innerHTML = `<span class="ctx-icon">${icon}</span><span>${indent}${escapeHtml(label)}</span>`;
+    if (!opts || !opts.disabled) {
+      item.addEventListener("click", () => {
+        hideContextMenu();
+        opts && opts.onClick && opts.onClick();
+      });
+    }
+    ctxMenu.appendChild(item);
+  };
+
+  if (current) {
+    addItem(`(Uncategorize — currently in "${current}")`, {
+      icon: "○",
+      onClick: () => moveVmToFolderOptimistic(vmUuid, "")
+    });
+    const sep = document.createElement("div");
+    sep.className = "ctx-menu-sep";
+    ctxMenu.appendChild(sep);
+  }
+
+  if (!paths.length) {
+    addItem("No folders defined yet", { disabled: true });
+  } else {
+    for (const p of paths) {
+      const depth = p.split(".").length - 1;
+      const isCurrent = p === current;
+      addItem(p.split(".").pop() + (isCurrent ? "  (current)" : ""), {
+        icon: isCurrent ? "✓" : "▸",
+        depth,
+        disabled: isCurrent,
+        onClick: () => moveVmToFolderOptimistic(vmUuid, p)
+      });
+    }
+  }
+
+  const sep2 = document.createElement("div");
+  sep2.className = "ctx-menu-sep";
+  ctxMenu.appendChild(sep2);
+  addItem("New folder...", {
+    icon: "+",
+    onClick: () => {
+      const next = window.prompt(
+        "New folder path (dot-separated for nesting):",
+        current || ""
+      );
+      if (next === null) return;
+      const path = String(next).trim();
+      if (!path) return;
+      moveVmToFolderOptimistic(vmUuid, path);
+    }
+  });
+
+  // Anchor near the original right-click point if provided; otherwise
+  // pop the menu in the center so it's never off-screen.
+  const x = (anchor && typeof anchor.x === "number")
+    ? anchor.x
+    : Math.max(8, Math.round(window.innerWidth / 2 - 100));
+  const y = (anchor && typeof anchor.y === "number")
+    ? anchor.y
+    : Math.max(8, Math.round(window.innerHeight / 2 - 80));
+  ctxMenu.style.left = `${x}px`;
+  ctxMenu.style.top = `${y}px`;
+  ctxMenu.classList.add("open");
+  const rect = ctxMenu.getBoundingClientRect();
+  if (rect.right > window.innerWidth - 4) {
+    ctxMenu.style.left = `${Math.max(4, window.innerWidth - rect.width - 4)}px`;
+  }
+  if (rect.bottom > window.innerHeight - 4) {
+    ctxMenu.style.top = `${Math.max(4, window.innerHeight - rect.height - 4)}px`;
+  }
 }
 
 // Button wiring for the folder pane header.
@@ -2043,6 +2152,7 @@ function logout() {
   vmFolderTree = [];
   for (const k of Object.keys(vmFolderPending.folders)) delete vmFolderPending.folders[k];
   for (const k of Object.keys(vmFolderPending.vms)) delete vmFolderPending.vms[k];
+  for (const k of Object.keys(vmFolderPending.receiving)) delete vmFolderPending.receiving[k];
   renderAll();
   renderVmFolderTree();
   closeShowAll();
@@ -3357,8 +3467,11 @@ function showVmContextMenu(x, y, vmUuid) {
     moveItem.dataset.feature = "vmFolders";
     moveItem.innerHTML = '<span class="ctx-icon">▸</span><span>Move to folder...</span>';
     moveItem.addEventListener("click", () => {
-      hideContextMenu();
-      promptMoveVmToFolder(vmUuid);
+      // Re-open the same menu in folder-picker mode at the same
+      // anchor point so the dropdown appears in place. hideContextMenu()
+      // here would race with the picker rendering, so promptMoveVmToFolder
+      // does its own innerHTML reset.
+      promptMoveVmToFolder(vmUuid, { x, y });
     });
     ctxMenu.appendChild(moveItem);
 

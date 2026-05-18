@@ -638,6 +638,28 @@
       .fav-folder.dragging {
         opacity: 0.4;
       }
+      /* Optimistic-update highlight: a folder row (or VM row) that has
+         a pending Prism call still in flight. The visual cue stays
+         until the server confirms (or rolls back) so users see
+         exactly where their item will land before PC catches up.
+         Reuses the existing accent-soft surface from drag-over so the
+         vocabulary is familiar. */
+      .fav-folder.is-pending > .fav-folder-header,
+      .fav-folder.is-receiving > .fav-folder-header {
+        background: var(--ntx-accent-soft);
+        box-shadow: inset 3px 0 0 0 var(--ntx-accent);
+        animation: nrcc-pending-pulse 1.6s ease-in-out infinite;
+      }
+      .vm-row.is-pending-move .vm-item {
+        background: var(--ntx-accent-soft);
+        box-shadow: inset 3px 0 0 0 var(--ntx-accent);
+        opacity: 0.85;
+        animation: nrcc-pending-pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes nrcc-pending-pulse {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.65; }
+      }
 
       #status {
         margin-bottom: 12px;
@@ -3362,7 +3384,7 @@
                      via the data-feature attribute. -->
                 <div data-feature="vmFolders" id="vmFoldersPane" hidden>
                   <div class="section-title-row" style="margin-top:14px">
-                    <div class="section-title">Folders</div>
+                    <div class="section-title">VM Folders</div>
                     <button id="vmFolderRefreshBtn" type="button" class="link-button" title="Refresh folder tree from Prism">Refresh</button>
                     <button id="vmFolderAddBtn" type="button" class="link-button" title="Add a top-level folder">+ Folder</button>
                   </div>
