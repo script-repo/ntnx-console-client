@@ -3111,6 +3111,52 @@ function mergeFolderCategory(categories, folderPath) {
   return normalized ? [...rest, `${FOLDER_CATEGORY_KEY}:${normalized}`] : rest;
 }
 
+async function hydrateBaseVmFolderCategories(client, vms) {
+  if (!VM_FOLDERS_ENABLED || !Array.isArray(vms) || !vms.length) return vms;
+  const byUuid = new Map(vms.map((vm) => [String(vm.uuid || "").toLowerCase(), vm]));
+  let offset = 0;
+  let merged = 0;
+  const length = 500;
+  try {
+    for (let page = 0; page < 20; page += 1) {
+      const resp = await client.post(
+        "/api/nutanix/v3/vms/list",
+        { kind: "vm", offset, length },
+        { timeout: PRISM_HTTP_TIMEOUT_MS }
+      );
+      const entities = resp?.data?.entities || resp?.data?.data || [];
+      if (!Array.isArray(entities) || !entities.length) break;
+      for (const entity of entities) {
+        const uuid = String(
+          entity?.metadata?.uuid ||
+          entity?.metadata?.extId ||
+          entity?.metadata?.entity_uuid ||
+          entity?.uuid ||
+          ""
+        ).toLowerCase();
+        const vm = byUuid.get(uuid);
+        if (!vm) continue;
+        const folderPath = folderPathFromCategories(categoriesFromVmDetail(entity));
+        if (!folderPath) continue;
+        vm.categories = mergeFolderCategory(vm.categories, folderPath);
+        merged += 1;
+      }
+      const total =
+        Number(resp?.data?.metadata?.total_matches) ||
+        Number(resp?.data?.metadata?.total) ||
+        0;
+      if (entities.length < length || (total && offset + length >= total)) break;
+      offset += length;
+    }
+  } catch (err) {
+    console.warn(`[vm-folders] base category metadata pass skipped: ${err.message || err}`);
+  }
+  if (merged) {
+    console.log(`[vm-folders] merged NTNXFolderPath categories into base inventory for ${merged} VM(s)`);
+  }
+  return vms;
+}
+
 async function hydrateVmFolderCategories(client, vms) {
   if (!VM_FOLDERS_ENABLED || !Array.isArray(vms) || !vms.length) return vms;
   const queue = vms.slice();
@@ -4344,6 +4390,7 @@ async function enumerateBaseVms(client, includeHiddenVms) {
   const deduped = Array.from(
     new Map(allVms.map((vm) => [vm.uuid, vm])).values()
   ).sort((a, b) => a.name.localeCompare(b.name));
+  await hydrateBaseVmFolderCategories(client, deduped);
   return { vms: deduped, selectedVariant, pageSize };
 }
 
