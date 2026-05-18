@@ -2987,18 +2987,28 @@ function parseVmList(vmResponse) {
         vm?.categories,
         vm?.categories_mapping,
         vm?.categoriesMapping,
+        vm?.categoryReferences,
+        vm?.category_reference_list,
         vm?.metadata?.categories,
         vm?.metadata?.categories_mapping,
         vm?.metadata?.categoriesMapping,
+        vm?.metadata?.categoryReferences,
+        vm?.metadata?.category_reference_list,
         vm?.status?.resources?.categories,
         vm?.status?.resources?.categories_mapping,
         vm?.status?.resources?.categoriesMapping,
+        vm?.status?.resources?.categoryReferences,
+        vm?.status?.resources?.category_reference_list,
         vm?.spec?.resources?.categories,
         vm?.spec?.resources?.categories_mapping,
         vm?.spec?.resources?.categoriesMapping,
+        vm?.spec?.resources?.categoryReferences,
+        vm?.spec?.resources?.category_reference_list,
         vm?.spec?.categories,
         vm?.spec?.categories_mapping,
-        vm?.spec?.categoriesMapping
+        vm?.spec?.categoriesMapping,
+        vm?.spec?.categoryReferences,
+        vm?.spec?.category_reference_list
       );
 
       const resolvedName =
@@ -3046,6 +3056,76 @@ function parseVmList(vmResponse) {
     })
     .filter((vm) => vm.uuid)
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function categoriesFromVmDetail(vm) {
+  if (!vm || typeof vm !== "object") return [];
+  return normalizeVmCategoryEntries(
+    vm?.categories,
+    vm?.categories_mapping,
+    vm?.categoriesMapping,
+    vm?.categoryReferences,
+    vm?.category_reference_list,
+    vm?.metadata?.categories,
+    vm?.metadata?.categories_mapping,
+    vm?.metadata?.categoriesMapping,
+    vm?.metadata?.categoryReferences,
+    vm?.metadata?.category_reference_list,
+    vm?.status?.resources?.categories,
+    vm?.status?.resources?.categories_mapping,
+    vm?.status?.resources?.categoriesMapping,
+    vm?.status?.resources?.categoryReferences,
+    vm?.status?.resources?.category_reference_list,
+    vm?.spec?.resources?.categories,
+    vm?.spec?.resources?.categories_mapping,
+    vm?.spec?.resources?.categoriesMapping,
+    vm?.spec?.resources?.categoryReferences,
+    vm?.spec?.resources?.category_reference_list,
+    vm?.spec?.categories,
+    vm?.spec?.categories_mapping,
+    vm?.spec?.categoriesMapping,
+    vm?.spec?.categoryReferences,
+    vm?.spec?.category_reference_list
+  );
+}
+
+function mergeFolderCategory(categories, folderPath) {
+  const existing = Array.isArray(categories) ? categories : [];
+  const prefix = `${FOLDER_CATEGORY_KEY}:`;
+  const rest = existing.filter((entry) => typeof entry !== "string" || !entry.startsWith(prefix));
+  const normalized = normalizeFolderPath(folderPath);
+  return normalized ? [...rest, `${FOLDER_CATEGORY_KEY}:${normalized}`] : rest;
+}
+
+async function hydrateVmFolderCategories(client, vms) {
+  if (!VM_FOLDERS_ENABLED || !Array.isArray(vms) || !vms.length) return vms;
+  const queue = vms.slice();
+  let hydrated = 0;
+  let failed = 0;
+  const worker = async () => {
+    while (queue.length) {
+      const vm = queue.shift();
+      if (!vm?.uuid) continue;
+      try {
+        const resp = await client.get(`/api/nutanix/v3/vms/${encodeURIComponent(vm.uuid)}`, {
+          timeout: PRISM_HTTP_TIMEOUT_MS
+        });
+        const detail = resp.data || {};
+        const folderPath = folderPathFromCategories(categoriesFromVmDetail(detail));
+        vm.categories = mergeFolderCategory(vm.categories, folderPath);
+        if (folderPath) hydrated += 1;
+      } catch (_err) {
+        // Some special/hidden entities can fail v3 detail lookup. Keep
+        // the list result rather than failing the entire inventory.
+        failed += 1;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, vms.length) }, () => worker()));
+  if (hydrated || failed) {
+    console.log(`[vm-folders] hydrated folder categories for ${hydrated} VM(s); detail failures=${failed}`);
+  }
+  return vms;
 }
 
 function parseGenericEntityList(response) {
@@ -4329,6 +4409,7 @@ app.post("/api/vms", async (req, res) => {
           }
         }
       }
+      await hydrateVmFolderCategories(client, deduped);
       logIpCoverage(deduped, selectedVariant, true);
       return res.json({
         vms: deduped,
@@ -4343,6 +4424,7 @@ app.post("/api/vms", async (req, res) => {
         ]
       });
     }
+    await hydrateVmFolderCategories(client, deduped);
     logIpCoverage(deduped, selectedVariant, false);
     return res.json({
       vms: deduped,
