@@ -1,6 +1,6 @@
 {
   "name": "nrcc",
-  "version": "0.7.0-20260518-01",
+  "version": "0.7.1",
   "description": "Nutanix Remote Console Client (NRCC) — browser-based VM and CVM console launcher for Prism Central / Prism Element.",
   "main": "server.js",
   "scripts": {

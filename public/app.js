@@ -122,6 +122,9 @@ const settingsLoggingEnabledInput = document.getElementById("settingsLoggingEnab
 const settingsLoggingHint = document.getElementById("settingsLoggingHint");
 const settingsLoggingDisabledHint = document.getElementById("settingsLoggingDisabledHint");
 const settingsBetaEnabledInput = document.getElementById("settingsBetaEnabled");
+const settingsBetaFeatureList = document.getElementById("settingsBetaFeatureList");
+const settingsBetaDetails = document.getElementById("settingsBetaDetails");
+const settingsHiddenCvmProbesDisabledInput = document.getElementById("settingsHiddenCvmProbesDisabled");
 const settingsCancelBtn = document.getElementById("settingsCancel");
 const settingsSaveBtn = document.getElementById("settingsSave");
 const settingsVersionLabel = document.getElementById("settingsVersionLabel");
@@ -2315,11 +2318,11 @@ async function login(event) {
   loginSubmitBtn.disabled = true;
   loginSubmitBtn.textContent = "Signing in...";
   try {
-    // Self-signed TLS and hidden / system VMs are always allowed; the
-    // corresponding login-form checkboxes were removed because every
-    // real-world deployment relied on both being on.
+    // Self-signed TLS remains always allowed; hidden/system VM probing
+    // is controlled from Settings because those extra Prism calls can
+    // dominate the first inventory pass in larger environments.
     const tlsSkipVerify = true;
-    const includeHiddenVms = true;
+    const includeHiddenVms = !userPrefs.hiddenCvmProbesDisabled;
     // Fast credential probe (~1-2 s) instead of the full VM list, so
     // the user gets into the app shell quickly. The actual VM list is
     // fetched in the background once the app is visible.
@@ -2387,6 +2390,7 @@ function logout() {
   session.username = "";
   session.password = "";
   session.loggedIn = false;
+  currentVmEnrichmentId = null;
   // Close any open consoles.
   consoleSessions.slice().forEach((s) => closeSession(s.id));
   // Clear in-memory VM cache so the next login starts fresh.
@@ -2432,6 +2436,8 @@ function logout() {
 // VM loading
 // =====================================================================
 
+let currentVmEnrichmentId = null;
+
 function applyVmListResult(data) {
   vmCache = Array.isArray(data.vms) ? data.vms : [];
   isLoadingVms = false;
@@ -2448,10 +2454,11 @@ function applyVmListResult(data) {
   vmPortScanner.scheduleProbe(vmCache);
 
   setStatus(
-    `Loaded ${vmCache.length} VMs` +
+    `${data.inventoryStage === "base" ? "Loaded base inventory for" : "Loaded"} ${vmCache.length} VMs` +
       `${data.hiddenCount ? ` (${data.hiddenCount} hidden/system)` : ""}` +
       ` (${data.cvmCount || 0} CVM)` +
       ` (${data.fsvmCount || 0} FSVM)` +
+      `${data.enrichmentPending ? " - enriching details..." : ""}` +
       `${data.listVariant ? ` via ${data.listVariant}` : ""}.`
   );
 
@@ -2469,8 +2476,38 @@ function applyVmListResult(data) {
   }
 }
 
+async function pollVmInventoryEnrichment(enrichmentId, attempt = 0) {
+  if (!enrichmentId || !session.loggedIn || enrichmentId !== currentVmEnrichmentId) return;
+  try {
+    const resp = await fetch(`/api/vms/enrichment/${encodeURIComponent(enrichmentId)}`, {
+      credentials: "same-origin",
+      cache: "no-store"
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 404 || enrichmentId !== currentVmEnrichmentId) return;
+    if (resp.status === 500) {
+      console.warn("[vm-inventory] enrichment failed", data);
+      setStatus("Loaded base VM inventory. Detail enrichment failed; refresh to retry.");
+      return;
+    }
+    if (data.status === "pending") {
+      const delay = Math.min(5000, 700 + attempt * 400);
+      setTimeout(() => pollVmInventoryEnrichment(enrichmentId, attempt + 1), delay);
+      return;
+    }
+    if (data.status === "done") {
+      currentVmEnrichmentId = null;
+      applyVmListResult(data);
+    }
+  } catch (_e) {
+    const delay = Math.min(5000, 1000 + attempt * 500);
+    setTimeout(() => pollVmInventoryEnrichment(enrichmentId, attempt + 1), delay);
+  }
+}
+
 async function refreshVmsInBackground() {
   if (!session.loggedIn) return;
+  currentVmEnrichmentId = null;
   isLoadingVms = true;
   setStatus("Refreshing VM list...", { spinner: true });
   renderVmList();
@@ -2484,7 +2521,8 @@ async function refreshVmsInBackground() {
         username: session.username,
         password: session.password,
         tlsSkipVerify: session.tlsSkipVerify,
-        includeHiddenVms: session.includeHiddenVms
+        includeHiddenVms: session.includeHiddenVms,
+        hydrateVmFolders: featureFlags.isEnabled("vmFolders")
       })
     });
     const data = await resp.json();
@@ -2493,6 +2531,12 @@ async function refreshVmsInBackground() {
       throw new Error((data.error || "Failed to refresh VMs.") + detailText);
     }
     applyVmListResult(data);
+    if (data.enrichmentId) {
+      currentVmEnrichmentId = data.enrichmentId;
+      pollVmInventoryEnrichment(data.enrichmentId);
+    } else {
+      currentVmEnrichmentId = null;
+    }
   } catch (error) {
     isLoadingVms = false;
     setStatus(`Error refreshing VMs: ${error.message}`);
@@ -4166,7 +4210,9 @@ const userPrefs = {
   theme: "light",
   idleTimeoutMin: 15,
   loggingEnabled: false,
-  betaFeaturesEnabled: false
+  betaFeaturesEnabled: false,
+  betaFeatureEnabled: {},
+  hiddenCvmProbesDisabled: false
 };
 
 function loadUserPrefs() {
@@ -4185,6 +4231,12 @@ function loadUserPrefs() {
       if (typeof parsed.betaFeaturesEnabled === "boolean") {
         userPrefs.betaFeaturesEnabled = parsed.betaFeaturesEnabled;
       }
+      if (parsed.betaFeatureEnabled && typeof parsed.betaFeatureEnabled === "object") {
+        userPrefs.betaFeatureEnabled = { ...parsed.betaFeatureEnabled };
+      }
+      if (typeof parsed.hiddenCvmProbesDisabled === "boolean") {
+        userPrefs.hiddenCvmProbesDisabled = parsed.hiddenCvmProbesDisabled;
+      }
     }
   } catch (_e) {
     /* corrupted JSON shouldn't break the app */
@@ -4193,6 +4245,9 @@ function loadUserPrefs() {
 
 function saveUserPrefs(patch) {
   Object.assign(userPrefs, patch || {});
+  if (!userPrefs.betaFeatureEnabled || typeof userPrefs.betaFeatureEnabled !== "object") {
+    userPrefs.betaFeatureEnabled = {};
+  }
   try {
     localStorage.setItem(userPrefsStorageKey, JSON.stringify(userPrefs));
   } catch (_e) {
@@ -4288,7 +4343,9 @@ const featureFlags = {
     const entry = appConfig.featureFlags && appConfig.featureFlags[id];
     const stage = entry && typeof entry.stage === "string" ? entry.stage : "ga";
     if (stage === "ga") return true;
-    return Boolean(userPrefs.betaFeaturesEnabled);
+    if (!userPrefs.betaFeaturesEnabled) return false;
+    const perFeature = userPrefs.betaFeatureEnabled || {};
+    return perFeature[id] !== false;
   },
   refresh() {
     document.querySelectorAll("[data-feature]").forEach((el) => {
@@ -4496,6 +4553,47 @@ function refreshSettingsUpdateButton() {
   }
 }
 
+function prettyFeatureName(id) {
+  const names = {
+    vmPortScan: "VM port scanning",
+    sshConsole: "SSH console",
+    rdpConsole: "RDP console",
+    vmFolders: "VM folders"
+  };
+  return names[id] || String(id).replace(/([a-z])([A-Z])/g, "$1 $2");
+}
+
+function betaFeatureEntries() {
+  return Object.entries(appConfig.featureFlags || {})
+    .filter(([, entry]) => entry && entry.stage === "beta")
+    .sort(([a], [b]) => prettyFeatureName(a).localeCompare(prettyFeatureName(b)));
+}
+
+function renderSettingsBetaFeatureList() {
+  if (!settingsBetaFeatureList) return;
+  settingsBetaFeatureList.innerHTML = "";
+  const entries = betaFeatureEntries();
+  if (!entries.length) {
+    settingsBetaFeatureList.innerHTML = `<p class="settings-hint">No beta features are currently advertised by the server.</p>`;
+    return;
+  }
+  const betaMasterOn = Boolean(settingsBetaEnabledInput && settingsBetaEnabledInput.checked);
+  entries.forEach(([id, entry]) => {
+    const label = document.createElement("label");
+    label.className = "settings-row settings-row-toggle";
+    const checked = (userPrefs.betaFeatureEnabled || {})[id] !== false;
+    label.innerHTML = `
+      <input type="checkbox" data-beta-feature-id="${escapeHtml(id)}" ${checked ? "checked" : ""} ${betaMasterOn ? "" : "disabled"} />
+      <span class="settings-label">
+        ${escapeHtml(prettyFeatureName(id))}
+        <span class="settings-feature-desc">${escapeHtml(entry.description || "")}</span>
+      </span>
+    `;
+    settingsBetaFeatureList.appendChild(label);
+  });
+  if (settingsBetaDetails) settingsBetaDetails.open = Boolean(userPrefs.betaFeaturesEnabled);
+}
+
 async function pollHealthUntilReady(onReady, opts) {
   const max = (opts && opts.maxAttempts) || 60; // ~2 min at 2s
   const interval = (opts && opts.interval) || 2000;
@@ -4640,6 +4738,10 @@ function openSettingsModal() {
   settingsIdleTimeoutInput.value = String(userPrefs.idleTimeoutMin);
   settingsLoggingEnabledInput.checked = Boolean(userPrefs.loggingEnabled && appConfig.loggingAvailable);
   settingsBetaEnabledInput.checked = Boolean(userPrefs.betaFeaturesEnabled);
+  if (settingsHiddenCvmProbesDisabledInput) {
+    settingsHiddenCvmProbesDisabledInput.checked = Boolean(userPrefs.hiddenCvmProbesDisabled);
+  }
+  renderSettingsBetaFeatureList();
   refreshSettingsServerHints();
   refreshSettingsVersionLabel();
   refreshSettingsUpdateButton();
@@ -4672,12 +4774,21 @@ async function saveSettingsModal() {
   const timeoutVal = Number(settingsIdleTimeoutInput.value);
   const loggingVal = Boolean(settingsLoggingEnabledInput.checked && appConfig.loggingAvailable);
   const betaVal = Boolean(settingsBetaEnabledInput.checked);
+  const betaFeatureEnabled = {};
+  if (settingsBetaFeatureList) {
+    settingsBetaFeatureList.querySelectorAll("[data-beta-feature-id]").forEach((input) => {
+      betaFeatureEnabled[input.getAttribute("data-beta-feature-id")] = Boolean(input.checked);
+    });
+  }
   saveUserPrefs({
     theme: ["light", "dark", "system"].includes(themeVal) ? themeVal : "light",
     idleTimeoutMin: Number.isFinite(timeoutVal) ? Math.max(0, timeoutVal) : 0,
     loggingEnabled: loggingVal,
-    betaFeaturesEnabled: betaVal
+    betaFeaturesEnabled: betaVal,
+    betaFeatureEnabled,
+    hiddenCvmProbesDisabled: Boolean(settingsHiddenCvmProbesDisabledInput && settingsHiddenCvmProbesDisabledInput.checked)
   });
+  session.includeHiddenVms = !userPrefs.hiddenCvmProbesDisabled;
   // Persist server-config separately. We do this AFTER the per-user
   // save so a server-config failure (e.g. read-only PVC) doesn't
   // strand the local settings.
@@ -4715,6 +4826,8 @@ async function saveSettingsModal() {
     idleTimeoutMin: userPrefs.idleTimeoutMin,
     loggingEnabled: userPrefs.loggingEnabled,
     betaFeaturesEnabled: userPrefs.betaFeaturesEnabled,
+    betaFeatureEnabled: userPrefs.betaFeatureEnabled,
+    hiddenCvmProbesDisabled: userPrefs.hiddenCvmProbesDisabled,
     logRetentionDays: _serverConfigCache?.logRetentionDays ?? null
   });
 }
@@ -4749,6 +4862,9 @@ if (settingsBtn) settingsBtn.addEventListener("click", openSettingsModal);
 if (settingsCancelBtn) settingsCancelBtn.addEventListener("click", closeSettingsModal);
 if (settingsSaveBtn) settingsSaveBtn.addEventListener("click", saveSettingsModal);
 if (settingsUpdateBtn) settingsUpdateBtn.addEventListener("click", handleUpdateClick);
+if (settingsBetaEnabledInput) {
+  settingsBetaEnabledInput.addEventListener("change", () => renderSettingsBetaFeatureList());
+}
 if (settingsViewLogsBtn) {
   settingsViewLogsBtn.addEventListener("click", () => {
     closeSettingsModal();

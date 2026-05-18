@@ -1638,6 +1638,33 @@
       }
       .settings-hint-warn { color: var(--ntx-warn); }
       .settings-hint[data-disabled] { opacity: 0.55; }
+      .settings-details {
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+        background: var(--ntx-surface-2);
+        padding: 8px 10px;
+      }
+      .settings-details summary {
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--ntx-text);
+      }
+      .settings-feature-list {
+        display: grid;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      .settings-feature-list .settings-row-toggle {
+        align-items: start;
+      }
+      .settings-feature-desc {
+        display: block;
+        margin-top: 2px;
+        font-size: 11.5px;
+        color: var(--ntx-text-muted);
+        line-height: 1.35;
+      }
       /* Version footer sits flush at the bottom of the dialog body so
          the operator can always confirm which build they're running. */
       .settings-section-meta {
@@ -4155,6 +4182,20 @@
             </label>
             <p class="settings-hint">
               Reveals UI for features that are still under development. Beta features may change or be removed without notice.
+            </p>
+            <details id="settingsBetaDetails" class="settings-details">
+              <summary>Individual beta features</summary>
+              <div id="settingsBetaFeatureList" class="settings-feature-list"></div>
+            </details>
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-title">Inventory</div>
+            <label class="settings-row settings-row-toggle">
+              <input id="settingsHiddenCvmProbesDisabled" type="checkbox" />
+              <span class="settings-label">Disable hidden/CVM probes</span>
+            </label>
+            <p class="settings-hint">
+              Speeds up VM enumeration by skipping hidden/system VM discovery and CVM-specific lookup probes. Regular VM name and power-state inventory still loads.
             </p>
           </section>
           <section class="settings-section" id="settingsServerSection">

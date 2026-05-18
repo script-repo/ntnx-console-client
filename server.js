@@ -41,6 +41,16 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const wsProxySessions = new Map();
 const vmListVariantCache = new Map();
+const VM_INVENTORY_CACHE_TTL_MS = Math.max(
+  5_000,
+  Number(process.env.NRCC_VM_INVENTORY_CACHE_TTL_MS || 30_000)
+);
+const VM_INVENTORY_PAGE_SIZE = Math.max(
+  100,
+  Number(process.env.NRCC_VM_INVENTORY_PAGE_SIZE || 200)
+);
+const vmInventoryCache = new Map();
+const vmInventoryEnrichmentJobs = new Map();
 
 // =====================================================================
 // Multi-user deployment configuration. The default (false) preserves
@@ -4129,6 +4139,66 @@ function buildVmListUrl(pageSize, offset, variant = "") {
   return variant ? `${base}&${variant}` : base;
 }
 
+function vmInventoryCacheKey({ pcHost, username, includeHiddenVms, hydrateVmFolders }) {
+  return [
+    normalizePrismHost(pcHost).toLowerCase(),
+    String(username || "").toLowerCase(),
+    includeHiddenVms ? "hidden" : "base",
+    hydrateVmFolders ? "folders" : "nofolders"
+  ].join("|");
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function compactBaseVm(vm) {
+  return {
+    uuid: vm.uuid,
+    name: vm.name,
+    powerState: vm.powerState || "UNKNOWN",
+    categories: Array.isArray(vm.categories) ? vm.categories : [],
+    ipAddresses: [],
+    ipAddress: "",
+    isHidden: Boolean(vm.isHidden),
+    isControllerVm: Boolean(vm.isControllerVm),
+    isFsvm: Boolean(vm.isFsvm)
+  };
+}
+
+function cacheVmInventory(key, payload) {
+  vmInventoryCache.set(key, {
+    expiresAt: Date.now() + VM_INVENTORY_CACHE_TTL_MS,
+    payload: cloneJson(payload)
+  });
+}
+
+function getCachedVmInventory(key) {
+  const hit = vmInventoryCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    vmInventoryCache.delete(key);
+    return null;
+  }
+  return cloneJson(hit.payload);
+}
+
+function makeVmInventoryResponse(vms, selectedVariant, opts = {}) {
+  return {
+    vms,
+    count: vms.length,
+    hiddenCount: vms.filter((vm) => vm.isHidden || vm.isControllerVm).length,
+    cvmCount: vms.filter((vm) => vm.isControllerVm).length,
+    fsvmCount: vms.filter((vm) => vm.isFsvm).length,
+    listVariant: selectedVariant || "default",
+    inventoryStage: opts.inventoryStage || "enriched",
+    enrichmentId: opts.enrichmentId || null,
+    enrichmentPending: Boolean(opts.enrichmentId),
+    fromCache: Boolean(opts.fromCache),
+    cvmProbeSummary: opts.cvmProbeSummary || undefined
+  };
+}
+
 function getVmListVariants(includeHiddenVms) {
   if (!includeHiddenVms) {
     return [""];
@@ -4236,6 +4306,165 @@ async function fetchCvmFocusedPage(client, pageSize, offset) {
   return Array.from(new Map(results.map((vm) => [vm.uuid, vm])).values());
 }
 
+async function enumerateBaseVms(client, includeHiddenVms) {
+  const pageSize = VM_INVENTORY_PAGE_SIZE;
+  let offset = 0;
+  let total = 0;
+  const allVms = [];
+  const selected = await selectVmListVariant(
+    client,
+    pageSize,
+    includeHiddenVms
+  );
+  const selectedVariant = selected.variant;
+
+  for (let i = 0; i < 20; i += 1) {
+    const vmResp =
+      i === 0
+        ? selected.firstResponse
+        : await client.get(
+            buildVmListUrl(pageSize, offset, selectedVariant),
+            { timeout: PRISM_HTTP_TIMEOUT_MS }
+          );
+    const pageVms = parseVmList(vmResp);
+    allVms.push(...pageVms);
+
+    const pageInfo = extractV4PageInfo(vmResp);
+    if (pageInfo.totalAvailableResults > 0) total = pageInfo.totalAvailableResults;
+    else if (!total) total = allVms.length;
+
+    if (pageVms.length < pageSize || allVms.length >= total) break;
+    offset += pageSize;
+  }
+
+  const deduped = Array.from(
+    new Map(allVms.map((vm) => [vm.uuid, vm])).values()
+  ).sort((a, b) => a.name.localeCompare(b.name));
+  return { vms: deduped, selectedVariant, pageSize };
+}
+
+async function enrichVmInventory(client, baseVms, selectedVariant, includeHiddenVms, authContext = {}, hydrateVmFolders = true) {
+  let deduped = baseVms.map((vm) => ({ ...vm }));
+  let cvmProbeSummary = [];
+  if (includeHiddenVms) {
+    const controllerProbe = await fetchControllerVmCandidates(client);
+    if (controllerProbe.vms.length) {
+      controllerProbe.vms.forEach((vm) => {
+        if (!deduped.find((existing) => existing.uuid === vm.uuid)) deduped.push(vm);
+      });
+      deduped.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    const clusterCvmProbe = await fetchClusterCvms(client);
+    const clusterIpCache = new Map();
+    const resolveClusterIp = async (clusterExtId) => {
+      if (!clusterExtId) return "";
+      if (clusterIpCache.has(clusterExtId)) return clusterIpCache.get(clusterExtId);
+      const ip = await fetchClusterExternalAddress(client, clusterExtId);
+      clusterIpCache.set(clusterExtId, ip);
+      return ip;
+    };
+
+    if (clusterCvmProbe.vms.length) {
+      const byIp = new Map();
+      const byName = new Map();
+      for (const vm of deduped) {
+        (vm.ipAddresses || []).forEach((ip) => {
+          if (ip && !byIp.has(ip)) byIp.set(ip, vm);
+        });
+        if (vm.name) byName.set(vm.name.toLowerCase(), vm);
+      }
+      const unmatchedCvms = [];
+      clusterCvmProbe.vms.forEach((cvm) => {
+        let ahvMatch = null;
+        if (cvm.ipAddress && byIp.has(cvm.ipAddress)) ahvMatch = byIp.get(cvm.ipAddress);
+        if (!ahvMatch && cvm.name) ahvMatch = byName.get(cvm.name.toLowerCase());
+        if (ahvMatch) {
+          ahvMatch.isControllerVm = true;
+          ahvMatch.isHidden = true;
+          ahvMatch.clusterUuid = cvm.clusterUuid || ahvMatch.clusterUuid;
+          ahvMatch.cvmExtId = cvm.uuid;
+          if (cvm.ipAddress && !ahvMatch.ipAddress) ahvMatch.ipAddress = cvm.ipAddress;
+          if (cvm.name && !/cvm/i.test(ahvMatch.name)) ahvMatch.name = cvm.name;
+          return;
+        }
+        unmatchedCvms.push(cvm);
+      });
+      const peLookups = await Promise.all(
+        unmatchedCvms.map(async (cvm) => ({
+          cvm,
+          peHost: await resolveClusterIp(cvm.clusterUuid)
+        }))
+      );
+      peLookups.forEach(({ cvm, peHost }) => {
+        deduped.push({
+          ...cvm,
+          peHost: peHost || undefined,
+          cvmIp: cvm.ipAddress,
+          cvmName: cvm.name,
+          consoleSupported: Boolean(peHost)
+        });
+      });
+      deduped.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    const cvmCount = deduped.filter((vm) => vm.isControllerVm).length;
+    cvmProbeSummary = [
+      ...controllerProbe.probeResults,
+      ...clusterCvmProbe.probeResults
+    ];
+    if (cvmCount === 0) {
+      console.error("CVM lookup yielded none. Probe summary:", JSON.stringify(cvmProbeSummary));
+      const { pcHost, username, password, tlsSkipVerify } = authContext;
+      const sessionCookie = username && password
+        ? await createPrismSessionCookie(client, username, password)
+        : null;
+      if (sessionCookie) {
+        const cookieClient = createCookieClient(pcHost, sessionCookie, tlsSkipVerify);
+        try {
+          const cookieResp = await cookieClient.get(
+            buildVmListUrl(VM_INVENTORY_PAGE_SIZE, 0, selectedVariant),
+            { timeout: 7000 }
+          );
+          const cookieVms = parseVmList(cookieResp);
+          deduped = Array.from(
+            new Map([...deduped, ...cookieVms].map((vm) => [vm.uuid, vm])).values()
+          ).sort((a, b) => a.name.localeCompare(b.name));
+        } catch (_cookieError) {
+          // Ignore; diagnostics already included.
+        }
+      }
+    }
+  }
+  if (hydrateVmFolders) {
+    await hydrateVmFolderCategories(client, deduped);
+  }
+  return makeVmInventoryResponse(deduped, selectedVariant, {
+    inventoryStage: "enriched",
+    cvmProbeSummary
+  });
+}
+
+function startVmInventoryEnrichmentJob({ cacheKey, client, baseVms, selectedVariant, includeHiddenVms, authContext, hydrateVmFolders }) {
+  const id = crypto.randomUUID();
+  const job = { id, status: "pending", createdAt: Date.now(), result: null, error: null };
+  vmInventoryEnrichmentJobs.set(id, job);
+  enrichVmInventory(client, baseVms, selectedVariant, includeHiddenVms, authContext, hydrateVmFolders)
+    .then((result) => {
+      job.status = "done";
+      job.result = result;
+      cacheVmInventory(cacheKey, result);
+    })
+    .catch((err) => {
+      job.status = "error";
+      job.error = err?.message || String(err);
+      console.error("[vm-inventory] enrichment failed:", job.error);
+    });
+  const cleanup = setTimeout(() => vmInventoryEnrichmentJobs.delete(id), 2 * 60 * 1000);
+  if (cleanup && typeof cleanup.unref === "function") cleanup.unref();
+  return id;
+}
+
 app.post("/api/vms", async (req, res) => {
   try {
     const { pcHost, username, password, tlsSkipVerify, includeHiddenVms } =
@@ -4247,192 +4476,33 @@ app.post("/api/vms", async (req, res) => {
       });
     }
     const client = createPrismClient(pcHost, username, password, tlsSkipVerify);
-    const pageSize = 100;
-    let offset = 0;
-    let total = 0;
-    const allVms = [];
-    const selected = await selectVmListVariant(
-      client,
-      pageSize,
-      includeHiddenVms
+    const hydrateVmFolders = VM_FOLDERS_ENABLED && req.body?.hydrateVmFolders !== false;
+    const cacheKey = vmInventoryCacheKey({ pcHost, username, includeHiddenVms, hydrateVmFolders });
+    const cached = getCachedVmInventory(cacheKey);
+    if (cached) {
+      logIpCoverage(cached.vms || [], cached.listVariant || "default", includeHiddenVms);
+      return res.json({ ...cached, fromCache: true });
+    }
+
+    const { vms: baseVms, selectedVariant } = await enumerateBaseVms(client, includeHiddenVms);
+    const basePayload = makeVmInventoryResponse(
+      baseVms.map(compactBaseVm),
+      selectedVariant,
+      { inventoryStage: "base" }
     );
-    const selectedVariant = selected.variant;
-
-    for (let i = 0; i < 20; i += 1) {
-      const vmResp =
-        i === 0
-          ? selected.firstResponse
-          : await client.get(
-              buildVmListUrl(pageSize, offset, selectedVariant),
-              { timeout: PRISM_HTTP_TIMEOUT_MS }
-            );
-      const regularPage = parseVmList(vmResp);
-      const cvmFocusedPage = includeHiddenVms
-        ? await fetchCvmFocusedPage(client, pageSize, offset)
-        : [];
-      const pageVms = Array.from(
-        new Map(
-          [...regularPage, ...cvmFocusedPage].map((vm) => [vm.uuid, vm])
-        ).values()
-      );
-      allVms.push(...pageVms);
-
-      const pageInfo = extractV4PageInfo(vmResp);
-      if (pageInfo.totalAvailableResults > 0) {
-        total = pageInfo.totalAvailableResults;
-      } else if (!total) {
-        total = allVms.length;
-      }
-
-      if (pageVms.length < pageSize || allVms.length >= total) {
-        break;
-      }
-      offset += pageSize;
-    }
-
-    let deduped = Array.from(
-      new Map(allVms.map((vm) => [vm.uuid, vm])).values()
-    ).sort((a, b) => a.name.localeCompare(b.name));
-    if (includeHiddenVms) {
-      const controllerProbe = await fetchControllerVmCandidates(client);
-      const cvmFromControllerEndpoints = controllerProbe.vms;
-      if (cvmFromControllerEndpoints.length) {
-        cvmFromControllerEndpoints.forEach((vm) => {
-          if (!deduped.find((existing) => existing.uuid === vm.uuid)) {
-            deduped.push(vm);
-          }
-        });
-        deduped.sort((a, b) => a.name.localeCompare(b.name));
-      }
-
-      const clusterCvmProbe = await fetchClusterCvms(client);
-      const clusterIpCache = new Map();
-      const resolveClusterIp = async (clusterExtId) => {
-        if (!clusterExtId) return "";
-        if (clusterIpCache.has(clusterExtId)) {
-          return clusterIpCache.get(clusterExtId);
-        }
-        const ip = await fetchClusterExternalAddress(client, clusterExtId);
-        clusterIpCache.set(clusterExtId, ip);
-        return ip;
-      };
-
-      if (clusterCvmProbe.vms.length) {
-        // Build IP/name lookup against the AHV VM list so we can re-key each
-        // CVM to its AHV VM UUID. The clustermgmt extId is a CVM-domain
-        // identifier and is rejected by VMM with VMM-30100.
-        const byIp = new Map();
-        const byName = new Map();
-        for (const vm of deduped) {
-          (vm.ipAddresses || []).forEach((ip) => {
-            if (ip && !byIp.has(ip)) byIp.set(ip, vm);
-          });
-          if (vm.name) byName.set(vm.name.toLowerCase(), vm);
-        }
-
-        const unmatchedCvms = [];
-        clusterCvmProbe.vms.forEach((cvm) => {
-          let ahvMatch = null;
-          if (cvm.ipAddress && byIp.has(cvm.ipAddress)) {
-            ahvMatch = byIp.get(cvm.ipAddress);
-          }
-          if (!ahvMatch && cvm.name) {
-            ahvMatch = byName.get(cvm.name.toLowerCase());
-          }
-
-          if (ahvMatch) {
-            ahvMatch.isControllerVm = true;
-            ahvMatch.isHidden = true;
-            ahvMatch.clusterUuid = cvm.clusterUuid || ahvMatch.clusterUuid;
-            ahvMatch.cvmExtId = cvm.uuid;
-            if (cvm.ipAddress && !ahvMatch.ipAddress) {
-              ahvMatch.ipAddress = cvm.ipAddress;
-            }
-            if (cvm.name && !/cvm/i.test(ahvMatch.name)) {
-              ahvMatch.name = cvm.name;
-            }
-            return;
-          }
-          unmatchedCvms.push(cvm);
-        });
-
-        // Resolve PE external IP per cluster for unmatched CVMs so the
-        // console-token call can be redirected to the cluster's PE.
-        const peLookups = await Promise.all(
-          unmatchedCvms.map(async (cvm) => ({
-            cvm,
-            peHost: await resolveClusterIp(cvm.clusterUuid)
-          }))
-        );
-        peLookups.forEach(({ cvm, peHost }) => {
-          deduped.push({
-            ...cvm,
-            peHost: peHost || undefined,
-            cvmIp: cvm.ipAddress,
-            cvmName: cvm.name,
-            consoleSupported: Boolean(peHost)
-          });
-        });
-        deduped.sort((a, b) => a.name.localeCompare(b.name));
-      }
-
-      const cvmCount = deduped.filter((vm) => vm.isControllerVm).length;
-      if (cvmCount === 0) {
-        console.error(
-          "CVM lookup yielded none. Probe summary:",
-          JSON.stringify([
-            ...controllerProbe.probeResults,
-            ...clusterCvmProbe.probeResults
-          ])
-        );
-      }
-      if (cvmCount === 0) {
-        // Fallback: list through Prism session-cookie context (can differ from basic auth view).
-        const sessionCookie = await createPrismSessionCookie(
-          client,
-          username,
-          password
-        );
-        if (sessionCookie) {
-          const cookieClient = createCookieClient(pcHost, sessionCookie, tlsSkipVerify);
-          try {
-            const cookieResp = await cookieClient.get(
-              buildVmListUrl(pageSize, 0, selectedVariant),
-              { timeout: 7000 }
-            );
-            const cookieVms = parseVmList(cookieResp);
-            deduped = Array.from(
-              new Map([...deduped, ...cookieVms].map((vm) => [vm.uuid, vm])).values()
-            ).sort((a, b) => a.name.localeCompare(b.name));
-          } catch (_cookieError) {
-            // Ignore; diagnostics already included below.
-          }
-        }
-      }
-      await hydrateVmFolderCategories(client, deduped);
-      logIpCoverage(deduped, selectedVariant, true);
-      return res.json({
-        vms: deduped,
-        count: deduped.length,
-        hiddenCount: deduped.filter((vm) => vm.isHidden || vm.isControllerVm).length,
-        cvmCount: deduped.filter((vm) => vm.isControllerVm).length,
-        fsvmCount: deduped.filter((vm) => vm.isFsvm).length,
-        listVariant: selectedVariant || "default",
-        cvmProbeSummary: [
-          ...controllerProbe.probeResults,
-          ...clusterCvmProbe.probeResults
-        ]
-      });
-    }
-    await hydrateVmFolderCategories(client, deduped);
-    logIpCoverage(deduped, selectedVariant, false);
+    const enrichmentId = startVmInventoryEnrichmentJob({
+      cacheKey,
+      client,
+      baseVms,
+      selectedVariant,
+      includeHiddenVms,
+      authContext: { pcHost, username, password, tlsSkipVerify },
+      hydrateVmFolders
+    });
     return res.json({
-      vms: deduped,
-      count: deduped.length,
-      hiddenCount: deduped.filter((vm) => vm.isHidden || vm.isControllerVm).length,
-      cvmCount: deduped.filter((vm) => vm.isControllerVm).length,
-      fsvmCount: deduped.filter((vm) => vm.isFsvm).length,
-      listVariant: selectedVariant || "default"
+      ...basePayload,
+      enrichmentId,
+      enrichmentPending: true
     });
   } catch (error) {
     if (error?.message === "Invalid Prism host format.") {
@@ -4445,6 +4515,29 @@ app.post("/api/vms", async (req, res) => {
       details
     });
   }
+});
+
+app.get("/api/vms/enrichment/:id", (req, res) => {
+  const id = String(req.params.id || "");
+  const job = vmInventoryEnrichmentJobs.get(id);
+  if (!job) {
+    return res.status(404).json({ error: "VM inventory enrichment job not found." });
+  }
+  if (job.status === "pending") {
+    return res.json({ status: "pending", inventoryStage: "enriching" });
+  }
+  if (job.status === "error") {
+    return res.status(500).json({
+      status: "error",
+      error: "VM inventory enrichment failed.",
+      details: job.error
+    });
+  }
+  return res.json({
+    status: "done",
+    inventoryStage: "enriched",
+    ...cloneJson(job.result)
+  });
 });
 
 // Lightweight credential probe used by the login screen so the user
@@ -5458,17 +5551,18 @@ async function moveVmsAcrossFolders(client, predicate, rewrite, includeHidden = 
   // Reuse the existing v4 list pathway so we see the full inventory
   // (including hidden / CVM-categorized VMs). Skip page caps in the
   // caller; selectVmListVariant + paging is shared with /api/vms.
-  const selected = await selectVmListVariant(client, 100, includeHidden);
+  const pageSize = VM_INVENTORY_PAGE_SIZE;
+  const selected = await selectVmListVariant(client, pageSize, includeHidden);
   const variant = selected.variant;
   const all = [];
   for (let i = 0; i < 50; i += 1) {
     const resp = i === 0
       ? selected.firstResponse
-      : await client.get(buildVmListUrl(100, i * 100, variant), { timeout: PRISM_HTTP_TIMEOUT_MS });
+      : await client.get(buildVmListUrl(pageSize, i * pageSize, variant), { timeout: PRISM_HTTP_TIMEOUT_MS });
     const page = parseVmList(resp);
     all.push(...page);
     const info = extractV4PageInfo(resp);
-    if (!info.totalAvailableResults || all.length >= info.totalAvailableResults || page.length < 100) break;
+    if (!info.totalAvailableResults || all.length >= info.totalAvailableResults || page.length < pageSize) break;
   }
   await hydrateVmFolderCategories(client, all);
 
