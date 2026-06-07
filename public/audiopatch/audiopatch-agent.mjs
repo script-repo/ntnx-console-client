@@ -265,6 +265,9 @@ function startCapture() {
       if (cfg.captureFormat === "alsa") {
         log("output: test it (no alsa-utils needed):  ffmpeg -f lavfi -i sine=frequency=440:duration=5 -f alsa hw:Loopback,0,0");
         log("output: (any app that plays to the 'default' ALSA device is also captured)");
+      } else if (cfg.captureFormat === "dshow") {
+        log("output: play any audio on this VM to the default Playback device (CABLE Input) -- it is captured from CABLE Output.");
+        log("output: confirm VB-CABLE is the default Playback device in Sound > Playback.");
       } else {
         log("output: test it with:  paplay /usr/share/sounds/alsa/Front_Center.wav   (audio must play to the default sink)");
       }

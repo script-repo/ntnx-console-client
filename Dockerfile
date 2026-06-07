@@ -22,6 +22,20 @@ RUN if [ -f package-lock.json ]; then \
       npm install --omit=dev --no-audit --no-fund --loglevel=error; \
     fi
 
+# ---------- 1b. Windows ffmpeg for AudioPatch guests --------------------------
+# Old Windows guests (e.g. Server 2012) have no winget/choco and often no
+# ffmpeg. NRCC serves this static build over plain HTTP so the AudioPatch
+# installer can drop it next to the agent -- no internet/TLS needed on the
+# guest. gyan.dev "essentials" is a self-contained static build (Windows 7+).
+FROM alpine:3.20 AS winffmpeg
+RUN apk add --no-cache curl unzip ca-certificates \
+ && mkdir -p /win \
+ && curl -fsSL --retry 3 -o /tmp/ff.zip \
+      https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip \
+ && unzip -j /tmp/ff.zip '*/bin/ffmpeg.exe' -d /win \
+ && rm /tmp/ff.zip \
+ && test -s /win/ffmpeg.exe
+
 # ---------- 2. runtime image --------------------------------------------------
 FROM node:20-alpine
 WORKDIR /app
@@ -40,6 +54,9 @@ COPY --chown=node:node --from=deps /app/node_modules ./node_modules
 # isn't needed at runtime (node_modules, .git, screenshots, etc.) so
 # this COPY brings in just code + assets + manifests.
 COPY --chown=node:node . .
+
+# Static Windows ffmpeg served to the AudioPatch installer (see stage above).
+COPY --chown=node:node --from=winffmpeg /win/ffmpeg.exe ./public/audiopatch/win/ffmpeg.exe
 
 ENV NODE_ENV=production \
     PORT=8443 \

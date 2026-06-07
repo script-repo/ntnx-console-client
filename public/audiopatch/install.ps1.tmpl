@@ -37,19 +37,48 @@ if (-not $node) { Fail "Node.js >= 18 is required. Install from https://nodejs.o
 $nodeMajor = [int](node -p "process.versions.node.split('.')[0]")
 if ($nodeMajor -lt 18) { Fail "Node.js >= 18 required (found $(node -v))." }
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Fail "npm is required. Re-install Node.js." }
-if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-  Write-Warn "ffmpeg not found on PATH. Install it (e.g. 'winget install Gyan.FFmpeg') -- audio will not pass until it is present."
+
+# ---- Install directory -------------------------------------------------
+New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+
+# ---- ffmpeg ------------------------------------------------------------
+# Audio is moved with ffmpeg. Old Windows (e.g. Server 2012) has no winget,
+# so when ffmpeg isn't already on PATH we pull the static build NRCC serves
+# over plain HTTP and run the agent against that exact path -- no internet,
+# package manager or TLS negotiation needed on the guest.
+$FfmpegExe = "ffmpeg"
+$ffCmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
+if ($ffCmd -and $ffCmd.Source) {
+  $FfmpegExe = $ffCmd.Source
+  Write-Log "Found ffmpeg on PATH: $FfmpegExe"
+} else {
+  $localFf = Join-Path $Dir "ffmpeg.exe"
+  if (-not (Test-Path $localFf)) {
+    $ffUrl = "__NRCC_BASE__/audiopatch/win/ffmpeg.exe"
+    Write-Log "ffmpeg not on PATH; downloading from $ffUrl"
+    try {
+      Invoke-WebRequest -Uri $ffUrl -OutFile $localFf -UseBasicParsing
+    } catch {
+      $curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
+      if ($curlExe) { & curl.exe -fsSLk $ffUrl -o $localFf }
+    }
+  }
+  if ((Test-Path $localFf) -and ((Get-Item $localFf).Length -gt 0)) {
+    $FfmpegExe = $localFf
+    Write-Log "Using bundled ffmpeg: $FfmpegExe"
+  } else {
+    Write-Warn "Could not obtain ffmpeg automatically. Audio will not pass until ffmpeg is available."
+  }
 }
 
 # Virtual audio cable check (output direction needs one).
 try {
-  $dshow = & ffmpeg -hide_banner -list_devices true -f dshow -i dummy 2>&1
+  $dshow = & $FfmpegExe -hide_banner -list_devices true -f dshow -i dummy 2>&1
   if ($dshow -match "CABLE") { Write-Log "Found a CABLE audio device." }
   else { Write-Warn "No 'CABLE' device detected. Install VB-CABLE (https://vb-audio.com/Cable/) and set it as the default Playback device." }
 } catch { }
 
 # ---- Download agent ----------------------------------------------------
-New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $AgentPath = Join-Path $Dir "audiopatch-agent.mjs"
 Write-Log "Downloading agent -> $AgentPath"
 # $AgentUrl is plain HTTP (NRCC nginx sidecar), so a bare Invoke-WebRequest
@@ -80,7 +109,7 @@ try {
 if ($LASTEXITCODE -ne 0) { Fail "Agent script failed syntax validation." }
 
 function Show-RunHint {
-  Write-Host "  `$env:AUDIOPATCH_PORTAL='$Portal'; `$env:AUDIOPATCH_TOKEN='$Token'; node `"$AgentPath`" --direction $Direction --name `"$Name`""
+  Write-Host "  `$env:AUDIOPATCH_PORTAL='$Portal'; `$env:AUDIOPATCH_TOKEN='$Token'; node `"$AgentPath`" --direction $Direction --name `"$Name`" --ffmpeg `"$FfmpegExe`""
 }
 
 if ($NoService) {
@@ -104,7 +133,8 @@ $agentArgs = @(
   "--portal", "`"$Portal`"",
   "--name", "`"$Name`"",
   "--direction", $Direction,
-  "--capture-source", "`"$CaptureSource`""
+  "--capture-source", "`"$CaptureSource`"",
+  "--ffmpeg", "`"$FfmpegExe`""
 )
 if ($Token) { $agentArgs += @("--token", "`"$Token`"") }
 $argString = $agentArgs -join " "
