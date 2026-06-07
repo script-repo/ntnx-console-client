@@ -290,6 +290,30 @@ function startCapture() {
 const PLAYBACK_IDLE_MS = Math.max(500, Number(process.env.AUDIOPATCH_PLAYBACK_IDLE_MS || 1500));
 let playbackIdleTimer = null;
 
+// Build a 44-byte streaming WAV/PCM header. The RIFF + data sizes are set to
+// 0xFFFFFFFF ("unknown / streaming") so ffplay starts playing immediately and
+// keeps reading until the pipe closes. This lets ffplay -i - auto-detect the
+// format without ffmpeg-only -ar/-ac flags (which ffplay rejects).
+function wavStreamHeader(rate, channels = 1, bits = 16) {
+  const byteRate = (rate * channels * bits) / 8;
+  const blockAlign = (channels * bits) / 8;
+  const b = Buffer.alloc(44);
+  b.write("RIFF", 0, "ascii");
+  b.writeUInt32LE(0xffffffff, 4);
+  b.write("WAVE", 8, "ascii");
+  b.write("fmt ", 12, "ascii");
+  b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20); // PCM
+  b.writeUInt16LE(channels, 22);
+  b.writeUInt32LE(rate, 24);
+  b.writeUInt32LE(byteRate, 28);
+  b.writeUInt16LE(blockAlign, 32);
+  b.writeUInt16LE(bits, 34);
+  b.write("data", 36, "ascii");
+  b.writeUInt32LE(0xffffffff, 40);
+  return b;
+}
+
 function startPlayback() {
   if (playback) return true;
 
@@ -300,11 +324,12 @@ function startPlayback() {
   // OUTPUT so they hear the operator. ffplay can't select a device, so
   // --playback-sink is informational on Windows.
   if (cfg.osType === "windows") {
-    const a = [
-      "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
-      "-f", "s16le", "-ar", String(cfg.rate), "-ac", "1", "-i", "-",
-    ];
+    // ffplay does NOT accept ffmpeg's -ar/-ac CLI aliases ("Option not found"),
+    // so describe the stream with a streaming WAV header instead and let ffplay
+    // auto-detect it. Header is written first (below), then raw PCM frames.
+    const a = ["-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit", "-i", "-"];
     playback = spawn(cfg.ffplay, a, { stdio: ["pipe", "ignore", "pipe"] });
+    try { playback.stdin.write(wavStreamHeader(cfg.rate, 1, 16)); } catch (_e) { /* ignore */ }
     log(`input: playback -> default Playback device via ffplay (${cfg.rate}Hz mono 16-bit).`);
     log("input: ensure your virtual-cable INPUT is the default Playback device, and the VM mic app uses that cable's OUTPUT.");
     playback.stderr.on("data", (d) => log("ffplay(playback):", d.toString().trim()));
