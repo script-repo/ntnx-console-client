@@ -1,0 +1,98 @@
+# NRCC AudioPatch agent installer for Windows (served by NRCC).
+#
+# The portal URL, token and download locations below are filled in by the
+# NRCC instance you fetched this from. No VM UUID or portal address to type.
+# Run from an elevated-or-normal PowerShell:
+#
+#   powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr __NRCC_BASE__/audiopatch/install.ps1 -UseBasicParsing | iex"
+#
+# Override defaults with environment variables before running:
+#   $env:AUDIOPATCH_DIRECTION = 'both'   # output|input|both (default: output)
+#   $env:AUDIOPATCH_NAME      = 'My VM'  # PatchBay display name (default: computer name)
+
+$ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+$Portal       = if ($env:AUDIOPATCH_PORTAL) { $env:AUDIOPATCH_PORTAL } else { "__NRCC_PORTAL__" }
+$Token        = if ($env:AUDIOPATCH_TOKEN)  { $env:AUDIOPATCH_TOKEN }  else { "__NRCC_TOKEN__" }
+$AgentUrl     = "__NRCC_BASE__/audiopatch/audiopatch-agent.mjs"
+$Direction    = if ($env:AUDIOPATCH_DIRECTION) { $env:AUDIOPATCH_DIRECTION } else { "output" }
+$Name         = if ($env:AUDIOPATCH_NAME) { $env:AUDIOPATCH_NAME } else { $env:COMPUTERNAME }
+$Dir          = if ($env:AUDIOPATCH_DIR)  { $env:AUDIOPATCH_DIR }  else { Join-Path $env:LOCALAPPDATA "nrcc-audiopatch" }
+$CaptureSource = if ($env:AUDIOPATCH_CAPTURE_SOURCE) { $env:AUDIOPATCH_CAPTURE_SOURCE } else { "audio=CABLE Output (VB-Audio Virtual Cable)" }
+$NoService    = $env:AUDIOPATCH_NO_SERVICE -eq "1"
+
+function Write-Log  { param([string]$m) Write-Host "[audiopatch] $m" }
+function Write-Warn { param([string]$m) Write-Warning "[audiopatch] $m" }
+function Fail       { param([string]$m) Write-Error "[audiopatch] ERROR: $m"; exit 1 }
+
+# ---- Prerequisites -----------------------------------------------------
+$node = Get-Command node -ErrorAction SilentlyContinue
+if (-not $node) { Fail "Node.js >= 18 is required. Install from https://nodejs.org and re-run." }
+$nodeMajor = [int](node -p "process.versions.node.split('.')[0]")
+if ($nodeMajor -lt 18) { Fail "Node.js >= 18 required (found $(node -v))." }
+if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Fail "npm is required. Re-install Node.js." }
+if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+  Write-Warn "ffmpeg not found on PATH. Install it (e.g. 'winget install Gyan.FFmpeg') -- audio will not pass until it is present."
+}
+
+# Virtual audio cable check (output direction needs one).
+try {
+  $dshow = & ffmpeg -hide_banner -list_devices true -f dshow -i dummy 2>&1
+  if ($dshow -match "CABLE") { Write-Log "Found a CABLE audio device." }
+  else { Write-Warn "No 'CABLE' device detected. Install VB-CABLE (https://vb-audio.com/Cable/) and set it as the default Playback device." }
+} catch { }
+
+# ---- Download agent ----------------------------------------------------
+New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+$AgentPath = Join-Path $Dir "audiopatch-agent.mjs"
+Write-Log "Downloading agent -> $AgentPath"
+Invoke-WebRequest -Uri $AgentUrl -OutFile $AgentPath -UseBasicParsing
+
+# ---- ws dependency (reliable self-signed wss:// support) ---------------
+Write-Log "Installing the 'ws' WebSocket dependency in $Dir ..."
+'{"private":true,"type":"module","dependencies":{"ws":"^8.18.0"}}' | Set-Content -Path (Join-Path $Dir "package.json") -Encoding ascii
+Push-Location $Dir
+try {
+  & npm install --omit=dev --no-audit --no-fund --loglevel=error
+  if ($LASTEXITCODE -ne 0) { Write-Warn "npm install ws failed; the agent will try the Node built-in WebSocket (Node >= 22)." }
+} finally { Pop-Location }
+
+& node --check $AgentPath
+if ($LASTEXITCODE -ne 0) { Fail "Agent script failed syntax validation." }
+
+function Show-RunHint {
+  Write-Host "  `$env:AUDIOPATCH_PORTAL='$Portal'; `$env:AUDIOPATCH_TOKEN='$Token'; node `"$AgentPath`" --direction $Direction --name `"$Name`""
+}
+
+if ($NoService) {
+  Write-Log "Install complete (AUDIOPATCH_NO_SERVICE=1). Start the agent with:"
+  Show-RunHint
+  exit 0
+}
+
+# ---- Scheduled Task ----------------------------------------------------
+$nodePath = $node.Source
+$agentArgs = @(
+  "`"$AgentPath`"",
+  "--portal", "`"$Portal`"",
+  "--name", "`"$Name`"",
+  "--direction", $Direction,
+  "--capture-source", "`"$CaptureSource`""
+)
+if ($Token) { $agentArgs += @("--token", "`"$Token`"") }
+$argString = $agentArgs -join " "
+
+$taskName = "NRCC-AudioPatch"
+Write-Log "Registering Scheduled Task '$taskName'..."
+$action  = New-ScheduledTaskAction -Execute $nodePath -Argument $argString -WorkingDirectory $Dir
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+
+try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Force | Out-Null
+Start-ScheduledTask -TaskName $taskName
+
+Write-Log "Scheduled Task '$taskName' registered and started."
+Write-Log "The VM will appear in NRCC PatchBay once an operator loads the VM list."
+Write-Host "  Stop-ScheduledTask -TaskName $taskName ; Unregister-ScheduledTask -TaskName $taskName -Confirm:`$false   # remove"

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# NRCC AudioPatch agent installer (served by NRCC -- the portal URL,
+# token and download locations below are filled in by the NRCC instance
+# you fetched this from). No VM UUID, portal address or token to type:
+#
+#   curl -fsSLk __NRCC_BASE__/audiopatch/install.sh | bash
+#
+# Optional flags:
+#   --direction output|input|both   what to bridge (default: output)
+#   --name NAME                      display name in PatchBay (default: hostname)
+#   --setup-audio                    create a dedicated PulseAudio null sink
+#   --no-service                     install only; print the run command
+#   --dir PATH                       install dir (default: ~/.nrcc-audiopatch)
+set -euo pipefail
+
+PORTAL="${AUDIOPATCH_PORTAL:-__NRCC_PORTAL__}"
+TOKEN="${AUDIOPATCH_TOKEN:-__NRCC_TOKEN__}"
+AGENT_URL="${AUDIOPATCH_AGENT_URL:-__NRCC_BASE__/audiopatch/audiopatch-agent.mjs}"
+SETUP_URL="${AUDIOPATCH_SETUP_URL:-__NRCC_BASE__/audiopatch/setup-linux-audio.sh}"
+DIR="${AUDIOPATCH_DIR:-$HOME/.nrcc-audiopatch}"
+DIRECTION="${AUDIOPATCH_DIRECTION:-output}"
+NAME="${AUDIOPATCH_NAME:-$(hostname)}"
+SETUP_AUDIO="${AUDIOPATCH_SETUP_AUDIO:-0}"
+NO_SERVICE="${AUDIOPATCH_NO_SERVICE:-0}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --direction) DIRECTION="$2"; shift 2 ;;
+    --name) NAME="$2"; shift 2 ;;
+    --dir) DIR="$2"; shift 2 ;;
+    --token) TOKEN="$2"; shift 2 ;;
+    --portal) PORTAL="$2"; shift 2 ;;
+    --setup-audio) SETUP_AUDIO=1; shift ;;
+    --no-service) NO_SERVICE=1; shift ;;
+    -h|--help) echo "Usage: install.sh [--direction output|input|both] [--name NAME] [--setup-audio] [--no-service] [--dir PATH]"; exit 0 ;;
+    *) echo "[audiopatch] ignoring unknown arg: $1"; shift ;;
+  esac
+done
+
+log() { printf '\033[36m[audiopatch]\033[0m %s\n' "$*"; }
+err() { printf '\033[31m[audiopatch]\033[0m %s\n' "$*" >&2; }
+
+command -v curl >/dev/null 2>&1 || { err "curl is required."; exit 1; }
+command -v node >/dev/null 2>&1 || { err "Node.js (>=18) is required. Install node, then re-run."; exit 1; }
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+if [ "$NODE_MAJOR" -lt 18 ]; then err "Node.js >= 18 required (found $(node -v 2>/dev/null))."; exit 1; fi
+command -v ffmpeg >/dev/null 2>&1 || err "ffmpeg not found -- audio capture/playback needs it. Install ffmpeg before the agent will pass audio."
+
+CURL="curl -fsSLk"
+
+mkdir -p "$DIR"
+log "Downloading agent -> $DIR/audiopatch-agent.mjs"
+$CURL "$AGENT_URL" -o "$DIR/audiopatch-agent.mjs"
+
+# Install the 'ws' package locally for reliable self-signed wss:// support.
+log "Installing the 'ws' WebSocket dependency in $DIR ..."
+printf '{"private":true,"type":"module","dependencies":{"ws":"^8.18.0"}}' > "$DIR/package.json"
+if ! ( cd "$DIR" && npm install --omit=dev --no-audit --no-fund --loglevel=error ); then
+  if node -e 'process.exit(globalThis.WebSocket?0:1)' >/dev/null 2>&1; then
+    err "npm install ws failed; falling back to the Node built-in WebSocket (TLS verification relaxed for wss://)."
+  else
+    err "npm install ws failed and this Node has no built-in WebSocket. Install ws manually or upgrade to Node >= 22."
+    exit 1
+  fi
+fi
+
+if [ "$SETUP_AUDIO" = "1" ]; then
+  log "Configuring guest audio (dedicated null sink) ..."
+  $CURL "$SETUP_URL" -o "$DIR/setup-linux-audio.sh"
+  chmod +x "$DIR/setup-linux-audio.sh"
+  "$DIR/setup-linux-audio.sh" || err "Audio setup reported an error; continuing."
+fi
+
+run_hint() {
+  echo "  AUDIOPATCH_PORTAL='$PORTAL' AUDIOPATCH_TOKEN='$TOKEN' node '$DIR/audiopatch-agent.mjs' --direction '$DIRECTION' --name '$NAME'"
+}
+
+if [ "$NO_SERVICE" = "1" ]; then
+  log "Install complete (no service). Start the agent with:"
+  run_hint
+  exit 0
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  UNIT_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
+  NODE_BIN="$(command -v node)"
+  cat > "$UNIT_DIR/nrcc-audiopatch.service" <<EOF
+[Unit]
+Description=NRCC AudioPatch agent
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+WorkingDirectory=$DIR
+Environment=AUDIOPATCH_PORTAL=$PORTAL
+Environment=AUDIOPATCH_TOKEN=$TOKEN
+ExecStart=$NODE_BIN $DIR/audiopatch-agent.mjs --direction $DIRECTION --name $NAME
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now nrcc-audiopatch.service
+  loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+  log "Installed + started systemd user service 'nrcc-audiopatch'."
+  log "Status: systemctl --user status nrcc-audiopatch"
+  log "Logs:   journalctl --user -u nrcc-audiopatch -f"
+else
+  err "systemd not found; start the agent manually:"
+  run_hint
+fi
+
+log "Done. The VM will appear in NRCC PatchBay once an operator loads the VM list."

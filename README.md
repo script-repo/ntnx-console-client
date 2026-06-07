@@ -610,7 +610,7 @@ A fifth beta feature (`audioPatch`) embeds a [CC-Peep](https://github.com/script
 
 **How it works**
 
-- A small **VM-side agent** (`deploy/audiopatch/`, adapted from CC-Peep) is installed manually in the guest. It uses `ffmpeg` to move raw 16-bit PCM and connects to `wss://<nrcc>/ws-audiopatch/client`, registering with the VM's **Prism UUID** so NRCC can line it up with the VM list.
+- A small **VM-side agent** (served by NRCC, adapted from CC-Peep) runs in the guest. It uses `ffmpeg` to move raw 16-bit PCM and connects to `wss://<nrcc>/ws-audiopatch/client`. The agent **self-identifies** (MAC / IP / hostname / DMI UUID) and NRCC **resolves the matching Prism VM UUID server-side** from the VM inventory — no operator-supplied UUID. Until the inventory is loaded the agent shows as *resolving*, then binds automatically.
 - The browser opens one **admin socket** (`/ws-audiopatch/admin`, authenticated by the existing `nrcc_sid` cookie) while the feature is on. NRCC relays output frames VM→admin and input frames admin→VM. Patch/unpatch are driven over this socket so the live audio binding and control state never diverge.
 
 **What you see (action pane → AudioPatch)**
@@ -625,16 +625,32 @@ A fifth beta feature (`audioPatch`) embeds a [CC-Peep](https://github.com/script
 | Surface | Purpose |
 | ------- | ------- |
 | `GET /api/audiopatch/clients` | Read-only registry snapshot for the action pane + PatchBay (login required). |
-| `WS /ws-audiopatch/client`    | VM-agent role. `?token=` required when `NRCC_AUDIOPATCH_TOKEN` is set. `register` → `audio-format` → binary PCM frames. |
+| `GET /audiopatch/install.sh`  | Templated Linux installer (portal URL + token filled in from the request host). No login. |
+| `GET /audiopatch/install.ps1` | Templated Windows installer. No login. |
+| `GET /audiopatch/audiopatch-agent.mjs` | The agent source the installers download. |
+| `WS /ws-audiopatch/client`    | VM-agent role. `?token=` required when `NRCC_AUDIOPATCH_TOKEN` is set. `register` (with `identity`) → `audio-format` → binary PCM frames. |
 | `WS /ws-audiopatch/admin`     | Admin role (cookie auth). Control: `patch` / `unpatch` / `list`; binary frames carry the admin mic for input/both. |
 
-**Agent install** — see `deploy/audiopatch/README.md`. `install-client.sh` (Linux: prereq checks, `npm install`, optional PulseAudio/PipeWire loopback via `setup-linux-audio.sh`, systemd user service) and `install-client.ps1` (Windows: prereq checks incl. a VB-CABLE virtual cable, `npm install`, Scheduled Task). Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows.
+**Agent install (zero-flag one-liner).** NRCC serves the agent and a templated installer, so there is **nothing to clone and no UUID/portal/token to type** — the host you reached NRCC on is baked in. Run inside the guest:
+
+```bash
+# Linux
+curl -fsSLk https://<nrcc-host>/audiopatch/install.sh | bash
+# add options after `-s --`, e.g.:  | bash -s -- --direction both --setup-audio
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr https://<nrcc-host>/audiopatch/install.ps1 -UseBasicParsing | iex"
+```
+
+The exact command for your deployment is shown in **PatchBay → Add a VM** (with a copy button). The installer checks Node ≥ 18 / ffmpeg, downloads the agent, installs `ws` locally (or uses Node 22's built-in WebSocket), optionally creates a PulseAudio/PipeWire loopback (Linux `--setup-audio`), and installs a restart-on-failure service (systemd user service on Linux, Scheduled Task on Windows). Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows. Full details and a manual-run path: `deploy/audiopatch/README.md`.
 
 **Trust model & caveats**
 
 - **Audio relay is raw PCM passthrough.** NRCC neither transcodes nor persists the live stream (only the optional recording does). Frames above `NRCC_AUDIOPATCH_MAX_FRAME_BYTES` are dropped.
 - **Agents authenticate with a shared token**, not Prism credentials. Leave `NRCC_AUDIOPATCH_TOKEN` empty only in trusted labs (a one-time warning is logged); set a strong value otherwise.
-- **One agent per VM UUID** (newest registration wins); stale agents are dropped after `NRCC_AUDIOPATCH_CLIENT_TTL_MS` of missed heartbeats.
+- **One agent per resolved VM** (newest registration wins); unresolved agents register under a provisional key and are re-bound to a real UUID as the VM inventory refreshes (never while a live patch is active). Stale agents are dropped after `NRCC_AUDIOPATCH_CLIENT_TTL_MS` of missed heartbeats.
 - **Microphone input requires a secure context** (HTTPS / multi-user mode) so the browser will grant `getUserMedia`.
 
 ---

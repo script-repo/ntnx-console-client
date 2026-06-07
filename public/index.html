@@ -1644,6 +1644,53 @@
         color: var(--ntx-text-subtle);
         font-size: 13px;
       }
+      .patchbay-install {
+        margin-top: 16px;
+        border-top: 1px solid var(--ntx-border);
+        padding-top: 12px;
+      }
+      .patchbay-install > summary {
+        cursor: pointer;
+        font-size: 12.5px;
+        font-weight: 600;
+        color: var(--ntx-accent, #4f46e5);
+      }
+      .patchbay-install-hint {
+        margin: 10px 0;
+        font-size: 12px;
+        color: var(--ntx-text-muted);
+        line-height: 1.5;
+      }
+      .patchbay-install-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .patchbay-install-label {
+        flex: 0 0 58px;
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--ntx-text-subtle);
+        text-transform: uppercase;
+      }
+      .patchbay-install-cmd {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-x: auto;
+        white-space: nowrap;
+        padding: 6px 8px;
+        font-size: 11.5px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        background: var(--ntx-bg-subtle, rgba(0, 0, 0, 0.04));
+        border: 1px solid var(--ntx-border);
+        border-radius: 6px;
+      }
+      .patchbay-install-copy {
+        flex: 0 0 auto;
+        font-size: 11px;
+        padding: 5px 10px;
+      }
       .patchbay-node {
         border: 1px solid var(--ntx-border);
         border-radius: 8px;
@@ -4250,6 +4297,24 @@
           </p>
           <div id="patchBayGraph" class="patchbay-graph" aria-live="polite"></div>
           <div id="patchBayEmpty" class="patchbay-empty">No VMs are currently registered with the AudioPatch portal.</div>
+          <details class="patchbay-install">
+            <summary>Add a VM &mdash; one-liner install</summary>
+            <p class="patchbay-install-hint">
+              Run inside the guest VM. No VM UUID, portal address or token
+              to type &mdash; the agent self-identifies and NRCC resolves the
+              VM automatically. Requires Node.js &ge; 18 and ffmpeg.
+            </p>
+            <div class="patchbay-install-row">
+              <span class="patchbay-install-label">Linux</span>
+              <code id="patchBayInstallLinux" class="patchbay-install-cmd"></code>
+              <button id="patchBayCopyLinux" type="button" class="patchbay-install-copy" data-target="patchBayInstallLinux">Copy</button>
+            </div>
+            <div class="patchbay-install-row">
+              <span class="patchbay-install-label">Windows</span>
+              <code id="patchBayInstallWindows" class="patchbay-install-cmd"></code>
+              <button id="patchBayCopyWindows" type="button" class="patchbay-install-copy" data-target="patchBayInstallWindows">Copy</button>
+            </div>
+          </details>
         </div>
         <div class="modal-footer">
           <span id="patchBayStatus" class="patchbay-status"></span>

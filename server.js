@@ -835,9 +835,82 @@ app.post("/api/log", (req, res) => {
 // fixes the frame direction so frames carry no tag. Patch/unpatch are
 // driven over the admin WS (so the live audio binding and the control
 // state can never disagree); REST is read-only state for the UI.
-const audioPatchClients = new Map(); // vmUuid -> client record
+const audioPatchClients = new Map(); // clientKey (uuid or prov:*) -> client record
 const audioPatchAdmins = new Map();  // adminId -> admin record
 let _audioPatchTokenWarned = false;
+
+// ---------------------------------------------------------------------
+// VM identity index. Lets a self-identifying AudioPatch agent (which
+// knows its own MACs/IPs/hostname but NOT its Prism VM UUID) be matched
+// to a UUID server-side, so the operator never has to hunt one down.
+// Rebuilt opportunistically from every VM enumeration (updateVmIdentityIndex).
+// ---------------------------------------------------------------------
+const vmIdentityIndex = {
+  byMac: new Map(),  // mac      -> uuid
+  byIp: new Map(),   // ip       -> uuid
+  byName: new Map(), // namelc   -> uuid
+  uuids: new Set(),
+  updatedAt: 0
+};
+
+function updateVmIdentityIndex(vms) {
+  if (!Array.isArray(vms) || !vms.length) return;
+  for (const vm of vms) {
+    const uuid = String(vm.uuid || "").toLowerCase();
+    if (!uuid) continue;
+    vmIdentityIndex.uuids.add(uuid);
+    (vm.macAddresses || []).forEach((mac) => {
+      const m = normalizeMac(mac);
+      if (m) vmIdentityIndex.byMac.set(m, uuid);
+    });
+    (vm.ipAddresses || []).forEach((ip) => {
+      if (ip) vmIdentityIndex.byIp.set(String(ip), uuid);
+    });
+    if (vm.name) vmIdentityIndex.byName.set(String(vm.name).toLowerCase(), uuid);
+  }
+  vmIdentityIndex.updatedAt = Date.now();
+  // A fresh index may let previously-unresolved agents bind to a UUID.
+  reresolveAudioPatchClients();
+}
+
+// Resolve a VM UUID from whatever identity signals an agent reported.
+// Priority: explicit DMI UUID that exists in inventory -> MAC -> IP ->
+// hostname == VM name. Returns "" when nothing matches.
+function resolveVmIdentity(identity) {
+  if (!identity || typeof identity !== "object") return "";
+  const dmi = String(identity.dmiUuid || "").toLowerCase();
+  if (dmi && VM_UUID_REGEX.test(dmi) && vmIdentityIndex.uuids.has(dmi)) return dmi;
+  for (const mac of identity.macs || []) {
+    const m = normalizeMac(mac);
+    if (m && vmIdentityIndex.byMac.has(m)) return vmIdentityIndex.byMac.get(m);
+  }
+  for (const ip of identity.ips || []) {
+    if (ip && vmIdentityIndex.byIp.has(String(ip))) return vmIdentityIndex.byIp.get(String(ip));
+  }
+  const host = String(identity.hostname || "").toLowerCase();
+  if (host && vmIdentityIndex.byName.has(host)) return vmIdentityIndex.byName.get(host);
+  return "";
+}
+
+// After the index refreshes, try to bind any unresolved agent to a real
+// UUID. We only re-key agents that nobody is actively patched to, so a
+// live patch can never have its target swapped out from under it.
+function reresolveAudioPatchClients() {
+  for (const client of Array.from(audioPatchClients.values())) {
+    if (client.resolved) continue;
+    if (client.listeners.size || client.inputSenders.size) continue;
+    const uuid = resolveVmIdentity(client.identity);
+    if (!uuid || uuid === client.vmUuid) continue;
+    if (audioPatchClients.has(uuid)) continue; // a resolved agent already owns it
+    audioPatchClients.delete(client.vmUuid);
+    client.vmUuid = uuid;
+    client.resolved = true;
+    client.ws.nrccAudioVmUuid = uuid;
+    audioPatchClients.set(uuid, client);
+    audioPatchSend(client.ws, { type: "resolved", vmUuid: uuid });
+  }
+  audioPatchBroadcastClients();
+}
 
 function audioPatchClientPublic(c) {
   return {
@@ -848,6 +921,7 @@ function audioPatchClientPublic(c) {
     outputFormat: c.outputFormat || null,
     listeners: c.listeners.size,
     inputSenders: c.inputSenders.size,
+    resolved: Boolean(c.resolved),
     sinceMs: c.registeredAtMs
   };
 }
@@ -909,6 +983,62 @@ app.get("/api/audiopatch/clients", (req, res) => {
     return res.status(401).json({ error: "Login required." });
   }
   res.json({ enabled: true, clients: audioPatchClientList() });
+});
+
+// ---------------------------------------------------------------------
+// NRCC-served AudioPatch agent + zero-flag installers.
+//
+// A guest VM installs the agent with a single command pointed at this
+// NRCC instance, e.g.:
+//   curl -fsSLk https://<nrcc-host>/audiopatch/install.sh | bash
+// The installer templates in the portal URL (derived from the host the
+// guest reached us on) and token, so the operator never types a portal
+// address, token, or VM UUID -- the agent self-identifies and NRCC
+// resolves the UUID server-side.
+// ---------------------------------------------------------------------
+const AUDIOPATCH_ASSET_DIR = path.join(__dirname, "public", "audiopatch");
+
+function audioPatchInstallContext(req) {
+  const host = String(req.headers.host || "").trim() || `localhost:${PORT}`;
+  const secure = req.secure || req.protocol === "https";
+  const wsScheme = secure ? "wss" : "ws";
+  const httpScheme = secure ? "https" : "http";
+  return {
+    portal: `${wsScheme}://${host}/ws-audiopatch/client`,
+    base: `${httpScheme}://${host}`,
+    token: AUDIOPATCH_TOKEN || ""
+  };
+}
+
+function renderAudioPatchTemplate(fileName, req) {
+  const raw = fs.readFileSync(path.join(AUDIOPATCH_ASSET_DIR, fileName), "utf8");
+  const ctx = audioPatchInstallContext(req);
+  return raw
+    .replace(/__NRCC_PORTAL__/g, ctx.portal)
+    .replace(/__NRCC_BASE__/g, ctx.base)
+    .replace(/__NRCC_TOKEN__/g, ctx.token);
+}
+
+app.get("/audiopatch/install.sh", (req, res) => {
+  if (!AUDIOPATCH_ENABLED) {
+    return res.status(503).type("text/plain").send("# AudioPatch portal is disabled on this NRCC instance.\n");
+  }
+  try {
+    res.type("text/x-shellscript").send(renderAudioPatchTemplate("install.sh.tmpl", req));
+  } catch (e) {
+    res.status(500).type("text/plain").send(`# Failed to render installer: ${e.message}\n`);
+  }
+});
+
+app.get("/audiopatch/install.ps1", (req, res) => {
+  if (!AUDIOPATCH_ENABLED) {
+    return res.status(503).type("text/plain").send("# AudioPatch portal is disabled on this NRCC instance.\n");
+  }
+  try {
+    res.type("text/plain").send(renderAudioPatchTemplate("install.ps1.tmpl", req));
+  } catch (e) {
+    res.status(500).type("text/plain").send(`# Failed to render installer: ${e.message}\n`);
+  }
 });
 
 // =====================================================================
@@ -3060,6 +3190,57 @@ function collectVmIpAddresses(vm) {
   return Array.from(out);
 }
 
+// Collect every NIC MAC address Prism reports for a VM. Used to line a
+// self-identifying AudioPatch agent (which knows its own MACs) up with a
+// Prism VM UUID without the operator having to supply one. Returns
+// lower-cased, colon-delimited MACs.
+const MAC_LITERAL = /^[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}$/i;
+function normalizeMac(value) {
+  if (typeof value !== "string") return "";
+  const v = value.trim();
+  if (!MAC_LITERAL.test(v)) return "";
+  return v.replace(/-/g, ":").toLowerCase();
+}
+function collectVmMacAddresses(vm) {
+  const out = new Set();
+  const visit = (node, parentKey) => {
+    if (node == null) return;
+    if (typeof node === "string") {
+      if (parentKey && /mac/i.test(parentKey)) {
+        const mac = normalizeMac(node);
+        if (mac) out.add(mac);
+      }
+      return;
+    }
+    if (typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      node.forEach((child) => visit(child, parentKey));
+      return;
+    }
+    for (const [key, val] of Object.entries(node)) {
+      if (typeof val === "string" && /mac/i.test(key)) {
+        const mac = normalizeMac(val);
+        if (mac) out.add(mac);
+      } else if (val && typeof val === "object") {
+        visit(val, key);
+      }
+    }
+  };
+  const roots = [
+    vm?.nics,
+    vm?.spec?.resources?.nic_list,
+    vm?.status?.resources?.nic_list,
+    vm?.spec?.resources?.nicList,
+    vm?.status?.resources?.nicList,
+    vm?.vm_nics,
+    vm?.networkConfig,
+    vm?.networkInfo
+  ];
+  roots.forEach((root) => visit(root, ""));
+  if (out.size === 0) visit(vm, "");
+  return Array.from(out);
+}
+
 // Quick visibility into Prism IP-reporting coverage. Logged once per
 // /api/vms response so an operator can tell at a glance whether the
 // IP parser is keeping up with the VMs the cluster has, and how
@@ -3202,7 +3383,8 @@ function parseVmList(vmResponse) {
           /(file|files)[-_ ]server/i.test(String(resolvedName)),
         categories,
         ipAddresses,
-        ipAddress: ipAddresses[0]
+        ipAddress: ipAddresses[0],
+        macAddresses: collectVmMacAddresses(vm)
       };
     })
     .filter((vm) => vm.uuid)
@@ -4528,6 +4710,9 @@ async function enumerateBaseVms(client, includeHiddenVms) {
     new Map(allVms.map((vm) => [vm.uuid, vm])).values()
   ).sort((a, b) => a.name.localeCompare(b.name));
   await hydrateBaseVmFolderCategories(client, deduped);
+  // Feed the AudioPatch identity index so self-identifying agents can be
+  // mapped to a UUID (MAC/IP/name) without an operator-supplied --uuid.
+  updateVmIdentityIndex(deduped);
   return { vms: deduped, selectedVariant, pageSize };
 }
 
@@ -4627,6 +4812,7 @@ async function enrichVmInventory(client, baseVms, selectedVariant, includeHidden
   if (hydrateVmFolders) {
     await hydrateVmFolderCategories(client, deduped);
   }
+  updateVmIdentityIndex(deduped);
   return makeVmInventoryResponse(deduped, selectedVariant, {
     inventoryStage: "enriched",
     cvmProbeSummary
@@ -7175,23 +7361,52 @@ function audioPatchHandleClient(ws, req, requestUrl) {
     if (msg.type === "ping") { ws.isAlive = true; return audioPatchSend(ws, { type: "pong", tsMs: Date.now() }); }
 
     if (msg.type === "register") {
-      const vmUuid = String(msg.vmUuid || "").trim().toLowerCase();
-      if (!vmUuid || vmUuid.length > 128) {
-        return audioPatchSend(ws, { type: "error", error: "register requires a vmUuid." });
-      }
-      if (audioPatchClients.size >= AUDIOPATCH_MAX_CLIENTS && !audioPatchClients.has(vmUuid)) {
+      // Identity-first registration: the agent reports what it knows
+      // about itself (MACs/IPs/DMI UUID/hostname) and we resolve the
+      // Prism VM UUID server-side. An explicit vmUuid still wins if the
+      // operator supplied one. When nothing resolves we register under a
+      // provisional key so the agent still shows in PatchBay, and
+      // re-resolve later as the VM inventory refreshes.
+      const identity = msg.identity && typeof msg.identity === "object"
+        ? {
+            macs: Array.isArray(msg.identity.macs) ? msg.identity.macs.slice(0, 16) : [],
+            ips: Array.isArray(msg.identity.ips) ? msg.identity.ips.slice(0, 16) : [],
+            dmiUuid: String(msg.identity.dmiUuid || "").toLowerCase().slice(0, 64),
+            hostname: String(msg.identity.hostname || "").slice(0, 160)
+          }
+        : { macs: [], ips: [], dmiUuid: "", hostname: "" };
+
+      const explicitUuid = String(msg.vmUuid || "").trim().toLowerCase();
+      const resolvedUuid = (explicitUuid && VM_UUID_REGEX.test(explicitUuid))
+        ? explicitUuid
+        : resolveVmIdentity(identity);
+      const resolved = Boolean(resolvedUuid);
+
+      // Stable provisional key when unresolved: prefer DMI UUID, then a
+      // MAC, then hostname, then a random id.
+      const provKey = "prov:" + (
+        identity.dmiUuid ||
+        (identity.macs[0] ? normalizeMac(identity.macs[0]) : "") ||
+        identity.hostname.toLowerCase() ||
+        crypto.randomUUID()
+      );
+      const clientKey = resolved ? resolvedUuid : provKey;
+
+      if (audioPatchClients.size >= AUDIOPATCH_MAX_CLIENTS && !audioPatchClients.has(clientKey)) {
         return audioPatchSend(ws, { type: "error", error: "Portal at capacity." });
       }
-      // Newest registration for a UUID wins: evict the old socket.
-      const existing = audioPatchClients.get(vmUuid);
+      // Newest registration for a key wins: evict the old socket.
+      const existing = audioPatchClients.get(clientKey);
       if (existing && existing.ws !== ws) {
         try { existing.ws.close(4409, "Replaced by newer agent"); } catch (_e) { /* ignore */ }
       }
       const caps = msg.capabilities && typeof msg.capabilities === "object" ? msg.capabilities : {};
-      ws.nrccAudioVmUuid = vmUuid;
-      audioPatchClients.set(vmUuid, {
-        vmUuid,
-        vmName: String(msg.vmName || vmUuid).slice(0, 160),
+      ws.nrccAudioVmUuid = clientKey;
+      audioPatchClients.set(clientKey, {
+        vmUuid: clientKey,
+        resolved,
+        identity,
+        vmName: String(msg.vmName || identity.hostname || clientKey).slice(0, 160),
         session: String(msg.session || "").slice(0, 160),
         capabilities: {
           output: caps.output !== false,
@@ -7203,7 +7418,10 @@ function audioPatchHandleClient(ws, req, requestUrl) {
         listeners: existing ? existing.listeners : new Set(),
         inputSenders: existing ? existing.inputSenders : new Set()
       });
-      audioPatchSend(ws, { type: "registered", vmUuid });
+      audioPatchSend(ws, { type: "registered", vmUuid: clientKey, resolved });
+      if (!resolved) {
+        console.log(`[audiopatch] agent '${identity.hostname || clientKey}' registered unresolved (no VM match yet); will retry as inventory refreshes.`);
+      }
       audioPatchBroadcastClients();
       return;
     }

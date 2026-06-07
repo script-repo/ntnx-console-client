@@ -12,6 +12,12 @@
 *.plist      text eol=lf
 *.desktop    text eol=lf
 
+# AudioPatch agent + NRCC-served installer templates. install.sh.tmpl is
+# piped into bash; the .mjs agent and .ps1.tmpl are served verbatim. Keep
+# them LF so `curl ... | bash` and downloads are byte-stable on any host.
+*.mjs        text eol=lf
+*.tmpl       text eol=lf
+
 # PowerShell tolerates either, but keep it deterministic.
 *.ps1        text eol=crlf
 *.cmd        text eol=crlf

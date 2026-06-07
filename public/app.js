@@ -63,6 +63,8 @@ const patchBayEmpty = document.getElementById("patchBayEmpty");
 const patchBayStatusEl = document.getElementById("patchBayStatus");
 const patchBayRefreshBtn = document.getElementById("patchBayRefreshBtn");
 const patchBayCloseBtn = document.getElementById("patchBayCloseBtn");
+const patchBayInstallLinux = document.getElementById("patchBayInstallLinux");
+const patchBayInstallWindows = document.getElementById("patchBayInstallWindows");
 
 const scriptLauncher = document.getElementById("scriptLauncher");
 const scriptLibraryModal = document.getElementById("scriptLibraryModal");
@@ -8103,9 +8105,23 @@ async function refreshAudioPatchClients() {
   } catch (_e) { /* ignore */ }
 }
 
+function fillPatchBayInstallCommands() {
+  // Build the install one-liner against whatever host the browser reached
+  // NRCC on, so the guest can be pointed straight at this instance.
+  const base = `${window.location.protocol}//${window.location.host}`;
+  if (patchBayInstallLinux) {
+    patchBayInstallLinux.textContent = `curl -fsSLk ${base}/audiopatch/install.sh | bash`;
+  }
+  if (patchBayInstallWindows) {
+    patchBayInstallWindows.textContent =
+      `powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr ${base}/audiopatch/install.ps1 -UseBasicParsing | iex"`;
+  }
+}
+
 function openPatchBay() {
   if (!audioPatchAvailable()) { setStatus("Enable AudioPatch in Settings first."); return; }
   patchBayModal.classList.add("open");
+  fillPatchBayInstallCommands();
   renderPatchBay();
   refreshAudioPatchClients();
   audioPatchSocketSend({ type: "list" });
@@ -8141,11 +8157,13 @@ function renderPatchBay() {
         data-patch-vm="${escapeHtml(id)}" data-patch-dir="${d.dir}" ${d.on ? "" : "disabled"}>${d.label}</button>`;
     }).join("");
     const listeners = Number(c.listeners || 0);
+    const unresolved = c.resolved === false;
     node.innerHTML = `
-      <div class="patchbay-node-name"><span class="patchbay-node-dot"></span>${escapeHtml(c.vmName || c.vmUuid)}</div>
+      <div class="patchbay-node-name"><span class="patchbay-node-dot"${unresolved ? ' style="background:#d97706"' : ""}></span>${escapeHtml(c.vmName || c.vmUuid)}</div>
       <div class="patchbay-node-meta">
         ${escapeHtml(c.session || "")}${c.session ? " &middot; " : ""}${listeners} listener${listeners === 1 ? "" : "s"}
         ${acceptsInput ? "&middot; input capable" : "&middot; output only"}
+        ${unresolved ? "&middot; <em>resolving to a VM&hellip;</em>" : ""}
       </div>
       <div class="patchbay-node-actions">
         ${btns}
@@ -8187,6 +8205,19 @@ if (patchBayRefreshBtn) {
 if (patchBayModal) {
   patchBayModal.addEventListener("click", (event) => {
     if (event.target === patchBayModal) closePatchBay();
+    const copyBtn = event.target.closest && event.target.closest(".patchbay-install-copy");
+    if (copyBtn) {
+      const target = document.getElementById(copyBtn.getAttribute("data-target"));
+      const text = target ? target.textContent : "";
+      if (text && navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(() => {
+          const prev = copyBtn.textContent;
+          copyBtn.textContent = "Copied";
+          setTimeout(() => { copyBtn.textContent = prev; }, 1500);
+        }).catch(() => setStatus("Copy failed; select the command manually."));
+      }
+      return;
+    }
     const btn = event.target.closest && event.target.closest("[data-patch-vm]");
     if (!btn) return;
     const vmUuid = btn.getAttribute("data-patch-vm");
