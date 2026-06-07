@@ -8113,8 +8113,11 @@ function fillPatchBayInstallCommands() {
     patchBayInstallLinux.textContent = `curl -fsSLk ${base}/audiopatch/install.sh | bash`;
   }
   if (patchBayInstallWindows) {
+    // Use the built-in curl.exe (Win10 1803+/Server 2019+) to fetch the
+    // script -- it handles the self-signed cert (-k) without the .NET
+    // Schannel/iwr TLS issues, then run it with PowerShell.
     patchBayInstallWindows.textContent =
-      `powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr ${base}/audiopatch/install.ps1 -UseBasicParsing | iex"`;
+      `curl.exe -fsSLk ${base}/audiopatch/install.ps1 -o $env:TEMP\\nrcc-audiopatch-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\\nrcc-audiopatch-install.ps1`;
   }
 }
 

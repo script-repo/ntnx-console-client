@@ -43,7 +43,7 @@ curl -fsSLk https://<nrcc-host>/audiopatch/install.sh | bash -s -- --direction b
 **Windows (PowerShell):**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr https://<nrcc-host>/audiopatch/install.ps1 -UseBasicParsing | iex"
+curl.exe -fsSLk https://<nrcc-host>/audiopatch/install.ps1 -o $env:TEMP\nrcc-audiopatch-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\nrcc-audiopatch-install.ps1
 ```
 
 The exact one-liner for your deployment (with the host already filled in)

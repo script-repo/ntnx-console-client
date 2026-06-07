@@ -98,48 +98,76 @@ if (cfg.osType === "windows") {
   // VB-CABLE exposes its output as a recording device "CABLE Output".
   cfg.captureSource ||= "audio=CABLE Output (VB-Audio Virtual Cable)";
 } else {
-  cfg.captureFormat ||= "pulse";
-  cfg.playbackFormat ||= "pulse";
-  // @DEFAULT_MONITOR@ captures whatever the VM is playing; the loopback
-  // setup script can create a dedicated null sink + monitor instead.
+  // @DEFAULT_MONITOR@ / @DEFAULT_SINK@ are sentinels meaning "auto-detect";
+  // detectLinuxAudioBackend() picks PulseAudio/PipeWire or ALSA snd-aloop.
   cfg.captureSource ||= "@DEFAULT_MONITOR@";
   cfg.playbackSink ||= "@DEFAULT_SINK@";
+  detectLinuxAudioBackend();
 }
 
-// Resolve the Linux Pulse/PipeWire placeholders to real device names so
-// capture (monitor of the default sink) and playback (the default sink)
-// work out of the box without --setup-audio. Explicit --capture-source /
-// --playback-sink overrides are left untouched.
-function resolveLinuxPulseDevices() {
-  if (cfg.osType === "windows") return;
-  const needsMonitor = cfg.captureSource === "@DEFAULT_MONITOR@";
-  const needsSink = cfg.playbackSink === "@DEFAULT_SINK@";
-  if (!needsMonitor && !needsSink) return;
-  let defaultSink = "";
+function pulseAvailable() {
   try {
-    const r = spawnSync("pactl", ["get-default-sink"], { encoding: "utf8" });
-    if (r.status === 0 && r.stdout) defaultSink = r.stdout.trim();
+    return spawnSync("pactl", ["info"], { encoding: "utf8" }).status === 0;
   } catch (_e) {
-    // pactl missing; handled by the fallbacks below.
-  }
-  if (needsMonitor) {
-    if (defaultSink) {
-      cfg.captureSource = `${defaultSink}.monitor`;
-    } else {
-      // No pactl/server: capturing 'default' grabs the default *source*
-      // (often a mic), not playback, but it lets the agent start.
-      cfg.captureSource = "default";
-      console.warn("[audiopatch] could not resolve default sink via pactl; capturing 'default' source. Install pulseaudio-utils / pipewire-pulse or pass --capture-source.");
-    }
-  }
-  if (needsSink) {
-    // ffmpeg's pulse muxer connects to the default sink regardless of the
-    // trailing arg (it is the stream name), so an empty/default value is
-    // safe; prefer the explicit default sink name when we know it.
-    cfg.playbackSink = defaultSink || "default";
+    return false;
   }
 }
-resolveLinuxPulseDevices();
+
+function defaultPulseSink() {
+  try {
+    const r = spawnSync("pactl", ["get-default-sink"], { encoding: "utf8" });
+    if (r.status === 0 && r.stdout) return r.stdout.trim();
+  } catch (_e) { /* ignore */ }
+  return "";
+}
+
+function alsaLoopbackPresent() {
+  for (const cmd of ["arecord", "aplay"]) {
+    try {
+      const r = spawnSync(cmd, ["-l"], { encoding: "utf8" });
+      if (r.status === 0 && /Loopback/i.test(r.stdout || "")) return true;
+    } catch (_e) { /* ignore */ }
+  }
+  return false;
+}
+
+// Pick a working ffmpeg backend/device for this Linux guest. Explicit
+// --capture-source / --playback-sink (and --capture-format/--playback-format)
+// always win; only the @...@ sentinels are auto-resolved.
+function detectLinuxAudioBackend() {
+  const autoCapture = cfg.captureSource === "@DEFAULT_MONITOR@";
+  const autoSink = cfg.playbackSink === "@DEFAULT_SINK@";
+
+  if (pulseAvailable()) {
+    cfg.captureFormat ||= "pulse";
+    cfg.playbackFormat ||= "pulse";
+    const sink = defaultPulseSink();
+    if (autoCapture) cfg.captureSource = sink ? `${sink}.monitor` : "default";
+    if (autoSink) cfg.playbackSink = sink || "default";
+    console.info(`[audiopatch] audio backend: pulse (capture='${cfg.captureSource}', playback='${cfg.playbackSink}')`);
+    return;
+  }
+
+  if (alsaLoopbackPresent()) {
+    cfg.captureFormat ||= "alsa";
+    cfg.playbackFormat ||= "alsa";
+    // snd-aloop pairs subdevice 0 (playback) with subdevice 1 (capture):
+    // whatever is played to hw:Loopback,0 is captured from hw:Loopback,1.
+    if (autoCapture) cfg.captureSource = "hw:Loopback,1,0";
+    if (autoSink) cfg.playbackSink = "hw:Loopback,0,0";
+    console.info(`[audiopatch] audio backend: alsa snd-aloop (capture='${cfg.captureSource}', playback='${cfg.playbackSink}')`);
+    return;
+  }
+
+  // Nothing capturable: still start (input may work to the default device)
+  // but make the silence diagnosable.
+  cfg.captureFormat ||= "pulse";
+  cfg.playbackFormat ||= "pulse";
+  if (autoCapture) cfg.captureSource = "default";
+  if (autoSink) cfg.playbackSink = "default";
+  console.warn("[audiopatch] No PulseAudio/PipeWire server and no ALSA 'Loopback' card found.");
+  console.warn("[audiopatch] OUTPUT capture will be SILENT until a capturable device exists. Re-run the installer with --setup-audio, or load the loopback once: sudo modprobe snd-aloop (persist in /etc/modules-load.d/snd-aloop.conf).");
+}
 
 if (!cfg.portal) {
   console.error("[audiopatch] --portal (or AUDIOPATCH_PORTAL) is required, e.g. wss://nrcc.example/ws-audiopatch/client");

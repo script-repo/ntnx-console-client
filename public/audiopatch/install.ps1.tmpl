@@ -2,9 +2,9 @@
 #
 # The portal URL, token and download locations below are filled in by the
 # NRCC instance you fetched this from. No VM UUID or portal address to type.
-# Run from an elevated-or-normal PowerShell:
+# Run from a normal PowerShell prompt (curl.exe ships with Win10 1803+):
 #
-#   powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr __NRCC_BASE__/audiopatch/install.ps1 -UseBasicParsing | iex"
+#   curl.exe -fsSLk __NRCC_BASE__/audiopatch/install.ps1 -o $env:TEMP\nrcc-audiopatch-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\nrcc-audiopatch-install.ps1
 #
 # Override defaults with environment variables before running:
 #   $env:AUDIOPATCH_DIRECTION = 'both'   # output|input|both (default: output)
@@ -51,7 +51,15 @@ try {
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $AgentPath = Join-Path $Dir "audiopatch-agent.mjs"
 Write-Log "Downloading agent -> $AgentPath"
-Invoke-WebRequest -Uri $AgentUrl -OutFile $AgentPath -UseBasicParsing
+# Prefer curl.exe (handles the self-signed cert via -k without the .NET
+# Schannel issues that break Invoke-WebRequest on some Windows builds).
+$curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
+if ($curlExe) {
+  & curl.exe -fsSLk $AgentUrl -o $AgentPath
+  if ($LASTEXITCODE -ne 0) { Fail "curl.exe failed to download the agent from $AgentUrl" }
+} else {
+  Invoke-WebRequest -Uri $AgentUrl -OutFile $AgentPath -UseBasicParsing
+}
 
 # ---- ws dependency (reliable self-signed wss:// support) ---------------
 Write-Log "Installing the 'ws' WebSocket dependency in $Dir ..."

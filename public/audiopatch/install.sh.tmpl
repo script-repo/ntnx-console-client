@@ -65,11 +65,23 @@ if ! ( cd "$DIR" && npm install --omit=dev --no-audit --no-fund --loglevel=error
   fi
 fi
 
+# Output capture needs a capturable device. If there's no PulseAudio/
+# PipeWire server, auto-run the audio setup (ALSA snd-aloop) so output
+# isn't silent -- otherwise the agent has nothing to capture.
+if [ "$SETUP_AUDIO" != "1" ]; then
+  if ! ( command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1 ); then
+    if ! ( aplay -l 2>/dev/null | grep -qi loopback ); then
+      log "No PulseAudio/PipeWire server and no ALSA loopback detected; running audio setup so OUTPUT capture works."
+      SETUP_AUDIO=1
+    fi
+  fi
+fi
+
 if [ "$SETUP_AUDIO" = "1" ]; then
-  log "Configuring guest audio (dedicated null sink) ..."
+  log "Configuring guest audio (Pulse null sink or ALSA snd-aloop) ..."
   $CURL "$SETUP_URL" -o "$DIR/setup-linux-audio.sh"
   chmod +x "$DIR/setup-linux-audio.sh"
-  "$DIR/setup-linux-audio.sh" || err "Audio setup reported an error; continuing."
+  "$DIR/setup-linux-audio.sh" || err "Audio setup reported an error (snd-aloop may need a one-time 'sudo modprobe snd-aloop'); continuing."
 fi
 
 run_hint() {
@@ -104,9 +116,12 @@ RestartSec=5
 WantedBy=default.target
 EOF
   systemctl --user daemon-reload
-  systemctl --user enable --now nrcc-audiopatch.service
+  systemctl --user enable nrcc-audiopatch.service >/dev/null 2>&1 || true
+  # restart (not just enable --now) so a re-install actually picks up new
+  # args like --direction both instead of leaving the old process running.
+  systemctl --user restart nrcc-audiopatch.service
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
-  log "Installed + started systemd user service 'nrcc-audiopatch'."
+  log "Installed + (re)started systemd user service 'nrcc-audiopatch' (direction=$DIRECTION)."
   log "Status: systemctl --user status nrcc-audiopatch"
   log "Logs:   journalctl --user -u nrcc-audiopatch -f"
 else
