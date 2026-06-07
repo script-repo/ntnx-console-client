@@ -4,9 +4,9 @@
 # NRCC instance you fetched this from. No VM UUID or portal address to type.
 # __NRCC_BASE__ is a plain-HTTP URL (NRCC's nginx sidecar proxies it) so this
 # works on any Windows build with no curl.exe and no TLS 1.2 / Schannel dance.
-# Run from a normal PowerShell prompt:
+# Run from a normal PowerShell prompt (paste-safe; no $vars to pre-expand):
 #
-#   powershell -ExecutionPolicy Bypass -Command "$f=Join-Path $env:TEMP 'nrcc-audiopatch-install.ps1'; Invoke-WebRequest '__NRCC_BASE__/audiopatch/install.ps1' -OutFile $f -UseBasicParsing; & powershell -ExecutionPolicy Bypass -File $f"
+#   iex (irm __NRCC_BASE__/audiopatch/install.ps1)
 #
 # Override defaults with environment variables before running:
 #   $env:AUDIOPATCH_DIRECTION = 'both'   # output|input|both (default: output)
@@ -90,7 +90,15 @@ if ($NoService) {
 }
 
 # ---- Scheduled Task ----------------------------------------------------
+# Resolve node.exe robustly. $node.Source is empty for some installs (shims,
+# Store aliases, certain version managers), which makes New-ScheduledTaskAction
+# fail with "Cannot validate argument on parameter 'Execute'".
 $nodePath = $node.Source
+if (-not $nodePath) { $nodePath = $node.Path }
+if (-not $nodePath) { $nodePath = (Get-Command node.exe -ErrorAction SilentlyContinue).Source }
+if (-not $nodePath) { try { $nodePath = (& where.exe node 2>$null | Select-Object -First 1) } catch {} }
+if (-not $nodePath) { Fail "Could not resolve the path to node.exe for the scheduled task. Ensure Node.js is on PATH and re-run." }
+Write-Log "Using node: $nodePath"
 $agentArgs = @(
   "`"$AgentPath`"",
   "--portal", "`"$Portal`"",

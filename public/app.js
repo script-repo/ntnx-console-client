@@ -8117,11 +8117,10 @@ function fillPatchBayInstallCommands() {
     patchBayInstallLinux.textContent = `curl -fsSL ${base}/audiopatch/install.sh | bash`;
   }
   if (patchBayInstallWindows) {
-    // Plain HTTP download means a bare Invoke-WebRequest works on every
-    // Windows build (no curl.exe, no TLS 1.2 dance). Fetch to a temp file,
-    // then run it with PowerShell.
-    patchBayInstallWindows.textContent =
-      `powershell -ExecutionPolicy Bypass -Command "$f=Join-Path $env:TEMP 'nrcc-audiopatch-install.ps1'; Invoke-WebRequest '${base}/audiopatch/install.ps1' -OutFile $f -UseBasicParsing; & powershell -ExecutionPolicy Bypass -File $f"`;
+    // Plain HTTP + iex(irm) is paste-safe inside an existing PowerShell
+    // prompt (no $vars for the outer shell to pre-expand) and needs no
+    // curl.exe / TLS. Run it from a normal PowerShell window.
+    patchBayInstallWindows.textContent = `iex (irm ${base}/audiopatch/install.ps1)`;
   }
 }
 

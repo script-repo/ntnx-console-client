@@ -640,8 +640,8 @@ curl -fsSL http://<nrcc-host>:32088/audiopatch/install.sh | bash
 ```
 
 ```powershell
-# Windows (no curl.exe / no TLS needed)
-powershell -ExecutionPolicy Bypass -Command "$f=Join-Path $env:TEMP 'nrcc-audiopatch-install.ps1'; Invoke-WebRequest 'http://<nrcc-host>:32088/audiopatch/install.ps1' -OutFile $f -UseBasicParsing; & powershell -ExecutionPolicy Bypass -File $f"
+# Windows (no curl.exe / no TLS needed; paste-safe in a PowerShell prompt)
+iex (irm http://<nrcc-host>:32088/audiopatch/install.ps1)
 ```
 
 The exact command for your deployment is shown in **PatchBay → Add a VM** (click the command to copy it) and uses the HTTP base advertised by `/api/config` (`audioPatch.installBase`, derived from `NRCC_PUBLIC_HTTP_PORT`). The installer checks Node ≥ 18 / ffmpeg, downloads the agent, installs `ws` locally (or uses Node 22's built-in WebSocket), and installs a restart-on-failure service (systemd user service on Linux, Scheduled Task on Windows). The agent then connects to the realtime portal on `wss://` (the ws client tolerates the self-signed cert). On Linux it defaults to `--direction both` and the agent auto-detects the audio backend for **output** capture: a running PulseAudio/PipeWire (captures the default sink monitor); if none is running the installer's `--setup-audio` step first tries to **start a per-user PulseAudio/PipeWire (no root)** and create a null sink, and only falls back to ALSA `snd-aloop` (one-time `sudo modprobe snd-aloop`) when there is no Pulse stack at all. Loopback detection reads `/proc/asound/cards` (not `aplay`/`arecord`), so it works on minimal server installs without `alsa-utils`; ffmpeg drives the loopback device directly. If output is silent the agent logs a clear "captured 0 bytes — nothing is playing to the capture device" warning with a test command. Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows. Full details and a manual-run path: `deploy/audiopatch/README.md`.
