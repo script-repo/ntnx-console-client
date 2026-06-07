@@ -304,6 +304,11 @@ copy .env.example .env       # Windows
 | `NRCC_SSH_MAX_SESSIONS`   | `64`               | **Beta.** Hard cap on simultaneous SSH sessions per server process. |
 | `NRCC_SSH_READY_TIMEOUT_MS`| `15000`           | **Beta.** How long `ssh2` waits for the remote handshake before giving up. |
 | `NRCC_VM_FOLDERS_ENABLED` | `true`             | **Beta.** Master switch for VM folders (Prism categories under `NTNXFolderPath`). Set to `false` to hide the sidebar folder pane and refuse the `/api/folders/*` and `/api/vms/folder*` endpoints (returns `503`). |
+| `NRCC_AUDIOPATCH_ENABLED` | `true`             | **Beta.** Master switch for the AudioPatch portal. `false` refuses the `/ws-audiopatch/*` upgrades and `/api/audiopatch/*` routes. The per-user beta opt-in still defaults off. |
+| `NRCC_AUDIOPATCH_TOKEN`   | _(empty)_          | **Beta.** Shared secret VM agents must present (`?token=`) to register. Empty = open lab portal (logs a one-time warning). |
+| `NRCC_AUDIOPATCH_MAX_CLIENTS` / `NRCC_AUDIOPATCH_MAX_ADMINS` | `256` / `256` | **Beta.** Registry caps for VM agents / admin sockets. |
+| `NRCC_AUDIOPATCH_CLIENT_TTL_MS` | `45000`      | **Beta.** Drop a VM agent from PatchBay after this many ms of missed heartbeats. |
+| `NRCC_AUDIOPATCH_MAX_FRAME_BYTES` | `262144`   | **Beta.** Largest PCM frame the portal will relay; oversized frames are dropped. |
 
 ### Run
 
@@ -492,7 +497,8 @@ const FEATURE_FLAGS = {
   vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
   sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" },
   rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" },
-  vmFolders:   { stage: "beta", description: "Group VMs into Prism-category-backed folders (NTNXFolderPath)" }
+  vmFolders:   { stage: "beta", description: "Group VMs into Prism-category-backed folders (NTNXFolderPath)" },
+  audioPatch:  { stage: "beta", defaultEnabled: false, description: "Patch into a registered VM's audio (input/output) via the AudioPatch portal" }
 };
 ```
 
@@ -597,6 +603,39 @@ Selecting a real folder narrows the VM list to that folder *and every subfolder*
 - **Prism is the source of truth.** NRCC keeps no folder/assignment overlay on disk; if Prism's category catalog is reset out-of-band, NRCC's folder tree resets with it. The current selection + collapsed map are per-browser (`localStorage` key `ntnxConsoleVmFolderPrefs.v1`).
 - **Validation matches Prism's category rules.** Each path segment must start and end with a letter or number; max 64 characters total; the usual forbidden category characters (`/,!'"#%() *+:;=?` `` ` `` `|[]^&`) are refused client- and server-side.
 - **Folder rename / move walks every affected VM** via `GET /api/nutanix/v3/vms/<uuid>` + `PUT` with a clean `{api_version, metadata, spec}` payload. For folders with hundreds of VMs this is sequential and can take a few seconds; we deliberately keep it simple in v1 and may add a small concurrency budget if customers hit it.
+
+### Beta: AudioPatch
+
+A fifth beta feature (`audioPatch`) embeds a [CC-Peep](https://github.com/script-repo/CC-Peep)-style **audio portal** in NRCC so you can listen to (and record) a VM's audio — and optionally send your microphone into the VM — straight from the action pane. Unlike the other beta features, AudioPatch is **off even when "Show beta features" is on**: it carries `defaultEnabled: false`, so each user must tick **AudioPatch** in Settings explicitly. The operator's server-side master switch is `NRCC_AUDIOPATCH_ENABLED` (defaults `true`).
+
+**How it works**
+
+- A small **VM-side agent** (`deploy/audiopatch/`, adapted from CC-Peep) is installed manually in the guest. It uses `ffmpeg` to move raw 16-bit PCM and connects to `wss://<nrcc>/ws-audiopatch/client`, registering with the VM's **Prism UUID** so NRCC can line it up with the VM list.
+- The browser opens one **admin socket** (`/ws-audiopatch/admin`, authenticated by the existing `nrcc_sid` cookie) while the feature is on. NRCC relays output frames VM→admin and input frames admin→VM. Patch/unpatch are driven over this socket so the live audio binding and control state never diverge.
+
+**What you see (action pane → AudioPatch)**
+
+- **Patch In** — listen to the active console's VM. Enabled only when that VM has registered an agent; greyed out otherwise.
+- **Disconnect Audio** — stop the current patch.
+- **PatchBay** — a graphical board of every registered VM with per-VM **Output / Input / Both** patch points (input buttons are disabled for output-only agents). Only one VM is patched at a time.
+- **Recording integration** — if a VM's audio is patched in (output/both) and you hit **Record**, NRCC mixes the patched audio into the WebM (Opus) and flags `audio: true` in the recording metadata.
+
+**Endpoints / sockets (gated on `NRCC_AUDIOPATCH_ENABLED`)**
+
+| Surface | Purpose |
+| ------- | ------- |
+| `GET /api/audiopatch/clients` | Read-only registry snapshot for the action pane + PatchBay (login required). |
+| `WS /ws-audiopatch/client`    | VM-agent role. `?token=` required when `NRCC_AUDIOPATCH_TOKEN` is set. `register` → `audio-format` → binary PCM frames. |
+| `WS /ws-audiopatch/admin`     | Admin role (cookie auth). Control: `patch` / `unpatch` / `list`; binary frames carry the admin mic for input/both. |
+
+**Agent install** — see `deploy/audiopatch/README.md`. `install-client.sh` (Linux: prereq checks, `npm install`, optional PulseAudio/PipeWire loopback via `setup-linux-audio.sh`, systemd user service) and `install-client.ps1` (Windows: prereq checks incl. a VB-CABLE virtual cable, `npm install`, Scheduled Task). Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows.
+
+**Trust model & caveats**
+
+- **Audio relay is raw PCM passthrough.** NRCC neither transcodes nor persists the live stream (only the optional recording does). Frames above `NRCC_AUDIOPATCH_MAX_FRAME_BYTES` are dropped.
+- **Agents authenticate with a shared token**, not Prism credentials. Leave `NRCC_AUDIOPATCH_TOKEN` empty only in trusted labs (a one-time warning is logged); set a strong value otherwise.
+- **One agent per VM UUID** (newest registration wins); stale agents are dropped after `NRCC_AUDIOPATCH_CLIENT_TTL_MS` of missed heartbeats.
+- **Microphone input requires a secure context** (HTTPS / multi-user mode) so the browser will grant `getUserMedia`.
 
 ---
 

@@ -1,0 +1,19 @@
+{
+  "name": "nrcc-audiopatch-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NRCC AudioPatch VM-side audio agent (beta). Streams guest audio to the NRCC AudioPatch portal over WebSocket using ffmpeg.",
+  "type": "module",
+  "bin": {
+    "audiopatch-agent": "audiopatch-agent.mjs"
+  },
+  "scripts": {
+    "start": "node audiopatch-agent.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

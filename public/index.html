@@ -1601,6 +1601,110 @@
         min-height: 0;
         overflow-y: auto;
       }
+
+      /* AudioPatch (beta: audioPatch) ---------------------------------- */
+      /* Action-pane status pill: shows the live patch direction. */
+      #audioPatchStatus {
+        font-variant-numeric: tabular-nums;
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--ntx-accent, #4f46e5);
+      }
+      .action-row.audiopatch-active {
+        color: var(--ntx-accent, #4f46e5);
+      }
+      /* PatchBay modal: wider, scrollable body. */
+      .patchbay-modal { width: 620px; }
+      .patchbay-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .patchbay-refresh {
+        font-size: 12px;
+        padding: 4px 10px;
+      }
+      .patchbay-hint {
+        margin: 0 0 12px;
+        font-size: 12.5px;
+        color: var(--ntx-text-muted);
+        line-height: 1.5;
+      }
+      .patchbay-graph {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+        gap: 12px;
+        max-height: 50vh;
+        overflow-y: auto;
+      }
+      .patchbay-empty {
+        padding: 18px;
+        text-align: center;
+        color: var(--ntx-text-subtle);
+        font-size: 13px;
+      }
+      .patchbay-node {
+        border: 1px solid var(--ntx-border);
+        border-radius: 8px;
+        padding: 12px;
+        background: var(--ntx-surface-alt, rgba(127,127,127,0.04));
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .patchbay-node.is-patched {
+        border-color: var(--ntx-accent, #4f46e5);
+        box-shadow: 0 0 0 1px var(--ntx-accent, #4f46e5);
+      }
+      .patchbay-node-name {
+        font-weight: 600;
+        font-size: 13px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        word-break: break-word;
+      }
+      .patchbay-node-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #22c55e;
+        flex: none;
+      }
+      .patchbay-node-meta {
+        font-size: 11.5px;
+        color: var(--ntx-text-subtle);
+      }
+      .patchbay-node-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .patchbay-patch-btn {
+        font-size: 11.5px;
+        padding: 4px 10px;
+        border: 1px solid var(--ntx-border);
+        border-radius: 4px;
+        background: var(--ntx-surface);
+        cursor: pointer;
+        color: var(--ntx-text);
+      }
+      .patchbay-patch-btn:hover { border-color: var(--ntx-accent, #4f46e5); }
+      .patchbay-patch-btn.is-active {
+        background: var(--ntx-accent, #4f46e5);
+        border-color: var(--ntx-accent, #4f46e5);
+        color: #fff;
+      }
+      .patchbay-patch-btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .patchbay-status {
+        flex: 1;
+        font-size: 12px;
+        color: var(--ntx-text-muted);
+      }
       .settings-section {
         padding: 16px 18px;
         border-bottom: 1px solid var(--ntx-border);
@@ -3726,6 +3830,52 @@
                       </button>
                     </div>
 
+                    <!-- AudioPatch (beta: audioPatch). Hidden entirely
+                         until the user enables it explicitly in Settings
+                         (it does NOT auto-enable with "Show beta
+                         features"). Patch In acts on the active console's
+                         VM; PatchBay works on any registered VM. -->
+                    <div class="action-section" data-feature="audioPatch">
+                      <div class="action-section-title">AudioPatch</div>
+                      <button id="audioPatchInBtn" type="button" class="action-row" disabled
+                              title="Listen to the active VM's audio. Enabled only when this VM has registered with the AudioPatch portal.">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M11 5 6 9H3v6h3l5 4V5z"/>
+                            <path d="M15.5 8.5a5 5 0 0 1 0 7"/>
+                            <path d="M18.5 5.5a9 9 0 0 1 0 13"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">
+                          <span id="audioPatchInLabel">Patch In</span>
+                          <span id="audioPatchStatus" class="record-btn-timer" hidden></span>
+                        </span>
+                      </button>
+                      <button id="audioPatchDisconnectBtn" type="button" class="action-row action-row-danger" disabled
+                              title="Stop the current audio patch.">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M11 5 6 9H3v6h3l5 4V5z"/>
+                            <line x1="22" y1="9" x2="16" y2="15"/>
+                            <line x1="16" y1="9" x2="22" y2="15"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">Disconnect Audio</span>
+                      </button>
+                      <button id="audioPatchBayBtn" type="button" class="action-row"
+                              title="Open the PatchBay: a graphical view of every VM registered with the AudioPatch portal.">
+                        <span class="action-row-icon" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="6" cy="7" r="2"/>
+                            <circle cx="6" cy="17" r="2"/>
+                            <circle cx="18" cy="12" r="2"/>
+                            <path d="M8 7h4a4 4 0 0 1 4 4M8 17h4a4 4 0 0 0 4-4"/>
+                          </svg>
+                        </span>
+                        <span class="action-row-label">PatchBay</span>
+                      </button>
+                    </div>
+
                     <div class="action-section">
                       <div class="action-section-title">Manage</div>
                       <button id="closeAllBtn" type="button" class="action-row action-row-danger" disabled
@@ -4077,6 +4227,33 @@
               </div>
             </section>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PatchBay modal (beta: audioPatch). A graphical view of every VM
+         registered with the AudioPatch portal, with per-VM output /
+         input / both patch controls. Hidden until the feature is on. -->
+    <div id="patchBayModal" class="modal-backdrop" role="dialog" aria-modal="true" data-feature="audioPatch">
+      <div class="modal patchbay-modal">
+        <div class="modal-header patchbay-header">
+          <span>AudioPatch &mdash; PatchBay</span>
+          <button id="patchBayRefreshBtn" type="button" class="patchbay-refresh" title="Refresh the registered VM list">Refresh</button>
+        </div>
+        <div class="modal-body">
+          <p class="patchbay-hint">
+            VMs running the AudioPatch agent appear here. Click a patch
+            point to route audio. <strong>Output</strong> lets you hear the
+            VM; <strong>Input</strong> sends your microphone to the VM;
+            <strong>Both</strong> does both at once. Only one VM can be
+            patched at a time.
+          </p>
+          <div id="patchBayGraph" class="patchbay-graph" aria-live="polite"></div>
+          <div id="patchBayEmpty" class="patchbay-empty">No VMs are currently registered with the AudioPatch portal.</div>
+        </div>
+        <div class="modal-footer">
+          <span id="patchBayStatus" class="patchbay-status"></span>
+          <button id="patchBayCloseBtn">Close</button>
         </div>
       </div>
     </div>

@@ -51,6 +51,19 @@ const recordBrowseBtn = document.getElementById("recordBrowseBtn");
 const recordingBrowseModal = document.getElementById("recordingBrowseModal");
 const recordingBrowseTitle = document.getElementById("recordingBrowseTitle");
 
+// AudioPatch (beta: audioPatch)
+const audioPatchInBtn = document.getElementById("audioPatchInBtn");
+const audioPatchInLabel = document.getElementById("audioPatchInLabel");
+const audioPatchStatusEl = document.getElementById("audioPatchStatus");
+const audioPatchDisconnectBtn = document.getElementById("audioPatchDisconnectBtn");
+const audioPatchBayBtn = document.getElementById("audioPatchBayBtn");
+const patchBayModal = document.getElementById("patchBayModal");
+const patchBayGraph = document.getElementById("patchBayGraph");
+const patchBayEmpty = document.getElementById("patchBayEmpty");
+const patchBayStatusEl = document.getElementById("patchBayStatus");
+const patchBayRefreshBtn = document.getElementById("patchBayRefreshBtn");
+const patchBayCloseBtn = document.getElementById("patchBayCloseBtn");
+
 const scriptLauncher = document.getElementById("scriptLauncher");
 const scriptLibraryModal = document.getElementById("scriptLibraryModal");
 const scriptFolderPane = document.getElementById("scriptFolderPane");
@@ -2369,6 +2382,9 @@ async function login(event) {
     // moment the user lands in the app shell.
     if (appConfig.multiUser) openChatSocket();
 
+    // Beta: connect the AudioPatch portal socket if the feature is on.
+    if (typeof syncAudioPatchFeature === "function") syncAudioPatchFeature();
+
     // Start the auto-poll that pins a "update available" dot on the
     // gear icon when GitHub has a newer build.
     startUpdateBadgePoll();
@@ -2419,6 +2435,12 @@ function logout() {
   } catch (_e) { /* ignore */ }
   // Multi-user only: tear down the chat socket and forget chat state.
   if (typeof teardownChat === "function") teardownChat();
+  // Beta: tear down the AudioPatch portal socket and any live audio.
+  if (typeof teardownAudioPatch === "function") {
+    audioPatchState.wantConnected = false;
+    teardownAudioPatch();
+    refreshAudioPatchButtons();
+  }
   // Stop the update-availability poll and clear the gear-icon badge
   // so the login screen doesn't show a stale dot.
   stopUpdateBadgePoll();
@@ -2580,6 +2602,9 @@ function updateConsoleControls() {
   // Recording UI state follows the active session (each tab can be
   // recording independently of the others).
   refreshRecordButtonForActiveSession();
+  // AudioPatch (beta): the Patch In button enables only when the active
+  // VM has registered an audio agent.
+  if (typeof refreshAudioPatchButtons === "function") refreshAudioPatchButtons();
   // Sync the keymap select to whatever the active tab is using, so
   // users can see at a glance which layout will be applied if they
   // hit Paste right now.
@@ -4147,7 +4172,11 @@ const appConfig = {
   // to true so a missing field on an older server doesn't hide the
   // feature gratuitously; the master gate is still featureFlags +
   // user's Show beta features toggle.
-  vmFoldersEnabled: true
+  vmFoldersEnabled: true,
+  // Beta: AudioPatch portal state (NRCC_AUDIOPATCH_ENABLED). Defaults to
+  // disabled so an older server that omits the field doesn't try to open
+  // a portal socket that isn't there.
+  audioPatch: { enabled: false, requiresToken: false }
 };
 
 async function loadAppConfig() {
@@ -4176,6 +4205,9 @@ async function loadAppConfig() {
     }
     if (typeof data.vmFoldersEnabled === "boolean") {
       appConfig.vmFoldersEnabled = data.vmFoldersEnabled;
+    }
+    if (data.audioPatch && typeof data.audioPatch === "object") {
+      appConfig.audioPatch = { ...appConfig.audioPatch, ...data.audioPatch };
     }
     if (appConfig.multiUser) {
       chatRoot.hidden = false;
@@ -4345,7 +4377,13 @@ const featureFlags = {
     if (stage === "ga") return true;
     if (!userPrefs.betaFeaturesEnabled) return false;
     const perFeature = userPrefs.betaFeatureEnabled || {};
-    return perFeature[id] !== false;
+    const pref = perFeature[id];
+    // No explicit per-feature choice yet: fall back to the feature's
+    // default. Most beta features default ON once "Show beta features"
+    // is enabled; a feature can opt out with defaultEnabled:false (e.g.
+    // audioPatch) so it stays off until the user ticks it.
+    if (pref === undefined) return entry && entry.defaultEnabled === false ? false : true;
+    return pref !== false;
   },
   refresh() {
     document.querySelectorAll("[data-feature]").forEach((el) => {
@@ -4374,6 +4412,11 @@ const featureFlags = {
         }
         if (typeof renderVmList === "function") renderVmList();
       } catch (_e) { /* ignore */ }
+    }
+    // Beta: connect/disconnect the AudioPatch admin portal socket as the
+    // flag flips, and refresh the action-pane button enable state.
+    if (typeof syncAudioPatchFeature === "function") {
+      try { syncAudioPatchFeature(); } catch (_e) { /* ignore */ }
     }
   }
 };
@@ -4558,7 +4601,8 @@ function prettyFeatureName(id) {
     vmPortScan: "VM port scanning",
     sshConsole: "SSH console",
     rdpConsole: "RDP console",
-    vmFolders: "VM folders"
+    vmFolders: "VM folders",
+    audioPatch: "AudioPatch"
   };
   return names[id] || String(id).replace(/([a-z])([A-Z])/g, "$1 $2");
 }
@@ -4581,7 +4625,10 @@ function renderSettingsBetaFeatureList() {
   entries.forEach(([id, entry]) => {
     const label = document.createElement("label");
     label.className = "settings-row settings-row-toggle";
-    const checked = (userPrefs.betaFeatureEnabled || {})[id] !== false;
+    const pref = (userPrefs.betaFeatureEnabled || {})[id];
+    const checked = pref === undefined
+      ? (entry.defaultEnabled !== false)
+      : pref !== false;
     label.innerHTML = `
       <input type="checkbox" data-beta-feature-id="${escapeHtml(id)}" ${checked ? "checked" : ""} ${betaMasterOn ? "" : "disabled"} />
       <span class="settings-label">
@@ -7294,12 +7341,21 @@ document.addEventListener("keydown", (event) => {
 // pendingChunks, uploadInFlight, timerHandle }` so multiple VMs can
 // record in parallel without interfering.
 // =====================================================================
-function pickRecordingMimeType() {
-  const candidates = [
-    "video/webm;codecs=vp9",
-    "video/webm;codecs=vp8",
-    "video/webm"
-  ];
+function pickRecordingMimeType(withAudio) {
+  // When AudioPatch audio is being mixed in, prefer a container that
+  // also carries an Opus audio track; fall back to video-only.
+  const candidates = withAudio
+    ? [
+        "video/webm;codecs=vp9,opus",
+        "video/webm;codecs=vp8,opus",
+        "video/webm;codecs=opus",
+        "video/webm"
+      ]
+    : [
+        "video/webm;codecs=vp9",
+        "video/webm;codecs=vp8",
+        "video/webm"
+      ];
   for (const mt of candidates) {
     try {
       if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mt)) return mt;
@@ -7352,13 +7408,26 @@ async function startRecordingForSession(session) {
   }
   const canvas = getSessionCanvas(session);
   if (!canvas) { setStatus(`No canvas to record for ${session.vmName}.`); return; }
-  const mimeType = pickRecordingMimeType();
+  // AudioPatch (beta): if this VM's audio is patched in, grab a cloned
+  // output track so the recording captures sound alongside the video.
+  const audioTrack = (typeof audioPatchGetRecordingTrack === "function")
+    ? audioPatchGetRecordingTrack(session.vmUuid)
+    : null;
+  const mimeType = pickRecordingMimeType(Boolean(audioTrack));
   if (!mimeType) { setStatus("Browser does not support WebM recording."); return; }
   const fps = appConfig.recording.fps || 10;
 
   let stream;
   try { stream = canvas.captureStream(fps); }
-  catch (err) { setStatus(`captureStream failed: ${err.message || err}`); return; }
+  catch (err) {
+    if (audioTrack) { try { audioTrack.stop(); } catch (_e) { /* ignore */ } }
+    setStatus(`captureStream failed: ${err.message || err}`);
+    return;
+  }
+  if (audioTrack) {
+    try { stream.addTrack(audioTrack); }
+    catch (_e) { try { audioTrack.stop(); } catch (_e2) { /* ignore */ } }
+  }
 
   const recActive = recordingLibrary.getActive();
   const folder = (recActive && recActive.vmUuid === session.vmUuid)
@@ -7371,7 +7440,7 @@ async function startRecordingForSession(session) {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ folder, fps, width: canvas.width, height: canvas.height, mimeType })
+      body: JSON.stringify({ folder, fps, width: canvas.width, height: canvas.height, mimeType, audio: Boolean(audioTrack) })
     });
   } catch (err) {
     setStatus(`Could not start recording: ${err.message || err}`);
@@ -7415,6 +7484,7 @@ async function startRecordingForSession(session) {
     width: canvas.width,
     height: canvas.height,
     stream,
+    hasAudio: Boolean(audioTrack),
     pendingChunks: [],
     uploadInFlight: false,
     failed: false,
@@ -7609,6 +7679,522 @@ function toggleRecordingForActive() {
 }
 
 recordBtn.addEventListener("click", toggleRecordingForActive);
+
+// =====================================================================
+// AudioPatch (beta: audioPatch)
+// =====================================================================
+//
+// Admin-side portal client. Opens one WebSocket to /ws-audiopatch/admin
+// while the feature is enabled, tracks which VMs have registered their
+// audio agents, and relays raw 16-bit PCM both directions:
+//   - output: VM system audio (binary frames in) -> Web Audio playback,
+//     also fanned into a MediaStreamDestination so an active recording
+//     captures it.
+//   - input:  admin microphone -> Int16 PCM frames out to the VM agent.
+// Patch/unpatch are driven over this socket so the live audio binding
+// and control state can't diverge.
+const audioPatchState = {
+  socket: null,
+  reconnectTimer: null,
+  reconnectAttempt: 0,
+  heartbeatTimer: null,
+  wantConnected: false,
+  clients: new Map(),          // vmUuid -> public client info
+  patch: null,                 // { vmUuid, vmName, direction, format }
+  audioCtx: null,
+  outGain: null,               // playback bus -> speakers + mixDest
+  mixDest: null,               // MediaStreamAudioDestinationNode (for recording)
+  nextPlayTime: 0,
+  micStream: null,
+  micSource: null,
+  micProcessor: null
+};
+
+function audioPatchPortalEnabled() {
+  return Boolean(appConfig.audioPatch && appConfig.audioPatch.enabled);
+}
+
+function audioPatchAvailable() {
+  return Boolean(
+    session && session.loggedIn &&
+    audioPatchPortalEnabled() &&
+    featureFlags.isEnabled("audioPatch")
+  );
+}
+
+// The VM the action-pane buttons act on: the active console session's VM.
+function currentActionVm() {
+  const active = consoleSessions.find((s) => s.id === activeSessionId);
+  if (!active || !active.vmUuid) return null;
+  return { uuid: String(active.vmUuid).toLowerCase(), name: active.vmName || active.vmUuid };
+}
+
+function audioPatchIsRegistered(vmUuid) {
+  return Boolean(vmUuid && audioPatchState.clients.has(String(vmUuid).toLowerCase()));
+}
+
+// Connect/disconnect the portal socket as the feature flag flips, and
+// keep the action-pane buttons in sync. Called from featureFlags.refresh
+// and after login/logout.
+function syncAudioPatchFeature() {
+  if (audioPatchAvailable()) {
+    audioPatchState.wantConnected = true;
+    openAudioPatchSocket();
+  } else {
+    audioPatchState.wantConnected = false;
+    teardownAudioPatch();
+  }
+  refreshAudioPatchButtons();
+}
+
+function audioPatchSocketSend(payload) {
+  const ws = audioPatchState.socket;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send(JSON.stringify(payload)); return true; } catch (_e) { return false; }
+}
+
+function openAudioPatchSocket() {
+  if (!audioPatchState.wantConnected) return;
+  const existing = audioPatchState.socket;
+  if (existing && (existing.readyState === WebSocket.CONNECTING || existing.readyState === WebSocket.OPEN)) {
+    return;
+  }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  let ws;
+  try {
+    ws = new WebSocket(`${proto}://${location.host}/ws-audiopatch/admin`);
+  } catch (_e) {
+    scheduleAudioPatchReconnect();
+    return;
+  }
+  ws.binaryType = "arraybuffer";
+  audioPatchState.socket = ws;
+
+  ws.addEventListener("open", () => {
+    audioPatchState.reconnectAttempt = 0;
+    clearInterval(audioPatchState.heartbeatTimer);
+    audioPatchState.heartbeatTimer = setInterval(() => {
+      audioPatchSocketSend({ type: "ping" });
+    }, 25_000);
+  });
+
+  ws.addEventListener("message", (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      audioPatchPlayPcm(event.data);
+      return;
+    }
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (_e) { return; }
+    audioPatchHandleMessage(msg);
+  });
+
+  ws.addEventListener("close", () => {
+    clearInterval(audioPatchState.heartbeatTimer);
+    audioPatchState.heartbeatTimer = null;
+    audioPatchState.socket = null;
+    audioPatchTeardownPlayback();
+    audioPatchStopMic();
+    audioPatchState.patch = null;
+    if (audioPatchState.wantConnected) scheduleAudioPatchReconnect();
+    refreshAudioPatchButtons();
+    if (patchBayModal && patchBayModal.classList.contains("open")) renderPatchBay();
+  });
+
+  ws.addEventListener("error", () => { try { ws.close(); } catch (_e) { /* ignore */ } });
+}
+
+function scheduleAudioPatchReconnect() {
+  if (audioPatchState.reconnectTimer || !audioPatchState.wantConnected) return;
+  const attempt = Math.min(audioPatchState.reconnectAttempt + 1, 6);
+  audioPatchState.reconnectAttempt = attempt;
+  const delay = Math.min(1000 * 2 ** (attempt - 1), 30_000);
+  audioPatchState.reconnectTimer = setTimeout(() => {
+    audioPatchState.reconnectTimer = null;
+    openAudioPatchSocket();
+  }, delay);
+}
+
+function teardownAudioPatch() {
+  if (audioPatchState.reconnectTimer) {
+    clearTimeout(audioPatchState.reconnectTimer);
+    audioPatchState.reconnectTimer = null;
+  }
+  clearInterval(audioPatchState.heartbeatTimer);
+  audioPatchState.heartbeatTimer = null;
+  audioPatchStopMic();
+  audioPatchTeardownPlayback();
+  audioPatchState.patch = null;
+  audioPatchState.clients.clear();
+  audioPatchState.reconnectAttempt = 0;
+  if (audioPatchState.socket) {
+    try { audioPatchState.socket.close(); } catch (_e) { /* ignore */ }
+    audioPatchState.socket = null;
+  }
+}
+
+function audioPatchHandleMessage(msg) {
+  if (!msg || typeof msg.type !== "string") return;
+  switch (msg.type) {
+    case "hello":
+    case "clients": {
+      audioPatchState.clients.clear();
+      (msg.clients || []).forEach((c) => {
+        if (c && c.vmUuid) audioPatchState.clients.set(String(c.vmUuid).toLowerCase(), c);
+      });
+      refreshAudioPatchButtons();
+      if (patchBayModal && patchBayModal.classList.contains("open")) renderPatchBay();
+      break;
+    }
+    case "patched": {
+      audioPatchState.patch = {
+        vmUuid: String(msg.vmUuid).toLowerCase(),
+        vmName: msg.vmName || msg.vmUuid,
+        direction: msg.direction || "output",
+        format: msg.outputFormat || null
+      };
+      if (audioPatchState.patch.direction === "output" || audioPatchState.patch.direction === "both") {
+        audioPatchSetupPlayback();
+      }
+      if (audioPatchState.patch.direction === "input" || audioPatchState.patch.direction === "both") {
+        audioPatchStartMic();
+      }
+      setStatus(`AudioPatch: patched into ${audioPatchState.patch.vmName} (${audioPatchState.patch.direction}).`);
+      refreshAudioPatchButtons();
+      if (patchBayModal && patchBayModal.classList.contains("open")) renderPatchBay();
+      break;
+    }
+    case "audio-format": {
+      if (audioPatchState.patch && audioPatchState.patch.vmUuid === String(msg.vmUuid).toLowerCase()) {
+        audioPatchState.patch.format = msg.format || audioPatchState.patch.format;
+      }
+      break;
+    }
+    case "unpatched":
+    case "client-gone": {
+      const goneName = audioPatchState.patch ? audioPatchState.patch.vmName : "";
+      audioPatchTeardownPlayback();
+      audioPatchStopMic();
+      audioPatchState.patch = null;
+      if (msg.type === "client-gone") {
+        audioPatchState.clients.delete(String(msg.vmUuid).toLowerCase());
+        setStatus(`AudioPatch: ${goneName || "VM"} disconnected.`);
+      } else {
+        setStatus("AudioPatch: disconnected.");
+      }
+      refreshAudioPatchButtons();
+      if (patchBayModal && patchBayModal.classList.contains("open")) renderPatchBay();
+      break;
+    }
+    case "error": {
+      if (msg.error) setStatus(`AudioPatch: ${msg.error}`);
+      break;
+    }
+    default: break;
+  }
+}
+
+function audioPatchSendPatch(vmUuid, direction) {
+  if (!audioPatchAvailable()) { setStatus("Enable AudioPatch in Settings first."); return; }
+  const id = String(vmUuid || "").toLowerCase();
+  if (!audioPatchIsRegistered(id)) { setStatus("That VM is not registered with AudioPatch."); return; }
+  // Resume the audio context within the user-gesture call stack so
+  // autoplay policies don't mute playback.
+  audioPatchEnsureAudioCtx();
+  if (!audioPatchSocketSend({ type: "patch", vmUuid: id, direction: direction || "output" })) {
+    setStatus("AudioPatch portal is not connected yet.");
+  }
+}
+
+function audioPatchUnpatch() {
+  audioPatchSocketSend({ type: "unpatch" });
+  audioPatchTeardownPlayback();
+  audioPatchStopMic();
+  audioPatchState.patch = null;
+  refreshAudioPatchButtons();
+  if (patchBayModal && patchBayModal.classList.contains("open")) renderPatchBay();
+}
+
+// ---- Web Audio playback (output: VM -> admin) --------------------------
+
+function audioPatchEnsureAudioCtx() {
+  if (!audioPatchState.audioCtx) {
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    audioPatchState.audioCtx = new Ctor();
+    audioPatchState.outGain = audioPatchState.audioCtx.createGain();
+    audioPatchState.outGain.gain.value = 1;
+    audioPatchState.outGain.connect(audioPatchState.audioCtx.destination);
+    // A parallel sink the recorder can tap so patched audio lands in
+    // the WebM alongside the canvas video.
+    if (typeof audioPatchState.audioCtx.createMediaStreamDestination === "function") {
+      audioPatchState.mixDest = audioPatchState.audioCtx.createMediaStreamDestination();
+      audioPatchState.outGain.connect(audioPatchState.mixDest);
+    }
+  }
+  if (audioPatchState.audioCtx.state === "suspended") {
+    audioPatchState.audioCtx.resume().catch(() => {});
+  }
+  return audioPatchState.audioCtx;
+}
+
+function audioPatchSetupPlayback() {
+  audioPatchEnsureAudioCtx();
+  audioPatchState.nextPlayTime = 0;
+}
+
+function audioPatchTeardownPlayback() {
+  audioPatchState.nextPlayTime = 0;
+  // Keep the AudioContext + mixDest alive across patches (cheap, avoids
+  // re-prompting autoplay); just stop scheduling new buffers.
+}
+
+function audioPatchPlayPcm(arrayBuffer) {
+  const ctx = audioPatchState.audioCtx;
+  if (!ctx || !audioPatchState.patch) return;
+  const fmt = audioPatchState.patch.format || { sampleRate: 48000, channels: 1, bitsPerSample: 16 };
+  const channels = Math.max(1, Math.min(2, fmt.channels || 1));
+  const sampleRate = fmt.sampleRate || 48000;
+  const int16 = new Int16Array(arrayBuffer);
+  const frames = Math.floor(int16.length / channels);
+  if (!frames) return;
+  let buf;
+  try { buf = ctx.createBuffer(channels, frames, sampleRate); }
+  catch (_e) { return; }
+  for (let ch = 0; ch < channels; ch += 1) {
+    const out = buf.getChannelData(ch);
+    for (let i = 0; i < frames; i += 1) {
+      out[i] = int16[i * channels + ch] / 32768;
+    }
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioPatchState.outGain);
+  const now = ctx.currentTime;
+  // Small lead-in to absorb jitter; if we fell behind, resync.
+  if (audioPatchState.nextPlayTime < now + 0.02) audioPatchState.nextPlayTime = now + 0.08;
+  try { src.start(audioPatchState.nextPlayTime); } catch (_e) { return; }
+  audioPatchState.nextPlayTime += buf.duration;
+}
+
+// ---- Microphone capture (input: admin -> VM) ---------------------------
+
+function audioPatchStartMic() {
+  if (audioPatchState.micStream) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("AudioPatch: microphone capture is not available in this browser.");
+    return;
+  }
+  const ctx = audioPatchEnsureAudioCtx();
+  if (!ctx) return;
+  navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then((stream) => {
+    if (!audioPatchState.patch ||
+        (audioPatchState.patch.direction !== "input" && audioPatchState.patch.direction !== "both")) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    audioPatchState.micStream = stream;
+    // Tell the VM agent the PCM format its input frames will arrive in.
+    audioPatchSocketSend({
+      type: "audio-format",
+      direction: "input",
+      sampleRate: Math.round(ctx.sampleRate),
+      channels: 1,
+      bitsPerSample: 16
+    });
+    audioPatchState.micSource = ctx.createMediaStreamSource(stream);
+    const bufferSize = 4096;
+    const processor = ctx.createScriptProcessor(bufferSize, 1, 1);
+    processor.onaudioprocess = (ev) => {
+      const ws = audioPatchState.socket;
+      if (!ws || ws.readyState !== WebSocket.OPEN || !audioPatchState.patch) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      const out = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i += 1) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        out[i] = s < 0 ? s * 32768 : s * 32767;
+      }
+      try { ws.send(out.buffer); } catch (_e) { /* ignore */ }
+    };
+    audioPatchState.micSource.connect(processor);
+    // ScriptProcessor needs a destination connection to pull audio, but
+    // we don't want to echo the mic locally -> route through a muted gain.
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    processor.connect(sink);
+    sink.connect(ctx.destination);
+    audioPatchState.micProcessor = processor;
+    setStatus("AudioPatch: microphone is live to the VM.");
+  }).catch((err) => {
+    setStatus(`AudioPatch: microphone denied (${err && err.name ? err.name : "error"}).`);
+  });
+}
+
+function audioPatchStopMic() {
+  if (audioPatchState.micProcessor) {
+    try { audioPatchState.micProcessor.disconnect(); } catch (_e) { /* ignore */ }
+    audioPatchState.micProcessor.onaudioprocess = null;
+    audioPatchState.micProcessor = null;
+  }
+  if (audioPatchState.micSource) {
+    try { audioPatchState.micSource.disconnect(); } catch (_e) { /* ignore */ }
+    audioPatchState.micSource = null;
+  }
+  if (audioPatchState.micStream) {
+    try { audioPatchState.micStream.getTracks().forEach((t) => t.stop()); } catch (_e) { /* ignore */ }
+    audioPatchState.micStream = null;
+  }
+}
+
+// Returns a fresh audio MediaStreamTrack carrying the patched VM's
+// output, for the recorder to mix in -- or null when nothing is patched
+// for this VM. The recorder owns/stops the returned (cloned) track.
+function audioPatchGetRecordingTrack(vmUuid) {
+  if (!audioPatchState.patch || !audioPatchState.mixDest) return null;
+  if (audioPatchState.patch.vmUuid !== String(vmUuid || "").toLowerCase()) return null;
+  if (audioPatchState.patch.direction === "input") return null; // no VM audio to capture
+  const tracks = audioPatchState.mixDest.stream.getAudioTracks();
+  if (!tracks.length) return null;
+  try { return tracks[0].clone(); } catch (_e) { return tracks[0]; }
+}
+
+// ---- Action-pane buttons + PatchBay ------------------------------------
+
+function refreshAudioPatchButtons() {
+  if (!audioPatchInBtn) return;
+  const available = audioPatchAvailable();
+  const vm = currentActionVm();
+  const patched = audioPatchState.patch;
+  const vmRegistered = available && vm && audioPatchIsRegistered(vm.uuid);
+  const patchedThisVm = patched && vm && patched.vmUuid === vm.uuid;
+
+  audioPatchInBtn.disabled = !vmRegistered || Boolean(patchedThisVm);
+  audioPatchInBtn.classList.toggle("audiopatch-active", Boolean(patchedThisVm));
+  if (audioPatchInLabel) audioPatchInLabel.textContent = patchedThisVm ? "Patched" : "Patch In";
+  if (audioPatchStatusEl) {
+    if (patched) {
+      audioPatchStatusEl.hidden = false;
+      audioPatchStatusEl.textContent = patchedThisVm
+        ? patched.direction
+        : `→ ${patched.vmName}`;
+    } else {
+      audioPatchStatusEl.hidden = true;
+      audioPatchStatusEl.textContent = "";
+    }
+  }
+  audioPatchDisconnectBtn.disabled = !available || !patched;
+  audioPatchBayBtn.disabled = !available;
+}
+
+async function refreshAudioPatchClients() {
+  if (!audioPatchAvailable()) return;
+  // The socket pushes the authoritative list; this REST pull is a
+  // belt-and-suspenders refresh for the PatchBay open / Refresh button.
+  try {
+    const resp = await fetch("/api/audiopatch/clients", { credentials: "same-origin" });
+    if (!resp.ok) return;
+    const data = await resp.json().catch(() => ({}));
+    if (!Array.isArray(data.clients)) return;
+    audioPatchState.clients.clear();
+    data.clients.forEach((c) => {
+      if (c && c.vmUuid) audioPatchState.clients.set(String(c.vmUuid).toLowerCase(), c);
+    });
+    refreshAudioPatchButtons();
+    if (patchBayModal && patchBayModal.classList.contains("open")) renderPatchBay();
+  } catch (_e) { /* ignore */ }
+}
+
+function openPatchBay() {
+  if (!audioPatchAvailable()) { setStatus("Enable AudioPatch in Settings first."); return; }
+  patchBayModal.classList.add("open");
+  renderPatchBay();
+  refreshAudioPatchClients();
+  audioPatchSocketSend({ type: "list" });
+}
+
+function closePatchBay() {
+  patchBayModal.classList.remove("open");
+}
+
+function renderPatchBay() {
+  if (!patchBayGraph) return;
+  patchBayGraph.innerHTML = "";
+  const clients = Array.from(audioPatchState.clients.values());
+  if (!clients.length) {
+    patchBayEmpty.style.display = "block";
+  } else {
+    patchBayEmpty.style.display = "none";
+  }
+  const patched = audioPatchState.patch;
+  clients.forEach((c) => {
+    const id = String(c.vmUuid).toLowerCase();
+    const node = document.createElement("div");
+    node.className = "patchbay-node" + (patched && patched.vmUuid === id ? " is-patched" : "");
+    const acceptsInput = c.capabilities && c.capabilities.input;
+    const dirs = [
+      { dir: "output", label: "Output", on: true },
+      { dir: "input", label: "Input", on: acceptsInput },
+      { dir: "both", label: "Both", on: acceptsInput }
+    ];
+    const btns = dirs.map((d) => {
+      const active = patched && patched.vmUuid === id && patched.direction === d.dir;
+      return `<button type="button" class="patchbay-patch-btn${active ? " is-active" : ""}"
+        data-patch-vm="${escapeHtml(id)}" data-patch-dir="${d.dir}" ${d.on ? "" : "disabled"}>${d.label}</button>`;
+    }).join("");
+    const listeners = Number(c.listeners || 0);
+    node.innerHTML = `
+      <div class="patchbay-node-name"><span class="patchbay-node-dot"></span>${escapeHtml(c.vmName || c.vmUuid)}</div>
+      <div class="patchbay-node-meta">
+        ${escapeHtml(c.session || "")}${c.session ? " &middot; " : ""}${listeners} listener${listeners === 1 ? "" : "s"}
+        ${acceptsInput ? "&middot; input capable" : "&middot; output only"}
+      </div>
+      <div class="patchbay-node-actions">
+        ${btns}
+        <button type="button" class="patchbay-patch-btn" data-patch-vm="${escapeHtml(id)}" data-patch-dir="off"
+          ${patched && patched.vmUuid === id ? "" : "disabled"}>Off</button>
+      </div>
+    `;
+    patchBayGraph.appendChild(node);
+  });
+  if (patchBayStatusEl) {
+    patchBayStatusEl.textContent = patched
+      ? `Patched into ${patched.vmName} (${patched.direction}).`
+      : (clients.length ? "Click a patch point to route audio." : "");
+  }
+}
+
+if (audioPatchInBtn) {
+  audioPatchInBtn.addEventListener("click", () => {
+    const vm = currentActionVm();
+    if (!vm) { setStatus("Open a VM console first."); return; }
+    audioPatchSendPatch(vm.uuid, "output");
+  });
+}
+if (audioPatchDisconnectBtn) {
+  audioPatchDisconnectBtn.addEventListener("click", () => audioPatchUnpatch());
+}
+if (audioPatchBayBtn) {
+  audioPatchBayBtn.addEventListener("click", () => openPatchBay());
+}
+if (patchBayCloseBtn) {
+  patchBayCloseBtn.addEventListener("click", () => closePatchBay());
+}
+if (patchBayRefreshBtn) {
+  patchBayRefreshBtn.addEventListener("click", () => {
+    refreshAudioPatchClients();
+    audioPatchSocketSend({ type: "list" });
+  });
+}
+if (patchBayModal) {
+  patchBayModal.addEventListener("click", (event) => {
+    if (event.target === patchBayModal) closePatchBay();
+    const btn = event.target.closest && event.target.closest("[data-patch-vm]");
+    if (!btn) return;
+    const vmUuid = btn.getAttribute("data-patch-vm");
+    const dir = btn.getAttribute("data-patch-dir");
+    if (dir === "off") audioPatchUnpatch();
+    else audioPatchSendPatch(vmUuid, dir);
+  });
+}
 
 // =====================================================================
 // Recording library (Finder-style 3-pane browser, shared factory above)

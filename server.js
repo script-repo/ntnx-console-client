@@ -225,6 +225,38 @@ const RDP_SECURITY = String(process.env.NRCC_RDP_SECURITY || "any").trim().toLow
 const RDP_IGNORE_CERT = String(process.env.NRCC_RDP_IGNORE_CERT || "true").toLowerCase() !== "false";
 
 // =====================================================================
+// AudioPatch portal (beta feature: audioPatch)
+// =====================================================================
+//
+// Embeds a CC-Peep-style audio portal in NRCC. VM-side agents (a
+// manually-installed virtual audio cable bridge -- see
+// deploy/audiopatch/) connect to /ws-audiopatch/client and announce
+// their presence. Logged-in admins connect to /ws-audiopatch/admin and
+// can "patch in" to a registered VM's audio: output (hear the VM's
+// system audio), input (send the admin mic to the VM), or both. Audio
+// is relayed as raw 16-bit PCM binary frames; the role of each socket
+// is fixed so frames need no tagging.
+//
+// The server master switch defaults ON so the routes exist out of the
+// box, mirroring SSH/RDP. The per-user beta opt-in defaults OFF (the
+// FEATURE_FLAGS entry below carries defaultEnabled:false), so enabling
+// "Show beta features" does NOT auto-enable AudioPatch -- the user must
+// tick it explicitly. Set NRCC_AUDIOPATCH_ENABLED=false to hard-disable
+// the portal cluster-wide regardless of any user's preference.
+const AUDIOPATCH_ENABLED = String(process.env.NRCC_AUDIOPATCH_ENABLED || "true").toLowerCase() !== "false";
+// Shared secret VM agents must present (?token=...) to register. Empty
+// means "no token required" (lab default) -- we log a one-time warning
+// so an operator notices an unauthenticated portal.
+const AUDIOPATCH_TOKEN = String(process.env.NRCC_AUDIOPATCH_TOKEN || "").trim();
+const AUDIOPATCH_MAX_CLIENTS = Math.max(1, Number(process.env.NRCC_AUDIOPATCH_MAX_CLIENTS || 256));
+const AUDIOPATCH_MAX_ADMINS = Math.max(1, Number(process.env.NRCC_AUDIOPATCH_MAX_ADMINS || 256));
+// A VM agent that misses heartbeats for this long is dropped from the
+// registry so PatchBay doesn't show stale entries.
+const AUDIOPATCH_CLIENT_TTL_MS = Math.max(15_000, Number(process.env.NRCC_AUDIOPATCH_CLIENT_TTL_MS || 45_000));
+// Reject absurd PCM frames so a misbehaving agent can't OOM the portal.
+const AUDIOPATCH_MAX_FRAME_BYTES = Math.max(1024, Number(process.env.NRCC_AUDIOPATCH_MAX_FRAME_BYTES || 262_144));
+
+// =====================================================================
 // VM folders (beta feature: vmFolders)
 // =====================================================================
 //
@@ -261,7 +293,11 @@ const FEATURE_FLAGS = {
   vmPortScan:  { stage: "beta", description: "Auto-probe VM IPs for SSH/RDP availability" },
   sshConsole:  { stage: "beta", description: "Open SSH session as a console tab (xterm.js)" },
   rdpConsole:  { stage: "beta", description: "Open RDP session as a console tab (Guacamole HTML5; needs guacd)" },
-  vmFolders:   { stage: "beta", description: "Group VMs into Prism-category-backed folders (NTNXFolderPath)" }
+  vmFolders:   { stage: "beta", description: "Group VMs into Prism-category-backed folders (NTNXFolderPath)" },
+  // AudioPatch defaults OFF even when "Show beta features" is on
+  // (defaultEnabled:false). The client honours this flag so the portal
+  // service only starts registering VM agents once a user opts in.
+  audioPatch:  { stage: "beta", defaultEnabled: false, description: "Patch into a registered VM's audio (input/output) via the AudioPatch portal" }
 };
 
 // Strict UUID match used everywhere we accept a VM UUID from the client.
@@ -725,7 +761,14 @@ app.get("/api/config", (req, res) => {
     // VM folders (beta: vmFolders). The client also gates on the
     // featureFlags entry above; this server-side switch is the
     // operator's kill switch independent of the beta opt-in.
-    vmFoldersEnabled: VM_FOLDERS_ENABLED
+    vmFoldersEnabled: VM_FOLDERS_ENABLED,
+    // AudioPatch (beta: audioPatch). Operator kill switch independent
+    // of the per-user beta opt-in. requiresToken tells the UI whether
+    // the VM-agent install needs a registration token.
+    audioPatch: {
+      enabled: AUDIOPATCH_ENABLED,
+      requiresToken: Boolean(AUDIOPATCH_TOKEN)
+    }
   });
 });
 
@@ -776,6 +819,96 @@ app.post("/api/log", (req, res) => {
     details: safeType === "client.unknown" ? { ...details, originalType: rawType } : details
   });
   res.status(204).end();
+});
+
+// =====================================================================
+// AudioPatch portal (beta feature: audioPatch) -- registry + REST
+// =====================================================================
+//
+// Two socket roles share one in-memory registry:
+//   - VM agents  (/ws-audiopatch/client): one record per VM UUID; a
+//     newer registration for the same UUID evicts the older socket.
+//   - Admins     (/ws-audiopatch/admin):  logged-in NRCC browsers.
+// An admin "patch" targets one VM UUID with a direction
+// (output|input|both): output frames flow VM->admin, input frames flow
+// admin->VM. The relay is raw 16-bit PCM passthrough; the socket role
+// fixes the frame direction so frames carry no tag. Patch/unpatch are
+// driven over the admin WS (so the live audio binding and the control
+// state can never disagree); REST is read-only state for the UI.
+const audioPatchClients = new Map(); // vmUuid -> client record
+const audioPatchAdmins = new Map();  // adminId -> admin record
+let _audioPatchTokenWarned = false;
+
+function audioPatchClientPublic(c) {
+  return {
+    vmUuid: c.vmUuid,
+    vmName: c.vmName,
+    session: c.session,
+    capabilities: c.capabilities,
+    outputFormat: c.outputFormat || null,
+    listeners: c.listeners.size,
+    inputSenders: c.inputSenders.size,
+    sinceMs: c.registeredAtMs
+  };
+}
+
+function audioPatchClientList() {
+  return Array.from(audioPatchClients.values())
+    .map(audioPatchClientPublic)
+    .sort((a, b) => String(a.vmName || a.vmUuid).localeCompare(String(b.vmName || b.vmUuid)));
+}
+
+function audioPatchSend(ws, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send(JSON.stringify(payload)); } catch (_e) { /* ignore */ }
+}
+
+function audioPatchBroadcastClients() {
+  const clients = audioPatchClientList();
+  for (const admin of audioPatchAdmins.values()) {
+    audioPatchSend(admin.ws, { type: "clients", clients });
+  }
+}
+
+function audioPatchNormalizeDirection(dir) {
+  return dir === "input" || dir === "output" || dir === "both" ? dir : "output";
+}
+
+function audioPatchNotifyClientConsumers(client) {
+  if (!client) return;
+  audioPatchSend(client.ws, {
+    type: "consumers",
+    listeners: client.listeners.size,
+    inputSenders: client.inputSenders.size
+  });
+}
+
+// Detach an admin from whatever VM it's patched to, updating the VM's
+// listener/sender sets and notifying the agent that its consumer count
+// changed.
+function audioPatchClearAdminPatch(admin, opts = {}) {
+  if (!admin || !admin.patch) return;
+  const { vmUuid } = admin.patch;
+  admin.patch = null;
+  const client = audioPatchClients.get(vmUuid);
+  if (client) {
+    client.listeners.delete(admin.id);
+    client.inputSenders.delete(admin.id);
+    audioPatchNotifyClientConsumers(client);
+  }
+  if (!opts.silent) audioPatchSend(admin.ws, { type: "unpatched", vmUuid });
+}
+
+// Read-only registry snapshot for the action pane + PatchBay. Patch
+// control happens over the admin WebSocket, not here.
+app.get("/api/audiopatch/clients", (req, res) => {
+  if (!AUDIOPATCH_ENABLED) {
+    return res.status(503).json({ error: "AudioPatch portal is disabled (NRCC_AUDIOPATCH_ENABLED=false)." });
+  }
+  if (!req.nrccSession?.currentUser) {
+    return res.status(401).json({ error: "Login required." });
+  }
+  res.json({ enabled: true, clients: audioPatchClientList() });
 });
 
 // =====================================================================
@@ -2212,6 +2345,8 @@ app.post("/api/recordings/:vmUuid/start", (req, res) => {
   const height = Math.max(0, Math.min(8192, Number(body.height) || 0));
   const mimeRaw = typeof body.mimeType === "string" ? body.mimeType : "";
   const mimeType = /^video\/webm/i.test(mimeRaw) ? mimeRaw : "video/webm";
+  // AudioPatch (beta): whether a patched VM audio track is mixed in.
+  const hasAudio = Boolean(body.audio);
 
   try { fs.mkdirSync(RECORDING_TMP_DIR, { recursive: true }); }
   catch (err) {
@@ -2231,6 +2366,7 @@ app.post("/api/recordings/:vmUuid/start", (req, res) => {
     width,
     height,
     mimeType,
+    hasAudio,
     tmpPath,
     bytesWritten: 0,
     startedAt: Date.now(),
@@ -2332,7 +2468,8 @@ app.post("/api/recordings/:vmUuid/finish", (req, res) => {
       fps: state.fps,
       width: state.width || null,
       height: state.height || null,
-      mimeType: state.mimeType
+      mimeType: state.mimeType,
+      audio: Boolean(state.hasAudio)
     });
   } catch (_e) { /* meta failure is non-fatal */ }
 
@@ -6120,6 +6257,12 @@ const wsSshServer = new WebSocketServer({ noServer: true });
 // require a process restart; the upgrade handler short-circuits when
 // the env var is off.
 const wsRdpServer = new WebSocketServer({ noServer: true });
+// AudioPatch portal (beta: audioPatch). One server handles both the
+// VM-agent role (/ws-audiopatch/client) and the admin browser role
+// (/ws-audiopatch/admin); the connection handler branches on the
+// pathname. Always created so a runtime feature flip needs no restart;
+// the upgrade handler short-circuits when the portal is disabled.
+const wsAudioPatchServer = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   // The upgrade handler runs before Express middleware, so build a URL
@@ -6153,6 +6296,15 @@ server.on("upgrade", (req, socket, head) => {
     if (!RDP_ENABLED) { socket.destroy(); return; }
     wsRdpServer.handleUpgrade(req, socket, head, (ws) => {
       wsRdpServer.emit("connection", ws, req, requestUrl);
+    });
+    return;
+  }
+
+  if (requestUrl.pathname === "/ws-audiopatch/client" ||
+      requestUrl.pathname === "/ws-audiopatch/admin") {
+    if (!AUDIOPATCH_ENABLED) { socket.destroy(); return; }
+    wsAudioPatchServer.handleUpgrade(req, socket, head, (ws) => {
+      wsAudioPatchServer.emit("connection", ws, req, requestUrl);
     });
     return;
   }
@@ -6947,6 +7099,279 @@ if (wsChatServer) {
     }
   }, 30 * 1000);
 }
+
+// =====================================================================
+// AudioPatch portal WebSocket (beta: audioPatch). One handler serves
+// both roles; it branches on the upgrade pathname. VM agents register
+// and stream raw PCM "output" frames; admins patch in to receive those
+// frames and (for input/both) stream their mic back to the agent.
+// =====================================================================
+wsAudioPatchServer.on("connection", (ws, req, requestUrl) => {
+  if (requestUrl.pathname === "/ws-audiopatch/client") {
+    audioPatchHandleClient(ws, req, requestUrl);
+  } else {
+    audioPatchHandleAdmin(ws, req);
+  }
+});
+
+// VM-agent socket. Authenticates with the shared registration token
+// (when configured), then waits for a `register` control message before
+// it appears in the registry. Binary frames are output PCM, relayed to
+// every admin currently patched to this VM with an output direction.
+function audioPatchHandleClient(ws, req, requestUrl) {
+  if (AUDIOPATCH_TOKEN) {
+    const token = requestUrl.searchParams.get("token") || "";
+    if (token !== AUDIOPATCH_TOKEN) {
+      try { ws.close(4403, "Bad AudioPatch token"); } catch (_e) { /* ignore */ }
+      return;
+    }
+  } else if (!_audioPatchTokenWarned) {
+    _audioPatchTokenWarned = true;
+    console.warn("[audiopatch] portal accepting agents WITHOUT a token. Set NRCC_AUDIOPATCH_TOKEN to require one.");
+  }
+
+  ws.isAlive = true;
+  ws.nrccAudioVmUuid = null;
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  const evict = (reason) => {
+    const vmUuid = ws.nrccAudioVmUuid;
+    if (!vmUuid) return;
+    const client = audioPatchClients.get(vmUuid);
+    if (client && client.ws === ws) {
+      audioPatchClients.delete(vmUuid);
+      // Detach any admins that were patched to this VM.
+      for (const admin of audioPatchAdmins.values()) {
+        if (admin.patch && admin.patch.vmUuid === vmUuid) {
+          admin.patch = null;
+          audioPatchSend(admin.ws, { type: "client-gone", vmUuid, reason: reason || "disconnected" });
+        }
+      }
+      audioPatchBroadcastClients();
+    }
+    ws.nrccAudioVmUuid = null;
+  };
+
+  ws.on("message", (raw, isBinary) => {
+    if (isBinary) {
+      const client = ws.nrccAudioVmUuid ? audioPatchClients.get(ws.nrccAudioVmUuid) : null;
+      if (!client || client.ws !== ws) return;
+      if (raw.length > AUDIOPATCH_MAX_FRAME_BYTES) return;
+      for (const adminId of client.listeners) {
+        const admin = audioPatchAdmins.get(adminId);
+        if (admin && admin.ws.readyState === WebSocket.OPEN) {
+          try { admin.ws.send(raw, { binary: true }); } catch (_e) { /* ignore */ }
+        }
+      }
+      return;
+    }
+
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch (_e) {
+      return audioPatchSend(ws, { type: "error", error: "Invalid JSON." });
+    }
+    if (!msg || typeof msg.type !== "string") return;
+
+    if (msg.type === "ping") { ws.isAlive = true; return audioPatchSend(ws, { type: "pong", tsMs: Date.now() }); }
+
+    if (msg.type === "register") {
+      const vmUuid = String(msg.vmUuid || "").trim().toLowerCase();
+      if (!vmUuid || vmUuid.length > 128) {
+        return audioPatchSend(ws, { type: "error", error: "register requires a vmUuid." });
+      }
+      if (audioPatchClients.size >= AUDIOPATCH_MAX_CLIENTS && !audioPatchClients.has(vmUuid)) {
+        return audioPatchSend(ws, { type: "error", error: "Portal at capacity." });
+      }
+      // Newest registration for a UUID wins: evict the old socket.
+      const existing = audioPatchClients.get(vmUuid);
+      if (existing && existing.ws !== ws) {
+        try { existing.ws.close(4409, "Replaced by newer agent"); } catch (_e) { /* ignore */ }
+      }
+      const caps = msg.capabilities && typeof msg.capabilities === "object" ? msg.capabilities : {};
+      ws.nrccAudioVmUuid = vmUuid;
+      audioPatchClients.set(vmUuid, {
+        vmUuid,
+        vmName: String(msg.vmName || vmUuid).slice(0, 160),
+        session: String(msg.session || "").slice(0, 160),
+        capabilities: {
+          output: caps.output !== false,
+          input: Boolean(caps.input)
+        },
+        outputFormat: null,
+        ws,
+        registeredAtMs: Date.now(),
+        listeners: existing ? existing.listeners : new Set(),
+        inputSenders: existing ? existing.inputSenders : new Set()
+      });
+      audioPatchSend(ws, { type: "registered", vmUuid });
+      audioPatchBroadcastClients();
+      return;
+    }
+
+    if (msg.type === "audio-format") {
+      const client = ws.nrccAudioVmUuid ? audioPatchClients.get(ws.nrccAudioVmUuid) : null;
+      if (!client || client.ws !== ws) return;
+      const format = {
+        sampleRate: Math.max(8000, Math.min(192000, Number(msg.sampleRate) || 48000)),
+        channels: Math.max(1, Math.min(2, Number(msg.channels) || 1)),
+        bitsPerSample: Number(msg.bitsPerSample) === 8 ? 8 : 16
+      };
+      client.outputFormat = format;
+      // Push the format to anyone already listening so playback can
+      // reconfigure mid-stream.
+      for (const adminId of client.listeners) {
+        const admin = audioPatchAdmins.get(adminId);
+        if (admin) audioPatchSend(admin.ws, { type: "audio-format", vmUuid: client.vmUuid, format });
+      }
+      audioPatchBroadcastClients();
+      return;
+    }
+  });
+
+  ws.on("close", () => evict("close"));
+  ws.on("error", () => evict("error"));
+  audioPatchSend(ws, { type: "hello", role: "client", needsRegister: true });
+}
+
+// Admin browser socket. Authenticated by the existing nrcc_sid cookie.
+// Text frames are JSON control (patch/unpatch/ping); binary frames are
+// the admin's mic PCM, relayed to the patched VM when the direction
+// includes input.
+function audioPatchHandleAdmin(ws, req) {
+  const cookies = parseCookies(req.headers.cookie);
+  const sid = cookies.nrcc_sid;
+  const session = sid ? serverSessions.get(sid) : null;
+  if (!session || !session.currentUser) {
+    try { ws.close(4401, "Not authenticated"); } catch (_e) { /* ignore */ }
+    return;
+  }
+  if (audioPatchAdmins.size >= AUDIOPATCH_MAX_ADMINS) {
+    try { ws.close(4429, "Too many AudioPatch admins"); } catch (_e) { /* ignore */ }
+    return;
+  }
+
+  const admin = { id: crypto.randomUUID(), username: String(session.currentUser), ws, patch: null };
+  audioPatchAdmins.set(admin.id, admin);
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  ws.on("message", (raw, isBinary) => {
+    if (isBinary) {
+      // Admin mic frame -> forward to the patched VM if it accepts input.
+      if (!admin.patch) return;
+      const dir = admin.patch.direction;
+      if (dir !== "input" && dir !== "both") return;
+      if (raw.length > AUDIOPATCH_MAX_FRAME_BYTES) return;
+      const client = audioPatchClients.get(admin.patch.vmUuid);
+      if (client && client.ws.readyState === WebSocket.OPEN) {
+        try { client.ws.send(raw, { binary: true }); } catch (_e) { /* ignore */ }
+      }
+      return;
+    }
+
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch (_e) {
+      return audioPatchSend(ws, { type: "error", error: "Invalid JSON." });
+    }
+    if (!msg || typeof msg.type !== "string") return;
+
+    if (msg.type === "ping") { ws.isAlive = true; return audioPatchSend(ws, { type: "pong", tsMs: Date.now() }); }
+
+    if (msg.type === "list") {
+      return audioPatchSend(ws, { type: "clients", clients: audioPatchClientList() });
+    }
+
+    if (msg.type === "patch") {
+      const vmUuid = String(msg.vmUuid || "").trim().toLowerCase();
+      const direction = audioPatchNormalizeDirection(msg.direction);
+      const client = audioPatchClients.get(vmUuid);
+      if (!client) {
+        return audioPatchSend(ws, { type: "error", error: "That VM is not registered with AudioPatch." });
+      }
+      if ((direction === "input" || direction === "both") && !client.capabilities.input) {
+        return audioPatchSend(ws, { type: "error", error: "This VM agent does not accept input audio." });
+      }
+      // Drop any previous patch first.
+      audioPatchClearAdminPatch(admin, { silent: true });
+      admin.patch = { vmUuid, direction };
+      if (direction === "output" || direction === "both") client.listeners.add(admin.id);
+      if (direction === "input" || direction === "both") client.inputSenders.add(admin.id);
+      audioPatchNotifyClientConsumers(client);
+      audioPatchSend(ws, {
+        type: "patched",
+        vmUuid,
+        vmName: client.vmName,
+        direction,
+        outputFormat: client.outputFormat || null
+      });
+      appendLog({
+        type: "audiopatch.patch",
+        vmUuid,
+        username: admin.username,
+        details: { direction }
+      });
+      return;
+    }
+
+    if (msg.type === "unpatch") {
+      const had = admin.patch;
+      audioPatchClearAdminPatch(admin);
+      if (had) {
+        appendLog({ type: "audiopatch.unpatch", vmUuid: had.vmUuid, username: admin.username });
+      }
+      return;
+    }
+
+    // Admin advertises the PCM format of the mic frames it's about to
+    // stream. Forward it to the patched VM agent so the agent can play
+    // the input at the right sample rate/channel count.
+    if (msg.type === "audio-format") {
+      if (!admin.patch) return;
+      const dir = admin.patch.direction;
+      if (dir !== "input" && dir !== "both") return;
+      const client = audioPatchClients.get(admin.patch.vmUuid);
+      if (!client) return;
+      const format = {
+        sampleRate: Math.max(8000, Math.min(192000, Number(msg.sampleRate) || 48000)),
+        channels: Math.max(1, Math.min(2, Number(msg.channels) || 1)),
+        bitsPerSample: Number(msg.bitsPerSample) === 8 ? 8 : 16
+      };
+      audioPatchSend(client.ws, { type: "input-format", format });
+      return;
+    }
+  });
+
+  const cleanup = () => {
+    audioPatchClearAdminPatch(admin, { silent: true });
+    audioPatchAdmins.delete(admin.id);
+  };
+  ws.on("close", cleanup);
+  ws.on("error", cleanup);
+
+  audioPatchSend(ws, { type: "hello", role: "admin", clients: audioPatchClientList() });
+}
+
+// Heartbeat + TTL sweep for AudioPatch sockets. Drops dead agents so
+// PatchBay never shows a stale VM, and pings admins so suspended tabs
+// fall out of the registry.
+setInterval(() => {
+  for (const client of audioPatchClients.values()) {
+    if (client.ws.isAlive === false) {
+      try { client.ws.terminate(); } catch (_e) { /* ignore */ }
+      continue;
+    }
+    client.ws.isAlive = false;
+    try { client.ws.ping(); } catch (_e) { /* ignore */ }
+  }
+  for (const admin of audioPatchAdmins.values()) {
+    if (admin.ws.isAlive === false) {
+      try { admin.ws.terminate(); } catch (_e) { /* ignore */ }
+      continue;
+    }
+    admin.ws.isAlive = false;
+    try { admin.ws.ping(); } catch (_e) { /* ignore */ }
+  }
+}, Math.max(10_000, Math.floor(AUDIOPATCH_CLIENT_TTL_MS / 3)));
 
 setInterval(() => {
   const now = Date.now();
