@@ -244,9 +244,16 @@ function sendBinary(chunk) {
 
 // output: capture device -> mono s16le @rate -> binary frames to NRCC.
 function startCapture() {
-  const a = ["-hide_banner", "-loglevel", "error", "-nostdin", "-f", cfg.captureFormat];
+  // Low-latency capture: nobuffer avoids ffmpeg's input queue, and for dshow
+  // a small audio_buffer_size (ms) trims the WASAPI/DirectShow capture buffer
+  // (its default is large and is the main source of round-trip delay).
+  const a = ["-hide_banner", "-loglevel", "error", "-nostdin", "-fflags", "nobuffer"];
+  if (cfg.captureFormat === "dshow") a.push("-audio_buffer_size", String(AUDIO_BUFFER_MS));
+  a.push("-f", cfg.captureFormat);
   if (cfg.captureFormat === "alsa") a.push("-ar", String(cfg.rate), "-ac", "1");
-  a.push("-i", cfg.captureSource, "-ac", "1", "-ar", String(cfg.rate), "-f", "s16le", "-");
+  // -flush_packets 1 pushes each captured chunk down the pipe immediately
+  // instead of letting ffmpeg coalesce them.
+  a.push("-i", cfg.captureSource, "-ac", "1", "-ar", String(cfg.rate), "-flush_packets", "1", "-f", "s16le", "-");
   capture = spawn(cfg.ffmpeg, a);
   log(`output: capturing '${cfg.captureSource}' (${cfg.captureFormat}) -> ${cfg.rate}Hz mono 16-bit`);
   sendText({ type: "audio-format", direction: "output", sampleRate: cfg.rate, channels: 1, bitsPerSample: 16 });
@@ -288,6 +295,8 @@ function startCapture() {
 // In `both` mode the device is therefore free whenever input isn't actively
 // flowing.
 const PLAYBACK_IDLE_MS = Math.max(500, Number(process.env.AUDIOPATCH_PLAYBACK_IDLE_MS || 1500));
+// dshow capture buffer (ms). Smaller = lower latency, larger = fewer xruns.
+const AUDIO_BUFFER_MS = Math.max(20, Number(process.env.AUDIOPATCH_AUDIO_BUFFER_MS || 50));
 let playbackIdleTimer = null;
 
 // Build a 44-byte streaming WAV/PCM header. The RIFF + data sizes are set to
@@ -327,7 +336,15 @@ function startPlayback() {
     // ffplay does NOT accept ffmpeg's -ar/-ac CLI aliases ("Option not found"),
     // so describe the stream with a streaming WAV header instead and let ffplay
     // auto-detect it. Header is written first (below), then raw PCM frames.
-    const a = ["-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit", "-i", "-"];
+    // Low-latency playback: nobuffer + tiny probe so ffplay starts the moment
+    // PCM arrives instead of pre-buffering seconds of audio. ffplay is a media
+    // player (built for A/V sync), so without these it adds a large delay.
+    const a = [
+      "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
+      "-fflags", "nobuffer", "-flags", "low_delay",
+      "-probesize", "32", "-analyzeduration", "0",
+      "-sync", "ext", "-framedrop", "-i", "-",
+    ];
     playback = spawn(cfg.ffplay, a, { stdio: ["pipe", "ignore", "pipe"] });
     try { playback.stdin.write(wavStreamHeader(cfg.rate, 1, 16)); } catch (_e) { /* ignore */ }
     log(`input: playback -> default Playback device via ffplay (${cfg.rate}Hz mono 16-bit).`);
