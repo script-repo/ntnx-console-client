@@ -37,6 +37,7 @@
 //   --capture-format   / AUDIOPATCH_CAPTURE_FORMAT   ffmpeg -f for capture (pulse|alsa|dshow)
 //   --playback-format  / AUDIOPATCH_PLAYBACK_FORMAT  ffmpeg -f for playback (pulse|alsa|dshow)
 //   --ffmpeg   / AUDIOPATCH_FFMPEG     ffmpeg binary path (default: ffmpeg)
+//   --ffplay   / AUDIOPATCH_FFPLAY     ffplay binary path (Windows input playback; default: ffplay)
 //   AUDIOPATCH_TLS_STRICT=1            verify TLS for wss:// (default: accept self-signed)
 
 import os from "node:os";
@@ -86,6 +87,7 @@ const cfg = {
   rate: parseInt(args.rate || process.env.AUDIOPATCH_RATE || "48000", 10),
   osType: args.os || process.env.AUDIOPATCH_OS || detectedOs,
   ffmpeg: args.ffmpeg || process.env.AUDIOPATCH_FFMPEG || "ffmpeg",
+  ffplay: args.ffplay || process.env.AUDIOPATCH_FFPLAY || "ffplay",
   captureSource: args["capture-source"] || process.env.AUDIOPATCH_CAPTURE_SOURCE || "",
   playbackSink: args["playback-sink"] || process.env.AUDIOPATCH_PLAYBACK_SINK || "",
   captureFormat: args["capture-format"] || process.env.AUDIOPATCH_CAPTURE_FORMAT || "",
@@ -287,18 +289,41 @@ function startCapture() {
 // flowing.
 const PLAYBACK_IDLE_MS = Math.max(500, Number(process.env.AUDIOPATCH_PLAYBACK_IDLE_MS || 1500));
 let playbackIdleTimer = null;
-let playbackInputUnsupported = false;
 
 function startPlayback() {
   if (playback) return true;
-  if (cfg.osType === "windows" && !cfg.playbackSink) {
-    if (!playbackInputUnsupported) {
-      log("input: no --playback-sink configured on Windows; input audio will be dropped (see README).");
-      playbackInputUnsupported = true;
-    }
-    return false;
+
+  // Windows: ffmpeg has no audio OUTPUT muxer (its dshow device is capture
+  // only), so admin->VM audio is rendered with ffplay, which plays to the
+  // system DEFAULT playback device via SDL. Route a virtual-cable INPUT as
+  // the default Playback device and point the VM's mic apps at that cable's
+  // OUTPUT so they hear the operator. ffplay can't select a device, so
+  // --playback-sink is informational on Windows.
+  if (cfg.osType === "windows") {
+    const a = [
+      "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
+      "-f", "s16le", "-ar", String(cfg.rate), "-ac", "1", "-i", "-",
+    ];
+    playback = spawn(cfg.ffplay, a, { stdio: ["pipe", "ignore", "pipe"] });
+    log(`input: playback -> default Playback device via ffplay (${cfg.rate}Hz mono 16-bit).`);
+    log("input: ensure your virtual-cable INPUT is the default Playback device, and the VM mic app uses that cable's OUTPUT.");
+    playback.stderr.on("data", (d) => log("ffplay(playback):", d.toString().trim()));
+    playback.on("error", (e) => {
+      if (e && e.code === "ENOENT") {
+        log("input: failed to start ffplay (not found). Re-run the installer so it fetches ffplay.exe, or pass --ffplay <path>.");
+      } else {
+        log("input: failed to start ffplay:", e.message);
+      }
+      playback = null;
+    });
+    playback.on("exit", (code) => {
+      if (code) log(`input: ffplay exited (${code})`);
+      playback = null;
+    });
+    return true;
   }
-  const fmt = cfg.playbackFormat || (cfg.osType === "windows" ? "dshow" : "pulse");
+
+  const fmt = cfg.playbackFormat || "pulse";
   const a = [
     "-hide_banner", "-loglevel", "error",
     "-f", "s16le", "-ar", String(cfg.rate), "-ac", "1", "-i", "-",

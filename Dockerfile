@@ -32,9 +32,10 @@ RUN apk add --no-cache curl unzip ca-certificates \
  && mkdir -p /win \
  && curl -fsSL --retry 3 -o /tmp/ff.zip \
       https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip \
- && unzip -j /tmp/ff.zip '*/bin/ffmpeg.exe' -d /win \
+ && unzip -j /tmp/ff.zip '*/bin/ffmpeg.exe' '*/bin/ffplay.exe' -d /win \
  && rm /tmp/ff.zip \
- && test -s /win/ffmpeg.exe
+ && test -s /win/ffmpeg.exe \
+ && test -s /win/ffplay.exe
 
 # ---------- 2. runtime image --------------------------------------------------
 FROM node:20-alpine
@@ -55,8 +56,10 @@ COPY --chown=node:node --from=deps /app/node_modules ./node_modules
 # this COPY brings in just code + assets + manifests.
 COPY --chown=node:node . .
 
-# Static Windows ffmpeg served to the AudioPatch installer (see stage above).
+# Static Windows ffmpeg/ffplay served to the AudioPatch installer (see stage
+# above). ffmpeg drives output capture; ffplay renders admin->VM input audio.
 COPY --chown=node:node --from=winffmpeg /win/ffmpeg.exe ./public/audiopatch/win/ffmpeg.exe
+COPY --chown=node:node --from=winffmpeg /win/ffplay.exe ./public/audiopatch/win/ffplay.exe
 
 ENV NODE_ENV=production \
     PORT=8443 \

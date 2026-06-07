@@ -71,6 +71,35 @@ if ($ffCmd -and $ffCmd.Source) {
   }
 }
 
+# ffplay renders admin -> VM (input) audio on Windows because ffmpeg has no
+# audio OUTPUT muxer there. Only needed for input/both directions.
+$FfplayExe = ""
+if ($Direction -eq "input" -or $Direction -eq "both") {
+  $ffp = Get-Command ffplay -ErrorAction SilentlyContinue
+  if ($ffp -and $ffp.Source) {
+    $FfplayExe = $ffp.Source
+    Write-Log "Found ffplay on PATH: $FfplayExe"
+  } else {
+    $localFp = Join-Path $Dir "ffplay.exe"
+    if (-not (Test-Path $localFp)) {
+      $fpUrl = "__NRCC_BASE__/audiopatch/win/ffplay.exe"
+      Write-Log "ffplay not on PATH; downloading from $fpUrl"
+      try {
+        Invoke-WebRequest -Uri $fpUrl -OutFile $localFp -UseBasicParsing
+      } catch {
+        $curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
+        if ($curlExe) { & curl.exe -fsSLk $fpUrl -o $localFp }
+      }
+    }
+    if ((Test-Path $localFp) -and ((Get-Item $localFp).Length -gt 0)) {
+      $FfplayExe = $localFp
+      Write-Log "Using bundled ffplay: $FfplayExe"
+    } else {
+      Write-Warn "Could not obtain ffplay automatically. Input (admin -> VM) audio will not play until ffplay is available."
+    }
+  }
+}
+
 # Virtual audio cable check (output direction needs one).
 try {
   $dshow = & $FfmpegExe -hide_banner -list_devices true -f dshow -i dummy 2>&1
@@ -109,7 +138,9 @@ try {
 if ($LASTEXITCODE -ne 0) { Fail "Agent script failed syntax validation." }
 
 function Show-RunHint {
-  Write-Host "  `$env:AUDIOPATCH_PORTAL='$Portal'; `$env:AUDIOPATCH_TOKEN='$Token'; node `"$AgentPath`" --direction $Direction --name `"$Name`" --ffmpeg `"$FfmpegExe`""
+  $extra = "--ffmpeg `"$FfmpegExe`""
+  if ($FfplayExe) { $extra = "$extra --ffplay `"$FfplayExe`"" }
+  Write-Host "  `$env:AUDIOPATCH_PORTAL='$Portal'; `$env:AUDIOPATCH_TOKEN='$Token'; node `"$AgentPath`" --direction $Direction --name `"$Name`" $extra"
 }
 
 if ($NoService) {
@@ -137,6 +168,7 @@ $agentArgs = @(
   "--ffmpeg", "`"$FfmpegExe`""
 )
 if ($Token) { $agentArgs += @("--token", "`"$Token`"") }
+if ($FfplayExe) { $agentArgs += @("--ffplay", "`"$FfplayExe`"") }
 $argString = $agentArgs -join " "
 
 $taskName = "NRCC-AudioPatch"
