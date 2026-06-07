@@ -240,10 +240,29 @@ function startCapture() {
   capture = spawn(cfg.ffmpeg, a);
   log(`output: capturing '${cfg.captureSource}' (${cfg.captureFormat}) -> ${cfg.rate}Hz mono 16-bit`);
   sendText({ type: "audio-format", direction: "output", sampleRate: cfg.rate, channels: 1, bitsPerSample: 16 });
-  capture.stdout.on("data", (chunk) => sendBinary(chunk));
+  // Flow diagnostics: count captured bytes so a SILENT patch (no audio heard
+  // in the browser) is easy to tell apart from a broken capture device.
+  let capturedBytes = 0;
+  capture.stdout.on("data", (chunk) => { capturedBytes += chunk.length; sendBinary(chunk); });
   capture.stderr.on("data", (d) => log("ffmpeg(capture):", d.toString().trim()));
   capture.on("error", (e) => log("output: failed to start ffmpeg:", e.message));
-  capture.on("exit", (code) => { if (code) log(`output: ffmpeg exited (${code})`); });
+  capture.on("exit", (code) => { if (code) log(`output: ffmpeg exited (${code}) -- capture device '${cfg.captureSource}' may be wrong; see --setup-audio`); });
+  // After a few seconds with zero captured bytes the device is producing no
+  // audio -- almost always because nothing is playing to it. Tell the user
+  // exactly how to test instead of leaving them with silence.
+  setTimeout(() => {
+    if (!capture) return;
+    if (capturedBytes === 0) {
+      log(`output: WARNING captured 0 bytes from '${cfg.captureSource}'. Nothing is playing to the capture device.`);
+      if (cfg.captureFormat === "alsa") {
+        log("output: test it with:  speaker-test -D default -c2 -twav   (or play any audio to the 'default' device)");
+      } else {
+        log("output: test it with:  paplay /usr/share/sounds/alsa/Front_Center.wav   (audio must play to the default sink)");
+      }
+    } else {
+      log(`output: capture healthy (${(capturedBytes / 1024).toFixed(0)} KB in first 6s).`);
+    }
+  }, 6000);
 }
 
 // input: receive binary frames from NRCC -> play into a sink/device.

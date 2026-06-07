@@ -631,20 +631,20 @@ A fifth beta feature (`audioPatch`) embeds a [CC-Peep](https://github.com/script
 | `WS /ws-audiopatch/client`    | VM-agent role. `?token=` required when `NRCC_AUDIOPATCH_TOKEN` is set. `register` (with `identity`) → `audio-format` → binary PCM frames. |
 | `WS /ws-audiopatch/admin`     | Admin role (cookie auth). Control: `patch` / `unpatch` / `list`; binary frames carry the admin mic for input/both. |
 
-**Agent install (zero-flag one-liner).** NRCC serves the agent and a templated installer, so there is **nothing to clone and no UUID/portal/token to type** — the host you reached NRCC on is baked in. Run inside the guest:
+**Agent install (zero-flag one-liner).** NRCC serves the agent and a templated installer, so there is **nothing to clone and no UUID/portal/token to type** — the host you reached NRCC on is baked in. The bootstrap is served over **plain HTTP** (NRCC's nginx sidecar proxies `/audiopatch/*` on the HTTP NodePort) so guests download with no TLS at all — this works on Windows boxes that ship **no `curl.exe`** and an old Schannel that can't negotiate the self-signed cert. Run inside the guest:
 
 ```bash
 # Linux
-curl -fsSLk https://<nrcc-host>/audiopatch/install.sh | bash
+curl -fsSL http://<nrcc-host>:32088/audiopatch/install.sh | bash
 # add options after `-s --`, e.g.:  | bash -s -- --direction both --setup-audio
 ```
 
 ```powershell
-# Windows
-curl.exe -fsSLk https://<nrcc-host>/audiopatch/install.ps1 -o $env:TEMP\nrcc-audiopatch-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\nrcc-audiopatch-install.ps1
+# Windows (no curl.exe / no TLS needed)
+powershell -ExecutionPolicy Bypass -Command "$f=Join-Path $env:TEMP 'nrcc-audiopatch-install.ps1'; Invoke-WebRequest 'http://<nrcc-host>:32088/audiopatch/install.ps1' -OutFile $f -UseBasicParsing; & powershell -ExecutionPolicy Bypass -File $f"
 ```
 
-The exact command for your deployment is shown in **PatchBay → Add a VM** (click the command to copy it). The installer checks Node ≥ 18 / ffmpeg, downloads the agent, installs `ws` locally (or uses Node 22's built-in WebSocket), and installs a restart-on-failure service (systemd user service on Linux, Scheduled Task on Windows). On Linux it defaults to `--direction both` and the agent auto-detects the audio backend: PulseAudio/PipeWire (captures the default sink monitor) or, on a server VM with no Pulse, ALSA `snd-aloop` (the installer auto-runs the loopback setup so output capture isn't silent; `snd-aloop` needs a one-time `sudo modprobe snd-aloop`). Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows. Full details and a manual-run path: `deploy/audiopatch/README.md`.
+The exact command for your deployment is shown in **PatchBay → Add a VM** (click the command to copy it) and uses the HTTP base advertised by `/api/config` (`audioPatch.installBase`, derived from `NRCC_PUBLIC_HTTP_PORT`). The installer checks Node ≥ 18 / ffmpeg, downloads the agent, installs `ws` locally (or uses Node 22's built-in WebSocket), and installs a restart-on-failure service (systemd user service on Linux, Scheduled Task on Windows). The agent then connects to the realtime portal on `wss://` (the ws client tolerates the self-signed cert). On Linux it defaults to `--direction both` and the agent auto-detects the audio backend for **output** capture: a running PulseAudio/PipeWire (captures the default sink monitor); if none is running the installer's `--setup-audio` step first tries to **start a per-user PulseAudio/PipeWire (no root)** and create a null sink, and only falls back to ALSA `snd-aloop` (one-time `sudo modprobe snd-aloop`) when there is no Pulse stack at all. If output is silent the agent logs a clear "captured 0 bytes — nothing is playing to the capture device" warning with a test command. Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows. Full details and a manual-run path: `deploy/audiopatch/README.md`.
 
 **Trust model & caveats**
 

@@ -248,6 +248,16 @@ const AUDIOPATCH_ENABLED = String(process.env.NRCC_AUDIOPATCH_ENABLED || "true")
 // means "no token required" (lab default) -- we log a one-time warning
 // so an operator notices an unauthenticated portal.
 const AUDIOPATCH_TOKEN = String(process.env.NRCC_AUDIOPATCH_TOKEN || "").trim();
+// Public NodePorts the cluster exposes NRCC on. The AudioPatch bootstrap is
+// served over plain HTTP (NRCC_PUBLIC_HTTP_PORT) so guests -- especially
+// Windows boxes that lack curl.exe and trip over .NET Schannel on the
+// self-signed cert -- can download the installer/agent with no TLS. The
+// realtime portal stays on wss:// (NRCC_PUBLIC_HTTPS_PORT) because the agent's
+// ws client tolerates the self-signed cert. Empty = fall back to the
+// request's own host:port (works when NRCC is reached directly, not via the
+// nginx redirect/proxy sidecar).
+const NRCC_PUBLIC_HTTP_PORT = String(process.env.NRCC_PUBLIC_HTTP_PORT || "").trim();
+const NRCC_PUBLIC_HTTPS_PORT = String(process.env.NRCC_PUBLIC_HTTPS_PORT || "").trim();
 const AUDIOPATCH_MAX_CLIENTS = Math.max(1, Number(process.env.NRCC_AUDIOPATCH_MAX_CLIENTS || 256));
 const AUDIOPATCH_MAX_ADMINS = Math.max(1, Number(process.env.NRCC_AUDIOPATCH_MAX_ADMINS || 256));
 // A VM agent that misses heartbeats for this long is dropped from the
@@ -767,7 +777,11 @@ app.get("/api/config", (req, res) => {
     // the VM-agent install needs a registration token.
     audioPatch: {
       enabled: AUDIOPATCH_ENABLED,
-      requiresToken: Boolean(AUDIOPATCH_TOKEN)
+      requiresToken: Boolean(AUDIOPATCH_TOKEN),
+      // Plain-HTTP base the PatchBay "Add a VM" one-liners should target so
+      // guests avoid the self-signed TLS download path. Null when AudioPatch
+      // is off; the UI then falls back to window.location.
+      installBase: AUDIOPATCH_ENABLED ? audioPatchInstallContext(req).base : null
     }
   });
 });
@@ -999,13 +1013,31 @@ app.get("/api/audiopatch/clients", (req, res) => {
 const AUDIOPATCH_ASSET_DIR = path.join(__dirname, "public", "audiopatch");
 
 function audioPatchInstallContext(req) {
-  const host = String(req.headers.host || "").trim() || `localhost:${PORT}`;
-  const secure = req.secure || req.protocol === "https";
-  const wsScheme = secure ? "wss" : "ws";
-  const httpScheme = secure ? "https" : "http";
+  const rawHost = String(req.headers.host || "").trim() || `localhost:${PORT}`;
+  const hostOnly = rawHost.replace(/:\d+$/, "");
+  const reqSecure = req.secure || req.protocol === "https";
+
+  // The nginx HTTP sidecar proxies /audiopatch/* to this app and forwards
+  // these hints so we can advertise a plain-HTTP download base even though
+  // the in-pod hop is HTTPS.
+  const xfPort = String(req.headers["x-forwarded-port"] || "").trim();
+
+  // Download base: prefer plain HTTP on the public HTTP NodePort so guests
+  // without curl.exe (and stuck on TLS 1.0 Schannel) can fetch with a bare
+  // iwr/curl over HTTP. Falls back to the request's own scheme+host when no
+  // public HTTP port is configured (direct access, e.g. dev).
+  const httpPort = xfPort || NRCC_PUBLIC_HTTP_PORT;
+  const base = httpPort
+    ? `http://${hostOnly}:${httpPort}`
+    : `${reqSecure ? "https" : "http"}://${rawHost}`;
+
+  // Portal stays on wss:// via the public HTTPS NodePort (the agent's ws
+  // client relaxes cert verification). Fall back to the request host:port.
+  const portalHost = NRCC_PUBLIC_HTTPS_PORT ? `${hostOnly}:${NRCC_PUBLIC_HTTPS_PORT}` : rawHost;
+
   return {
-    portal: `${wsScheme}://${host}/ws-audiopatch/client`,
-    base: `${httpScheme}://${host}`,
+    portal: `wss://${portalHost}/ws-audiopatch/client`,
+    base,
     token: AUDIOPATCH_TOKEN || ""
   };
 }

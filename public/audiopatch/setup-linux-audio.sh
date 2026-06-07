@@ -43,6 +43,27 @@ as_root() {
   fi
 }
 
+# If pactl exists but no server is running, try to start a per-user sound
+# server WITHOUT root -- this is the cleanest way to get a capturable
+# monitor on a desktop-class guest (Rocky/RHEL ship pulseaudio or pipewire).
+if command -v pactl >/dev/null 2>&1 && ! pactl info >/dev/null 2>&1; then
+  log "pactl present but no sound server running; trying to start one (no root needed) ..."
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user start pipewire pipewire-pulse wireplumber 2>/dev/null || true
+    systemctl --user start pulseaudio.socket pulseaudio.service 2>/dev/null || true
+  fi
+  if ! pactl info >/dev/null 2>&1; then
+    if command -v pipewire-pulse >/dev/null 2>&1; then
+      ( setsid pipewire >/dev/null 2>&1 & setsid pipewire-pulse >/dev/null 2>&1 & setsid wireplumber >/dev/null 2>&1 & ) || true
+    elif command -v pulseaudio >/dev/null 2>&1; then
+      pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
+    fi
+  fi
+  # Give the daemon a moment to come up.
+  for _ in 1 2 3 4 5; do pactl info >/dev/null 2>&1 && break; sleep 1; done
+fi
+
 # -------- PulseAudio / PipeWire path --------------------------------------
 if command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1; then
   log "PulseAudio/PipeWire detected; configuring null sink '${SINK_NAME}'."

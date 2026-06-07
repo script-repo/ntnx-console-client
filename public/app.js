@@ -4178,7 +4178,7 @@ const appConfig = {
   // Beta: AudioPatch portal state (NRCC_AUDIOPATCH_ENABLED). Defaults to
   // disabled so an older server that omits the field doesn't try to open
   // a portal socket that isn't there.
-  audioPatch: { enabled: false, requiresToken: false }
+  audioPatch: { enabled: false, requiresToken: false, installBase: null }
 };
 
 async function loadAppConfig() {
@@ -8106,18 +8106,22 @@ async function refreshAudioPatchClients() {
 }
 
 function fillPatchBayInstallCommands() {
-  // Build the install one-liner against whatever host the browser reached
-  // NRCC on, so the guest can be pointed straight at this instance.
-  const base = `${window.location.protocol}//${window.location.host}`;
+  // Prefer the server-advertised plain-HTTP base (HTTP NodePort, proxied by
+  // the nginx sidecar) so guests download with no TLS at all -- this avoids
+  // the self-signed cert tripping curl/iwr and works on Windows boxes that
+  // ship neither curl.exe nor a modern Schannel. Fall back to the browser's
+  // own origin when the server didn't advertise one.
+  const base = (appConfig.audioPatch && appConfig.audioPatch.installBase)
+    || `${window.location.protocol}//${window.location.host}`;
   if (patchBayInstallLinux) {
-    patchBayInstallLinux.textContent = `curl -fsSLk ${base}/audiopatch/install.sh | bash`;
+    patchBayInstallLinux.textContent = `curl -fsSL ${base}/audiopatch/install.sh | bash`;
   }
   if (patchBayInstallWindows) {
-    // Use the built-in curl.exe (Win10 1803+/Server 2019+) to fetch the
-    // script -- it handles the self-signed cert (-k) without the .NET
-    // Schannel/iwr TLS issues, then run it with PowerShell.
+    // Plain HTTP download means a bare Invoke-WebRequest works on every
+    // Windows build (no curl.exe, no TLS 1.2 dance). Fetch to a temp file,
+    // then run it with PowerShell.
     patchBayInstallWindows.textContent =
-      `curl.exe -fsSLk ${base}/audiopatch/install.ps1 -o $env:TEMP\\nrcc-audiopatch-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\\nrcc-audiopatch-install.ps1`;
+      `powershell -ExecutionPolicy Bypass -Command "$f=Join-Path $env:TEMP 'nrcc-audiopatch-install.ps1'; Invoke-WebRequest '${base}/audiopatch/install.ps1' -OutFile $f -UseBasicParsing; & powershell -ExecutionPolicy Bypass -File $f"`;
   }
 }
 

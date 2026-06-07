@@ -56,7 +56,27 @@ data:
     server {
       listen 8080 default_server;
       server_name _;
-      return 301 https://$host:32444$request_uri;
+
+      # Serve the AudioPatch bootstrap (installers + agent + setup script)
+      # over plain HTTP by proxying to the app's in-pod HTTPS listener.
+      # This lets guest VMs -- especially Windows boxes with no curl.exe and
+      # a TLS 1.0 Schannel that chokes on the self-signed cert -- download
+      # the installer/agent with a bare iwr/curl, no TLS involved. The
+      # X-Forwarded-* hints tell the app to advertise this HTTP NodePort as
+      # the download base while keeping the realtime portal on wss://.
+      location /audiopatch/ {
+        proxy_pass https://127.0.0.1:8443;
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_set_header X-Forwarded-Port 32088;
+      }
+
+      # Everything else: bounce bare-hostname HTTP to the TLS endpoint.
+      location / {
+        return 301 https://$host:32444$request_uri;
+      }
     }
 
 ---
@@ -157,6 +177,12 @@ spec:
             # an immutable image. Disable the Update button in the UI
             # and roll forward with `kubectl set image` instead.
             - { name: NRCC_UPDATE_ENABLED,     value: "false" }
+            # Public NodePorts this cluster exposes NRCC on. The AudioPatch
+            # bootstrap is advertised over plain HTTP on NRCC_PUBLIC_HTTP_PORT
+            # (proxied by the nginx sidecar above) so guests download with no
+            # TLS; the realtime portal stays on wss:// via the HTTPS NodePort.
+            - { name: NRCC_PUBLIC_HTTP_PORT,   value: "32088" }
+            - { name: NRCC_PUBLIC_HTTPS_PORT,  value: "32444" }
           readinessProbe:
             tcpSocket:
               port: 8443
