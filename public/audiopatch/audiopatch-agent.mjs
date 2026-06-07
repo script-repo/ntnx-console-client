@@ -275,10 +275,25 @@ function startCapture() {
 }
 
 // input: receive binary frames from NRCC -> play into a sink/device.
+//
+// IMPORTANT: the playback device is opened LAZILY (on the first input frame)
+// and released after a short idle gap. snd-aloop allows only one writer to
+// hw:Loopback,0,0, so holding it open while no admin is talking would block
+// the VM's own apps (and any test playback) from feeding the OUTPUT capture.
+// In `both` mode the device is therefore free whenever input isn't actively
+// flowing.
+const PLAYBACK_IDLE_MS = Math.max(500, Number(process.env.AUDIOPATCH_PLAYBACK_IDLE_MS || 1500));
+let playbackIdleTimer = null;
+let playbackInputUnsupported = false;
+
 function startPlayback() {
+  if (playback) return true;
   if (cfg.osType === "windows" && !cfg.playbackSink) {
-    log("input: no --playback-sink configured on Windows; input audio will be dropped (see README).");
-    return;
+    if (!playbackInputUnsupported) {
+      log("input: no --playback-sink configured on Windows; input audio will be dropped (see README).");
+      playbackInputUnsupported = true;
+    }
+    return false;
   }
   const fmt = cfg.playbackFormat || (cfg.osType === "windows" ? "dshow" : "pulse");
   const a = [
@@ -290,18 +305,39 @@ function startPlayback() {
   log(`input: playback -> '${cfg.playbackSink}' (${fmt}, ${cfg.rate}Hz mono 16-bit)`);
   playback.stderr.on("data", (d) => log("ffmpeg(playback):", d.toString().trim()));
   playback.on("error", (e) => log("input: failed to start ffmpeg:", e.message));
-  playback.on("exit", (code) => { if (code) log(`input: ffmpeg exited (${code})`); });
+  playback.on("exit", (code) => {
+    if (code) log(`input: ffmpeg exited (${code})`);
+    playback = null;
+  });
+  return true;
+}
+
+function releasePlaybackIdle() {
+  clearTimeout(playbackIdleTimer);
+  playbackIdleTimer = null;
+  if (playback) {
+    try { playback.stdin.end(); } catch (_e) { /* ignore */ }
+    try { playback.kill("SIGKILL"); } catch (_e) { /* ignore */ }
+    playback = null;
+    log(`input: idle ${PLAYBACK_IDLE_MS}ms -> released '${cfg.playbackSink}' (frees it for VM/output audio)`);
+  }
 }
 
 function writePlayback(data) {
+  if (!wantInput) return;
+  if (!startPlayback()) return; // unsupported (e.g. Windows without a sink)
   if (!playback || !playback.stdin.writable) return;
   const buf = Buffer.isBuffer(data)
     ? data
     : (data instanceof ArrayBuffer ? Buffer.from(data) : Buffer.from(data.buffer || data));
   playback.stdin.write(buf);
+  clearTimeout(playbackIdleTimer);
+  playbackIdleTimer = setTimeout(releasePlaybackIdle, PLAYBACK_IDLE_MS);
 }
 
 function stopMedia() {
+  clearTimeout(playbackIdleTimer);
+  playbackIdleTimer = null;
   try { capture?.kill("SIGKILL"); } catch (_e) { /* ignore */ }
   try { playback?.kill("SIGKILL"); } catch (_e) { /* ignore */ }
   capture = null;
@@ -342,7 +378,7 @@ function onOpen() {
     capabilities: { output: wantOutput, input: wantInput },
   });
   if (wantOutput) startCapture();
-  if (wantInput) startPlayback();
+  if (wantInput) log("input: playback device opened on demand (released when idle so it never blocks VM/output audio)");
   clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(() => sendText({ type: "ping" }), 25000);
 }
