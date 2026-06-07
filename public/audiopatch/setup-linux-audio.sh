@@ -134,15 +134,17 @@ ctl.!default {
 }
 EOF
 
-log "Loopback ready. Devices:"
-aplay -l 2>/dev/null | grep -i loopback | sed 's/^/  /' || true
+log "Loopback ready. Cards:"
+grep -i loopback /proc/asound/cards 2>/dev/null | sed 's/^/  /' || true
 
 cat <<EONOTE
 
 Done (ALSA snd-aloop). The agent auto-detects this; it captures
 'hw:Loopback,1,0' and plays input into 'hw:Loopback,0,0'.
 
-Whatever the VM plays via the default device is now captured. Test it:
+Whatever the VM plays via the default device is now captured. Test it
+(no alsa-utils needed -- uses ffmpeg, which the agent already requires):
   systemctl --user restart nrcc-audiopatch
-  speaker-test -D default -c2 -twav   # then Patch In 'Output' from NRCC
+  # Patch In 'Output' from NRCC, then play a 5s tone to the loopback:
+  ffmpeg -f lavfi -i sine=frequency=440:duration=5 -f alsa hw:Loopback,0,0
 EONOTE

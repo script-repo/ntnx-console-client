@@ -70,7 +70,9 @@ fi
 # isn't silent -- otherwise the agent has nothing to capture.
 if [ "$SETUP_AUDIO" != "1" ]; then
   if ! ( command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1 ); then
-    if ! ( aplay -l 2>/dev/null | grep -qi loopback ); then
+    # Detect the loopback via /proc/asound/cards (alsa-utils / aplay is often
+    # not installed on minimal server VMs).
+    if ! grep -qi loopback /proc/asound/cards 2>/dev/null; then
       log "No PulseAudio/PipeWire server and no ALSA loopback detected; running audio setup so OUTPUT capture works."
       SETUP_AUDIO=1
     fi

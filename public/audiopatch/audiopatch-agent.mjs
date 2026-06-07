@@ -122,6 +122,14 @@ function defaultPulseSink() {
 }
 
 function alsaLoopbackPresent() {
+  // Detect the snd-aloop card WITHOUT relying on alsa-utils: arecord/aplay
+  // are absent on minimal/server installs (e.g. Rocky/RHEL base), but the
+  // kernel always exposes /proc/asound/cards once ALSA + snd-aloop are
+  // loaded. Relying on aplay here made the agent silently fall back to the
+  // (nonexistent) Pulse server and capture nothing.
+  try {
+    if (/loopback/i.test(fs.readFileSync("/proc/asound/cards", "utf8"))) return true;
+  } catch (_e) { /* ignore */ }
   for (const cmd of ["arecord", "aplay"]) {
     try {
       const r = spawnSync(cmd, ["-l"], { encoding: "utf8" });
@@ -255,7 +263,8 @@ function startCapture() {
     if (capturedBytes === 0) {
       log(`output: WARNING captured 0 bytes from '${cfg.captureSource}'. Nothing is playing to the capture device.`);
       if (cfg.captureFormat === "alsa") {
-        log("output: test it with:  speaker-test -D default -c2 -twav   (or play any audio to the 'default' device)");
+        log("output: test it (no alsa-utils needed):  ffmpeg -f lavfi -i sine=frequency=440:duration=5 -f alsa hw:Loopback,0,0");
+        log("output: (any app that plays to the 'default' ALSA device is also captured)");
       } else {
         log("output: test it with:  paplay /usr/share/sounds/alsa/Front_Center.wav   (audio must play to the default sink)");
       }
