@@ -4,13 +4,17 @@
 # NRCC instance you fetched this from. No VM UUID or portal address to type.
 # Run from an elevated-or-normal PowerShell:
 #
-#   powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr __NRCC_BASE__/audiopatch/install.ps1 -UseBasicParsing | iex"
+#   powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr __NRCC_BASE__/audiopatch/install.ps1 -UseBasicParsing | iex"
 #
 # Override defaults with environment variables before running:
 #   $env:AUDIOPATCH_DIRECTION = 'both'   # output|input|both (default: output)
 #   $env:AUDIOPATCH_NAME      = 'My VM'  # PatchBay display name (default: computer name)
 
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 negotiates TLS 1.0/SSL3 by default; NRCC requires
+# TLS 1.2+, so force it before any HTTPS download (otherwise the handshake
+# fails with "Could not create SSL/TLS secure channel").
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 $Portal       = if ($env:AUDIOPATCH_PORTAL) { $env:AUDIOPATCH_PORTAL } else { "__NRCC_PORTAL__" }

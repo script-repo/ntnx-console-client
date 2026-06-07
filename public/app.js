@@ -8114,7 +8114,23 @@ function fillPatchBayInstallCommands() {
   }
   if (patchBayInstallWindows) {
     patchBayInstallWindows.textContent =
-      `powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr ${base}/audiopatch/install.ps1 -UseBasicParsing | iex"`;
+      `powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; [Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr ${base}/audiopatch/install.ps1 -UseBasicParsing | iex"`;
+  }
+}
+
+function copyInstallCommand(cmdEl) {
+  const text = cmdEl ? cmdEl.textContent : "";
+  if (!text) return;
+  const flash = () => {
+    cmdEl.classList.add("copied");
+    setTimeout(() => cmdEl.classList.remove("copied"), 1500);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(flash).catch(() => {
+      setStatus("Copy failed; select the command manually.");
+    });
+  } else {
+    setStatus("Clipboard unavailable; select the command manually.");
   }
 }
 
@@ -8205,17 +8221,9 @@ if (patchBayRefreshBtn) {
 if (patchBayModal) {
   patchBayModal.addEventListener("click", (event) => {
     if (event.target === patchBayModal) closePatchBay();
-    const copyBtn = event.target.closest && event.target.closest(".patchbay-install-copy");
-    if (copyBtn) {
-      const target = document.getElementById(copyBtn.getAttribute("data-target"));
-      const text = target ? target.textContent : "";
-      if (text && navigator.clipboard) {
-        navigator.clipboard.writeText(text).then(() => {
-          const prev = copyBtn.textContent;
-          copyBtn.textContent = "Copied";
-          setTimeout(() => { copyBtn.textContent = prev; }, 1500);
-        }).catch(() => setStatus("Copy failed; select the command manually."));
-      }
+    const cmdEl = event.target.closest && event.target.closest(".patchbay-install-cmd");
+    if (cmdEl) {
+      copyInstallCommand(cmdEl);
       return;
     }
     const btn = event.target.closest && event.target.closest("[data-patch-vm]");
@@ -8224,6 +8232,14 @@ if (patchBayModal) {
     const dir = btn.getAttribute("data-patch-dir");
     if (dir === "off") audioPatchUnpatch();
     else audioPatchSendPatch(vmUuid, dir);
+  });
+  // Keyboard activation for the focusable click-to-copy command boxes.
+  patchBayModal.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const cmdEl = event.target.closest && event.target.closest(".patchbay-install-cmd");
+    if (!cmdEl) return;
+    event.preventDefault();
+    copyInstallCommand(cmdEl);
   });
 }
 

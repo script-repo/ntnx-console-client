@@ -7,7 +7,7 @@
 #   curl -fsSLk __NRCC_BASE__/audiopatch/install.sh | bash
 #
 # Optional flags:
-#   --direction output|input|both   what to bridge (default: output)
+#   --direction output|input|both   what to bridge (default: both)
 #   --name NAME                      display name in PatchBay (default: hostname)
 #   --setup-audio                    create a dedicated PulseAudio null sink
 #   --no-service                     install only; print the run command
@@ -19,7 +19,7 @@ TOKEN="${AUDIOPATCH_TOKEN:-__NRCC_TOKEN__}"
 AGENT_URL="${AUDIOPATCH_AGENT_URL:-__NRCC_BASE__/audiopatch/audiopatch-agent.mjs}"
 SETUP_URL="${AUDIOPATCH_SETUP_URL:-__NRCC_BASE__/audiopatch/setup-linux-audio.sh}"
 DIR="${AUDIOPATCH_DIR:-$HOME/.nrcc-audiopatch}"
-DIRECTION="${AUDIOPATCH_DIRECTION:-output}"
+DIRECTION="${AUDIOPATCH_DIRECTION:-both}"
 NAME="${AUDIOPATCH_NAME:-$(hostname)}"
 SETUP_AUDIO="${AUDIOPATCH_SETUP_AUDIO:-0}"
 NO_SERVICE="${AUDIOPATCH_NO_SERVICE:-0}"

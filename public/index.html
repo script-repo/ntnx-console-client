@@ -1675,6 +1675,7 @@
         text-transform: uppercase;
       }
       .patchbay-install-cmd {
+        position: relative;
         flex: 1 1 auto;
         min-width: 0;
         overflow-x: auto;
@@ -1685,11 +1686,35 @@
         background: var(--ntx-bg-subtle, rgba(0, 0, 0, 0.04));
         border: 1px solid var(--ntx-border);
         border-radius: 6px;
+        cursor: pointer;
+        transition: border-color 0.15s ease, background 0.15s ease;
       }
-      .patchbay-install-copy {
-        flex: 0 0 auto;
+      .patchbay-install-cmd:hover {
+        border-color: var(--ntx-accent, #4f46e5);
+      }
+      .patchbay-install-cmd:focus-visible {
+        outline: 2px solid var(--ntx-accent, #4f46e5);
+        outline-offset: 1px;
+      }
+      .patchbay-install-cmd.copied {
+        border-color: #16a34a;
+        background: rgba(22, 163, 74, 0.12);
+      }
+      /* Replace the command text with a "Copied" badge briefly on click. */
+      .patchbay-install-cmd.copied::after {
+        content: "Copied";
+        position: absolute;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        display: flex;
+        align-items: center;
+        padding: 0 10px;
         font-size: 11px;
-        padding: 5px 10px;
+        font-weight: 600;
+        color: #16a34a;
+        background: var(--ntx-bg, #fff);
+        border-radius: 6px;
       }
       .patchbay-node {
         border: 1px solid var(--ntx-border);
@@ -4306,13 +4331,11 @@
             </p>
             <div class="patchbay-install-row">
               <span class="patchbay-install-label">Linux</span>
-              <code id="patchBayInstallLinux" class="patchbay-install-cmd"></code>
-              <button id="patchBayCopyLinux" type="button" class="patchbay-install-copy" data-target="patchBayInstallLinux">Copy</button>
+              <code id="patchBayInstallLinux" class="patchbay-install-cmd" role="button" tabindex="0" title="Click to copy"></code>
             </div>
             <div class="patchbay-install-row">
               <span class="patchbay-install-label">Windows</span>
-              <code id="patchBayInstallWindows" class="patchbay-install-cmd"></code>
-              <button id="patchBayCopyWindows" type="button" class="patchbay-install-copy" data-target="patchBayInstallWindows">Copy</button>
+              <code id="patchBayInstallWindows" class="patchbay-install-cmd" role="button" tabindex="0" title="Click to copy"></code>
             </div>
           </details>
         </div>

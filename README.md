@@ -644,7 +644,7 @@ curl -fsSLk https://<nrcc-host>/audiopatch/install.sh | bash
 powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr https://<nrcc-host>/audiopatch/install.ps1 -UseBasicParsing | iex"
 ```
 
-The exact command for your deployment is shown in **PatchBay → Add a VM** (with a copy button). The installer checks Node ≥ 18 / ffmpeg, downloads the agent, installs `ws` locally (or uses Node 22's built-in WebSocket), optionally creates a PulseAudio/PipeWire loopback (Linux `--setup-audio`), and installs a restart-on-failure service (systemd user service on Linux, Scheduled Task on Windows). Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows. Full details and a manual-run path: `deploy/audiopatch/README.md`.
+The exact command for your deployment is shown in **PatchBay → Add a VM** (click the command to copy it). The installer checks Node ≥ 18 / ffmpeg, downloads the agent, installs `ws` locally (or uses Node 22's built-in WebSocket), and installs a restart-on-failure service (systemd user service on Linux, Scheduled Task on Windows). On Linux it defaults to `--direction both` and the agent auto-resolves the default PulseAudio sink + monitor, so listening to the VM and sending your mic into it both work out of the box (pass `--setup-audio` for a dedicated null sink). Output (listen to the VM) works on both Windows and Linux; input (mic → VM) is fully supported on Linux and opt-in on Windows. Full details and a manual-run path: `deploy/audiopatch/README.md`.
 
 **Trust model & caveats**
 

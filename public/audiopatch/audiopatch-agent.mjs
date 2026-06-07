@@ -41,7 +41,7 @@
 
 import os from "node:os";
 import fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 // Prefer the 'ws' package (it can accept NRCC's self-signed wss:// via
 // rejectUnauthorized:false). Fall back to the built-in WebSocket when ws
@@ -105,6 +105,41 @@ if (cfg.osType === "windows") {
   cfg.captureSource ||= "@DEFAULT_MONITOR@";
   cfg.playbackSink ||= "@DEFAULT_SINK@";
 }
+
+// Resolve the Linux Pulse/PipeWire placeholders to real device names so
+// capture (monitor of the default sink) and playback (the default sink)
+// work out of the box without --setup-audio. Explicit --capture-source /
+// --playback-sink overrides are left untouched.
+function resolveLinuxPulseDevices() {
+  if (cfg.osType === "windows") return;
+  const needsMonitor = cfg.captureSource === "@DEFAULT_MONITOR@";
+  const needsSink = cfg.playbackSink === "@DEFAULT_SINK@";
+  if (!needsMonitor && !needsSink) return;
+  let defaultSink = "";
+  try {
+    const r = spawnSync("pactl", ["get-default-sink"], { encoding: "utf8" });
+    if (r.status === 0 && r.stdout) defaultSink = r.stdout.trim();
+  } catch (_e) {
+    // pactl missing; handled by the fallbacks below.
+  }
+  if (needsMonitor) {
+    if (defaultSink) {
+      cfg.captureSource = `${defaultSink}.monitor`;
+    } else {
+      // No pactl/server: capturing 'default' grabs the default *source*
+      // (often a mic), not playback, but it lets the agent start.
+      cfg.captureSource = "default";
+      console.warn("[audiopatch] could not resolve default sink via pactl; capturing 'default' source. Install pulseaudio-utils / pipewire-pulse or pass --capture-source.");
+    }
+  }
+  if (needsSink) {
+    // ffmpeg's pulse muxer connects to the default sink regardless of the
+    // trailing arg (it is the stream name), so an empty/default value is
+    // safe; prefer the explicit default sink name when we know it.
+    cfg.playbackSink = defaultSink || "default";
+  }
+}
+resolveLinuxPulseDevices();
 
 if (!cfg.portal) {
   console.error("[audiopatch] --portal (or AUDIOPATCH_PORTAL) is required, e.g. wss://nrcc.example/ws-audiopatch/client");
